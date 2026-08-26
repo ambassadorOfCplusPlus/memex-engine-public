@@ -928,11 +928,11 @@ bool collect_gemma4(llama_model* m, HParams* h, Gemma4Weights* w) {
     // projection are precisely the full-attention ones - and a file where they do not is a
     // file this builder is about to misread.
     printf("gemma4: слоёв %d — с окном %d, полных %d; V берётся из K на %d слоях; "
-           "rope_freqs %s\\n", h->n_layer, n_win, h->n_layer - n_win, n_shared_v,
+           "rope_freqs %s\n", h->n_layer, n_win, h->n_layer - n_win, n_shared_v,
            rope_freqs ? "есть" : "НЕТ (полные слои будут вращаться целиком — это ошибка)");
     if (n_shared_v && n_shared_v != h->n_layer - n_win) {
         printf("gemma4: %d слоёв без attn_v против %d полных слоёв — это не та раскладка, "
-               "под которую написан граф\\n", n_shared_v, h->n_layer - n_win);
+               "под которую написан граф\n", n_shared_v, h->n_layer - n_win);
         ok = false;
     }
     return ok;
@@ -1002,8 +1002,6 @@ bool collect_qwen35(llama_model* m, const HParams& h, Qwen35Weights* w) {
     }
     return ok;
 }
-
-struct Graph {
 
 struct Graph {
     ggml_context* ctx = nullptr;
@@ -2521,18 +2519,6 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
             ggml_reshape_3d(c, probs, 1, h.n_expert, n_tokens), sel);
         weights = ggml_reshape_2d(c, weights, h.n_expert_used, n_tokens);
         weights = ggml_div(c, weights, ggml_sum_rows(c, weights));
-        if (L.down_scale) {
-            // The per-expert scale, folded into the ROUTING WEIGHT after renormalisation
-            // rather than applied to the expert's output. Algebraically the same thing; the
-            // reference does it here, and doing it there instead would reassociate a
-            // multiply into a different place in every one of thirty layers. Matching the
-            // association is what lets a later mismatch mean something.
-            ggml_tensor* sc = ggml_reshape_3d(c, L.down_scale, 1, h.n_expert, 1);
-            sc = ggml_repeat_4d(c, sc, 1, h.n_expert, n_tokens, 1);
-            sc = ggml_get_rows(c, sc, sel);
-            weights = ggml_mul(c, weights,
-                               ggml_reshape_2d(c, sc, h.n_expert_used, n_tokens));
-        }
         weights = ggml_reshape_3d(c, weights, 1, h.n_expert_used, n_tokens);
 
         ggml_tensor* xe = ggml_reshape_3d(c, moe_in, h.n_embd, 1, n_tokens);
@@ -2551,11 +2537,28 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         ggml_tensor* par = ggml_moe_up_gate(c, L.gate_up_exps, nullptr, xe, sel,
                                             GGML_UNARY_OP_GELU);
         ggml_tensor* eo = ggml_mul_mat_id(c, L.down_exps, par, sel);
-        eo = ggml_mul(c, eo, weights);
-        ggml_tensor* routed = ggml_view_2d(c, eo, h.n_embd, n_tokens, eo->nb[2], 0);
-        for (int e = 1; e < h.n_expert_used; ++e) {
-            routed = ggml_add(c, routed, ggml_view_2d(c, eo, h.n_embd, n_tokens, eo->nb[2],
-                                                      size_t(e) * eo->nb[1]));
+        // Weight by the router, fold the eight slots, and apply the per-expert scale - all
+        // in ONE node.
+        //
+        // Written this way for two reasons that happen to agree. The first is fidelity: the
+        // reference's cparams.fused_mmad defaults to TRUE (llama.cpp:7728), so the decode we
+        // compare against takes exactly this op, with the scale handed in through src[2] and
+        // the chosen ids through src[3]. The second is cost. The obvious spelling - multiply
+        // by the weights, then add eight slices - is eight nodes, and folding the scale in by
+        // hand (repeat_4d, get_rows, mul) is three more. At 27 us of launch per node and
+        // thirty layers that spelling would cost about 9 ms per token to compute something
+        // bit-identical.
+        //
+        // Bit-identical is not an approximation here. The kernel forms s = w[j]*scale[id[j]]
+        // once per slot and accumulates y += e[j][k]*s from slot zero upward, which is the
+        // same value and the same left-to-right association as the long spelling.
+        ggml_tensor* routed = ggml_mul_multi_add(c, eo, weights);
+        if (L.down_scale) {
+            // Assigned after construction, as the reference does. Safe for the graph walk:
+            // ggml_build_forward_expand visits every src, and `sel` is already an ancestor
+            // through eo, so nothing is scheduled out of order by this.
+            routed->src[2] = L.down_scale;
+            routed->src[3] = sel;
         }
         if (keep_probes) g->probes.push_back({"ffn_moe_out-" + std::to_string(il), routed});
 
@@ -2604,6 +2607,357 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
 }
 
 // ---------------------------------------------------------------------------------------
+// Qwen 3.6 35B-A3B
+// ---------------------------------------------------------------------------------------
+
+// The routed-plus-shared feed-forward that hangs off every one of the forty layers, of both
+// kinds. Factored out because the two layer kinds differ only in what feeds it.
+//
+//   h      = rms(attn_out) * post_attention_norm
+//   routed = MoE(h) + attn_out          <- the residual joins the ROUTED half, before shared
+//   shared = sigmoid(shexp_gate.h) * SharedFFN(h)
+//   out    = routed + shared
+//
+// The order of those last two lines is the reference's and is kept: adding the residual to
+// the routed half first and the shared expert afterwards is a different association from
+// adding both to the residual at the end, and this project has already paid for treating
+// that kind of difference as cosmetic.
+static ggml_tensor* qwen35_ffn(ggml_context* c, const HParams& h,
+                               const Qwen35Weights::Layer& L, ggml_tensor* attn_out,
+                               int n_tokens, ggml_tensor** normed_out) {
+    const float eps = h.rms_eps;
+    ggml_tensor* x = fnorm(c, attn_out, L.ffn_norm, eps);
+    if (normed_out) *normed_out = x;
+
+    ggml_tensor* rlogits = ggml_mul_mat(c, L.router, x);
+    ggml_tensor* probs = ggml_soft_max(c, rlogits);
+    ggml_tensor* sel = ggml_top_k(c, probs, h.n_expert_used);
+    ggml_tensor* weights = ggml_get_rows(c,
+        ggml_reshape_3d(c, probs, 1, h.n_expert, n_tokens), sel);
+    weights = ggml_reshape_2d(c, weights, h.n_expert_used, n_tokens);
+    weights = ggml_div(c, weights, ggml_sum_rows(c, weights));
+    weights = ggml_reshape_3d(c, weights, 1, h.n_expert_used, n_tokens);
+
+    ggml_tensor* xe = ggml_reshape_3d(c, x, h.n_embd, 1, n_tokens);
+    ggml_tensor* up = ggml_mul_mat_id(c, L.up_exps, xe, sel);
+    ggml_tensor* gt = ggml_mul_mat_id(c, L.gate_exps, xe, sel);
+    // silu(gate) * up in one node, which is the op the reference resolves LLM_FFN_SILU to.
+    ggml_tensor* par = ggml_fused_mul_unary(c, gt, up, GGML_UNARY_OP_SILU);
+    ggml_tensor* eo = ggml_mul_mat_id(c, L.down_exps, par, sel);
+    // Weight and fold in one node - see the note in build_gemma4_step. Eight slots means
+    // eight nodes saved a layer, and this model has forty layers.
+    ggml_tensor* routed = ggml_mul_multi_add(c, eo, weights);
+    routed = ggml_add(c, routed, attn_out);
+
+    // The shared expert. Always active on every layer and every token - static traffic, not
+    // expert traffic - and gated by a single sigmoid scalar per token.
+    ggml_tensor* shared = ggml_mul_mat(c, L.down_shexp,
+        ggml_fused_up_gate(c, L.up_shexp, L.gate_shexp, x, GGML_UNARY_OP_SILU));
+    ggml_tensor* sg = ggml_mul_mat(c, L.shexp_gate, x);      // [1, n_tokens]
+    if (n_tokens == 1) {
+        // The reference takes the fused form only for a single token, and the branch is on
+        // the same quantity, so a decode step and a prefill row go through the same kernel
+        // here as they do there.
+        shared = ggml_fused_mul_unary(c, sg, shared, GGML_UNARY_OP_SIGMOID);
+    } else {
+        shared = ggml_mul(c, shared, ggml_sigmoid(c, sg));
+    }
+    return ggml_add(c, routed, shared);
+}
+
+// One layer of gated delta-net: a linear-attention recurrence with a fixed-size state and no
+// KV cache. Thirty of qwen35moe's forty layers are this.
+//
+// Two ggml ops carry almost all of it - ggml_ssm_conv and ggml_delta_net - and using them
+// rather than unrolling the recurrence is the single most important decision in this
+// function. It buys arithmetic identity with the reference, which is what makes a comparison
+// mean anything; and it buys node count, because the alternative is a scan whose length is
+// the token count. A hand-built recurrence would be correct and unusable.
+//
+// The recurrence, per V head, per token, with d = 128 (from ggml.c and the iqk kernel that
+// actually runs):
+//     decay = exp(min(g,50));  b = sigmoid(beta)
+//     score = <k, q> / sqrt(d)                 (q and k arrive L2-normalised)
+//     v'    = S.k ;  v_new = b*v - b*decay*v'
+//     out   = (S.q)*decay/sqrt(d) + v_new*score
+//     S     = decay*S + v_new (x) k ,  clamped to +-1e6
+static ggml_tensor* qwen35_delta_layer(ggml_context* c, ggml_cgraph* gf, const HParams& h,
+                                       const Qwen35Weights::Layer& L, ggml_tensor* st,
+                                       ggml_tensor* seq_ids, ggml_tensor* inp, int n_tokens) {
+    const float eps = h.rms_eps;
+    const int Sk = h.ssm_d_state;                     // 128, the key/query head width
+    const int Hk = h.ssm_n_group;                     // 16 K heads
+    const int Hv = h.ssm_dt_rank;                     // 32 V heads
+    const int Sv = h.ssm_d_inner / Hv;                // 128, the value head width
+    const int key_dim = Sk * Hk;                      // 2048
+    const int val_dim = Sv * Hv;                      // 4096
+    const int conv_dim = key_dim * 2 + val_dim;       // 8192
+    const int dconv = h.ssm_d_conv;                   // 4
+    const int conv_state_dim = (dconv - 1) * conv_dim;
+    const int ssm_state_dim = Sv * Sv * Hv;
+    const size_t esz = sizeof(float);
+
+    ggml_tensor* x = fnorm(c, inp, L.attn_norm, eps);
+
+    // q | k | v in one projection, and the output gate in another.
+    ggml_tensor* qkv = ggml_mul_mat(c, L.wqkv, x);            // [conv_dim, n_tokens]
+    ggml_tensor* z = ggml_mul_mat(c, L.wqkv_gate, x);         // [val_dim, n_tokens]
+
+    // beta and the decay. ssm_a holds -exp(A_log) - every entry in the file is negative -
+    // so `gate` comes out negative and exp(gate) lands in (0,1) as a decay must.
+    ggml_tensor* beta = ggml_reshape_4d(c, ggml_mul_mat(c, L.ssm_beta, x), Hv, 1, n_tokens, 1);
+    ggml_tensor* alpha = ggml_reshape_3d(c, ggml_mul_mat(c, L.ssm_alpha, x), Hv, n_tokens, 1);
+    ggml_tensor* gate = ggml_mul(c, ggml_softplus(c, ggml_add(c, alpha, L.ssm_dt)), L.ssm_a);
+
+    // The state: a convolution window of dconv-1 positions, then the recurrent matrices.
+    // Both are views of one slot so that a single pair of copies at the end writes it back.
+    ggml_tensor* conv_state = ggml_reshape_3d(c,
+        ggml_view_2d(c, st, conv_state_dim, 1, st->nb[1], 0), dconv - 1, conv_dim, 1);
+    ggml_tensor* state = ggml_reshape_4d(c,
+        ggml_view_2d(c, st, ssm_state_dim, 1, st->nb[1], size_t(conv_state_dim) * esz),
+        Sv, Sv, Hv, 1);
+
+    // The causal depthwise convolution over q|k|v, and the new window, in one op. Its output
+    // is the convolved values first and the rolling window after them.
+    ggml_tensor* conv_raw = ggml_ssm_conv(c, conv_state, qkv, L.ssm_conv1d, seq_ids, nullptr);
+    ggml_tensor* y = ggml_silu(c, ggml_view_2d(c, conv_raw, conv_dim, n_tokens,
+                                               size_t(conv_dim) * esz, 0));
+    const size_t rowq = size_t(conv_dim) * esz;
+    ggml_tensor* q = ggml_view_4d(c, y, Sk, Hk, n_tokens, 1,
+                                  size_t(Sk) * esz, rowq, rowq * n_tokens, 0);
+    ggml_tensor* k = ggml_view_4d(c, y, Sk, Hk, n_tokens, 1,
+                                  size_t(Sk) * esz, rowq, rowq * n_tokens,
+                                  size_t(key_dim) * esz);
+    ggml_tensor* v = ggml_view_4d(c, y, Sv, Hv, n_tokens, 1,
+                                  size_t(Sv) * esz, rowq, rowq * n_tokens,
+                                  size_t(2 * key_dim) * esz);
+
+    // The order of l2_norm and permute is not interchangeable, and the reference switches on
+    // exactly this quantity. With more than one token the permute has to come first, because
+    // l2_norm's result is what carries the contiguity ggml_delta_net asserts; with a single
+    // token the permuted view is contiguous anyway - every axis it moves has extent one - so
+    // normalising first and permuting after is both legal and one fewer copy.
+    if (n_tokens > 1) {
+        q = ggml_l2_norm(c, ggml_permute(c, q, 0, 2, 1, 3), eps);
+        k = ggml_l2_norm(c, ggml_permute(c, k, 0, 2, 1, 3), eps);
+    } else {
+        q = ggml_permute(c, ggml_l2_norm(c, q, eps), 0, 2, 1, 3);
+        k = ggml_permute(c, ggml_l2_norm(c, k, eps), 0, 2, 1, 3);
+    }
+
+    // Into the layout the op reads. These permutes are pure bookkeeping - no kernel runs -
+    // and the layouts they produce are the ones the iqk kernel indexes: g and beta as
+    // [token][head] with head contiguous, v strided by the op's own nb1/nb2/nb3.
+    ggml_tensor* vp = ggml_permute(c, v, 0, 2, 1, 3);
+    ggml_tensor* gp = ggml_permute(c, gate, 2, 0, 3, 1);
+    ggml_tensor* bp = ggml_permute(c, beta, 2, 0, 1, 3);
+    ggml_tensor* state_flat = ggml_reshape_4d(c, state, Sv, Sv * Hv, 1, 1);
+
+    ggml_tensor* res = ggml_delta_net(c, q, k, vp, gp, bp, state_flat, nullptr);
+    // How the 32 V heads map onto the 16 K heads. Type 1 is head % 16 - the block mapping -
+    // and type 0 would be head / 2. The reference picks 1 whenever beta and alpha are stored
+    // as separate tensors, which is this file. Getting it wrong pairs every V head with the
+    // wrong K head and still produces text.
+    res->op_params[0] = 1;
+
+    const size_t out_elems = size_t(Sv) * size_t(Hv) * size_t(n_tokens);
+    ggml_tensor* out = ggml_view_4d(c, res, Sv, Hv, n_tokens, 1, size_t(Sv) * esz,
+                                    size_t(Sv * Hv) * esz, out_elems * esz, 0);
+    ggml_tensor* new_state = ggml_reshape_4d(c,
+        ggml_view_1d(c, res, ssm_state_dim, out_elems * esz), Sv, Sv, Hv, 1);
+
+    // Write both halves of the state back. The reference expands the recurrent copy first,
+    // and the order is load-bearing on its side (its fusion pass only matches the copy when
+    // nothing but view no-ops stands between it and the op); ours follows it so the two
+    // graphs schedule the same way.
+    ggml_tensor* new_conv = ggml_cont(c,
+        ggml_view_2d(c, conv_raw, dconv - 1, conv_dim, size_t(dconv) * esz,
+                     (1 + size_t(conv_dim) * size_t(n_tokens)) * esz));
+    ggml_tensor* ssm_cpy = ggml_cpy(c, ggml_reshape_2d(c, new_state, ssm_state_dim, 1),
+        ggml_view_2d(c, st, ssm_state_dim, 1, st->nb[1], size_t(conv_state_dim) * esz));
+    ggml_build_forward_expand(gf, ssm_cpy);
+    ggml_tensor* conv_cpy = ggml_cpy(c, ggml_reshape_2d(c, new_conv, conv_state_dim, 1),
+        ggml_view_2d(c, st, conv_state_dim, 1, st->nb[1], 0));
+    ggml_build_forward_expand(gf, conv_cpy);
+
+    // The gated output norm: rms over the head width, then the projection's own gate.
+    ggml_tensor* o2 = ggml_reshape_2d(c, out, Sv, int64_t(Hv) * n_tokens);
+    ggml_tensor* z2 = ggml_reshape_2d(c, z, Sv, int64_t(Hv) * n_tokens);
+    ggml_tensor* on = ggml_fused_mul_unary(c, z2, fnorm(c, o2, L.ssm_norm, eps),
+                                           GGML_UNARY_OP_SILU);
+    ggml_tensor* proj = ggml_mul_mat(c, L.ssm_out,
+                                     ggml_reshape_2d(c, on, val_dim, n_tokens));
+    return ggml_add(c, proj, inp);
+}
+
+// One graph for the whole hybrid. Attention every fourth layer, delta-net in between, and
+// the same feed-forward on both.
+bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
+                       const Qwen35Weights& w, Cache& kv, DeltaState& ds, int n_tokens,
+                       int n_past, int n_kv, bool all_logits, bool keep_probes) {
+    if (n_tokens <= 0 || n_kv <= 0 || n_past < 0) {
+        printf("qwen35moe: бессмысленные размеры n_tokens %d, n_past %d, n_kv %d\n",
+               n_tokens, n_past, n_kv);
+        return false;
+    }
+    if (h.n_delta_layers() > 0 && ds.state_dim == 0) {
+        printf("qwen35moe: слои дельта-сети есть, а состояние не выделено\n");
+        return false;
+    }
+    const size_t n_nodes = size_t(h.n_layer) * 96 + 256;
+    ggml_init_params ip = {ggml_tensor_overhead() * (n_nodes + 512) +
+                           ggml_graph_overhead_custom(n_nodes, false), nullptr, true};
+    g->ctx = ggml_init(ip);
+    if (!g->ctx) return false;
+    ggml_context* c = g->ctx;
+
+    g->tokens = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tokens);
+    g->positions = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tokens);
+    g->mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, n_kv, n_tokens);
+    // ggml_ssm_conv takes the state slot per token as an input tensor, so it has to live in
+    // the writable input buffer even though every entry of it is zero for us.
+    if (h.n_delta_layers() > 0) {
+        g->seq_ids = ggml_new_tensor_2d(c, GGML_TYPE_I32, 1, n_tokens);
+    }
+    g->n_kv_built = n_kv;
+    g->inputs = ggml_backend_alloc_ctx_tensors_from_buft(c, buft);
+    if (!g->inputs) return false;
+    g->gf = ggml_new_graph_custom(c, n_nodes, false);
+
+    const float eps = h.rms_eps;
+    // {11,11,10,0}. Their doubled sum is 64, which is n_rot: qwen35moe rotates 64 of its 256
+    // head dimensions and leaves the rest alone.
+    int sections[GGML_MROPE_SECTIONS] = {0};
+    for (int i = 0; i < 4 && i < GGML_MROPE_SECTIONS; ++i) sections[i] = h.rope_sections[i];
+
+    ggml_tensor* cur = ggml_get_rows(c, w.tok_embd, g->tokens);
+    for (int il = 0; il < h.n_layer; ++il) {
+        const Qwen35Weights::Layer& L = w.layers[size_t(il)];
+        const LayerGeom& G = h.L(il);
+        ggml_tensor* attn_out = nullptr;
+
+        if (G.kind == LayerKind::DELTA_NET) {
+            if (!ds.s[size_t(il)] || !g->seq_ids) {
+                printf("qwen35moe: слой %d — дельта-сеть без состояния или без карты "
+                       "последовательностей\n", il);
+                return false;
+            }
+            attn_out = qwen35_delta_layer(c, g->gf, h, L, ds.s[size_t(il)], g->seq_ids,
+                                          cur, n_tokens);
+            if (keep_probes) g->probes.push_back({"ssm_output-" + std::to_string(il), attn_out});
+        } else {
+            const int hd = G.head_dim;
+            const float kq_scale = h.f_attn_scale != 0.0f ? h.f_attn_scale
+                                                          : 1.0f / std::sqrt(float(hd));
+            ggml_tensor* inpSA = cur;
+            ggml_tensor* x = fnorm(c, cur, L.attn_norm, eps);
+
+            // attn_q is double width and the halves are INTERLEAVED PER HEAD: head n owns
+            // rows [2n*hd, 2n*hd+hd) as query and [2n*hd+hd, 2n*hd+2hd) as output gate. Two
+            // contiguous halves would be the obvious reading and would be wrong - it would
+            // take the first eight heads' queries and gates and call them sixteen queries.
+            ggml_tensor* qaux = ggml_mul_mat(c, L.wq, x);
+            const size_t row = size_t(hd) * sizeof(float);
+            ggml_tensor* q = ggml_cont(c, ggml_view_3d(c, qaux, hd, G.n_head, n_tokens,
+                                                       2 * row, qaux->nb[1], 0));
+            ggml_tensor* agate = ggml_cont_2d(c,
+                ggml_view_3d(c, qaux, hd, G.n_head, n_tokens, 2 * row, qaux->nb[1], row),
+                G.d_q(), n_tokens);
+            ggml_tensor* k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, x), hd,
+                                             G.n_head_kv, n_tokens);
+            ggml_tensor* v = ggml_mul_mat(c, L.wv, x);
+
+            q = fnorm(c, q, L.q_norm, eps);
+            k = fnorm(c, k, L.k_norm, eps);
+            // ggml_rope_multi with real sections, not the all-zero text-only form: this rope
+            // is interleaved-mrope and the section widths decide which dimension gets which
+            // of the three angle streams.
+            q = ggml_rope_multi(c, q, g->positions, nullptr, G.n_rot, sections, h.rope_type,
+                                h.n_ctx_train, G.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            k = ggml_rope_multi(c, k, g->positions, nullptr, G.n_rot, sections, h.rope_type,
+                                h.n_ctx_train, G.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+            ggml_tensor* Kc = ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));
+            ggml_tensor* Vc = ggml_cont(c, ggml_permute(c,
+                ggml_reshape_3d(c, v, hd, G.n_head_kv, n_tokens), 1, 2, 0, 3));
+            {
+                ggml_tensor* kc = kv.k[size_t(il)];
+                ggml_tensor* vc = kv.v[size_t(il)];
+                ggml_tensor* kdst = ggml_view_3d(c, kc, hd, n_tokens, G.n_head_kv,
+                                                 kc->nb[1], kc->nb[2],
+                                                 size_t(n_past) * kc->nb[1]);
+                ggml_tensor* vdst = ggml_view_3d(c, vc, n_tokens, hd, G.n_head_kv,
+                                                 vc->nb[1], vc->nb[2],
+                                                 size_t(n_past) * ggml_element_size(vc));
+                ggml_tensor* kcpy = ggml_cpy(c, Kc, kdst);
+                ggml_tensor* vcpy = ggml_cpy(c, Vc, vdst);
+                ggml_build_forward_expand(g->gf, kcpy);
+                ggml_build_forward_expand(g->gf, vcpy);
+                g->writes.push_back({kcpy, kdst, kc, kc->nb[1], kc->ne[1], n_tokens});
+                g->writes.push_back({vcpy, vdst, vc, ggml_element_size(vc), vc->ne[0],
+                                     n_tokens});
+            }
+
+            ggml_tensor* Q = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));
+            ggml_tensor* K = ggml_view_3d(c, kv.k[size_t(il)], hd, n_kv, G.n_head_kv,
+                                          kv.k[size_t(il)]->nb[1],
+                                          kv.k[size_t(il)]->nb[2], 0);
+            ggml_tensor* V = ggml_view_3d(c, kv.v[size_t(il)], n_kv, hd, G.n_head_kv,
+                                          kv.v[size_t(il)]->nb[1],
+                                          kv.v[size_t(il)]->nb[2], 0);
+            ggml_tensor* kq = ggml_mul_mat(c, K, Q);
+            ggml_tensor* pr = ggml_soft_max_ext(c, kq, g->mask, kq_scale, 0.0f);
+            ggml_tensor* kqv = ggml_mul_mat(c, V, pr);
+            g->reads.push_back({K, V, kq, pr, g->mask});
+            kqv = ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), G.d_q(), n_tokens);
+            if (keep_probes) {
+                ggml_set_output(inpSA);
+                ggml_set_output(kqv);
+                g->dbg.push_back({inpSA, kqv});
+            }
+            // The output gate, applied to the attention result BEFORE the output projection.
+            if (n_tokens == 1) {
+                kqv = ggml_fused_mul_unary(c, agate, kqv, GGML_UNARY_OP_SIGMOID);
+            } else {
+                kqv = ggml_mul(c, kqv, ggml_sigmoid(c, agate));
+            }
+            attn_out = ggml_add(c, ggml_mul_mat(c, L.wo, kqv), inpSA);
+            if (keep_probes) {
+                g->probes.push_back({"attn_out-" + std::to_string(il), attn_out});
+            }
+        }
+
+        ggml_tensor* normed = nullptr;
+        cur = qwen35_ffn(c, h, L, attn_out, n_tokens, keep_probes ? &normed : nullptr);
+        if (keep_probes) {
+            g->probes.push_back({"ffn_inp_normed-" + std::to_string(il), normed});
+            g->probes.push_back({"l_out-" + std::to_string(il), cur});
+        }
+    }
+
+    if (n_tokens > 1 && !all_logits) {
+        cur = ggml_cont(c, ggml_view_2d(c, cur, h.n_embd, 1, cur->nb[1],
+                                        size_t(n_tokens - 1) * cur->nb[1]));
+    }
+    cur = fnorm(c, cur, w.out_norm, eps);
+    if (keep_probes) g->probes.push_back({"result_norm", cur});
+    g->logits = ggml_mul_mat(c, w.out, cur);
+    ggml_set_output(g->logits);
+    for (auto& pr : g->probes) ggml_set_output(pr.second);
+    ggml_build_forward_expand(g->gf, g->logits);
+    g->alloc = ggml_gallocr_new(buft);
+    if (!g->alloc) {
+        printf("qwen35moe: ggml_gallocr_new не удался\n");
+        return false;
+    }
+    if (!ggml_gallocr_reserve(g->alloc, g->gf) || !ggml_gallocr_alloc_graph(g->alloc, g->gf)) {
+        printf("qwen35moe: граф не разместился (n_tokens %d, n_kv %d)\n", n_tokens, n_kv);
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------
 // A generation loop's machinery, in one place
 // ---------------------------------------------------------------------------------------
 
@@ -2616,8 +2970,19 @@ struct Generator {
     ggml_backend_t be = nullptr;
     ggml_backend_buffer_type_t buft = nullptr;
     const HParams* h = nullptr;
-    const Weights* w = nullptr;         // set for the target
-    const DenseWeights* dw = nullptr;   // set for the draft; exactly one of the two
+    // Exactly one of these four is set, and which one is the architecture. Kept as four
+    // pointers rather than one tagged union because the compiler then checks that a builder
+    // is only ever handed the weights it was written for - the failure this file cares about
+    // is not a crash, it is a graph that reads plausible tensors under the wrong names.
+    const Weights* w = nullptr;         // qwen3moe, the target
+    const DenseWeights* dw = nullptr;   // qwen3, the draft
+    const Gemma4Weights* g4 = nullptr;  // gemma4
+    const Qwen35Weights* q35 = nullptr; // qwen35moe
+    // The delta-net's carried state. Empty unless some layer needs it, and shared by the
+    // decode graph and the prefill graph on purpose: they are two views of one running
+    // recurrence, and giving them separate states would make a generation start over from
+    // nothing at the first decoded token.
+    DeltaState ds;
     int n_kv_max = 0;
     int min_experts = -1;
     float expert_thresh = 1.0f;
@@ -2630,17 +2995,24 @@ struct Generator {
     std::vector<int32_t> ps;            // scratch, so a step allocates nothing
     std::vector<float> mk;
     bool aim_warned = false;            // said once, not once per token
+    // Whether the graphs this generator builds keep their per-layer intermediates alive.
+    // Off for a real generation - it pins a tensor per layer that the allocator would
+    // otherwise reuse - and on for --decode-check, where comparing a layer at a time is the
+    // entire point.
+    bool want_probes = false;
 
     bool dense() const { return dw != nullptr; }
 
     bool init(ggml_backend_t backend, ggml_backend_buffer_type_t bt, const HParams* hp,
-              const Weights* tw, const DenseWeights* dwp, int n_kv, int min_e, float thr) {
-        if (!backend || !bt || !hp || (!tw && !dwp) || (tw && dwp)) {
+              const Weights* tw, const DenseWeights* dwp, int n_kv, int min_e, float thr,
+              const Gemma4Weights* g4p = nullptr, const Qwen35Weights* q35p = nullptr) {
+        const int n_set = (tw ? 1 : 0) + (dwp ? 1 : 0) + (g4p ? 1 : 0) + (q35p ? 1 : 0);
+        if (!backend || !bt || !hp || n_set != 1) {
             printf("генератор: некорректная инициализация "
-                   "(ровно один из наборов весов обязателен)\n");
+                   "(ровно один из наборов весов обязателен, задано %d)\n", n_set);
             return false;
         }
-        be = backend; buft = bt; h = hp; w = tw; dw = dwp;
+        be = backend; buft = bt; h = hp; w = tw; dw = dwp; g4 = g4p; q35 = q35p;
         n_kv_max = n_kv; min_experts = min_e; expert_thresh = thr;
         if (n_kv_max <= 0) {
             printf("генератор: бессмысленный размер кэша %d\n", n_kv_max);
@@ -2648,17 +3020,35 @@ struct Generator {
         }
         if (!kv.init(buft, *h, n_kv_max)) {
             printf("генератор: кэш на %d позиций не выделился (%.1f МБ)\n", n_kv_max,
-                   double(h->n_layer) * 2.0 * n_kv_max * h->d_kv() * 2.0 / 1e6);
+                   double(n_kv_max) * double(h->kv_elems_per_pos()) * 2.0 / 1e6);
             return false;
         }
+        if (!ds.init(buft, *h)) {
+            printf("генератор: состояние дельта-сети не выделилось (%.1f МБ)\n",
+                   double(h->n_delta_layers()) * double(h->delta_state_elems()) * 4.0 / 1e6);
+            return false;
+        }
+        // No history yet. Cheap, and the alternative is a first prompt conditioned on
+        // whatever the allocator handed us.
+        ds.clear();
         return true;
     }
 
     bool build_one(Graph* g, int n_tokens, int n_past, bool all_logits) {
-        return dense()
-            ? build_dense_step(g, buft, *h, *dw, kv, n_tokens, n_past, n_kv_max, all_logits)
-            : build_step(g, buft, *h, *w, kv, n_tokens, n_past, n_kv_max, min_experts,
-                         expert_thresh, all_logits);
+        if (dw) {
+            return build_dense_step(g, buft, *h, *dw, kv, n_tokens, n_past, n_kv_max,
+                                    all_logits);
+        }
+        if (g4) {
+            return build_gemma4_step(g, buft, *h, *g4, kv, n_tokens, n_past, n_kv_max,
+                                     all_logits, want_probes);
+        }
+        if (q35) {
+            return build_qwen35_step(g, buft, *h, *q35, kv, ds, n_tokens, n_past, n_kv_max,
+                                     all_logits, want_probes);
+        }
+        return build_step(g, buft, *h, *w, kv, n_tokens, n_past, n_kv_max, min_experts,
+                          expert_thresh, all_logits);
     }
 
     // The mask is -inf everywhere and zero only where a query at position past+i may see key
@@ -2672,7 +3062,7 @@ struct Generator {
         if (!gr.aim_kv_reads(want) && !aim_warned) {
             aim_warned = true;
             printf("не удалось сузить чтение кэша до %d позиций — шаги читают все %d "
-                   "выделенных\\n", want, n_kv_max);
+                   "выделенных\n", want, n_kv_max);
         }
         set_graph_inputs(gr, *h, tk, nt, past, &ps, &mk);
     }
@@ -2686,6 +3076,12 @@ struct Generator {
                    n_kv_max);
             return false;
         }
+        // A prefill from position zero is a new conversation, so the recurrence starts over.
+        // A prefill at a non-zero position is a continuation - a chat turn appended to what
+        // is already in the cache - and clearing there would silently drop everything the
+        // delta-net layers remember while the KV cache kept everything the attention layers
+        // do. That asymmetry would read as a model that forgets only some of the context.
+        if (past == 0) ds.clear();
         Graph pre;
         if (!build_one(&pre, nt, past, /*all_logits=*/false)) {
             printf("префилл: граф на %d токенов не собрался\n", nt);
@@ -2781,6 +3177,7 @@ struct Generator {
         if (ver_ready) ver.free_all();
         if (dec_ready) dec.free_all();
         kv.free_all();
+        ds.free_all();
         dec_ready = false;
         ver_ready = false;
     }
@@ -2824,10 +3221,23 @@ int probe_cb(ggml_tensor* t, bool ask, void* user_data) {
         const std::string n = t->name;
         // Only the nodes a comparison can use: layer outputs, the normed MoE input, and the
         // final norm. Names come from the reference itself, listed with --probe list.
+        // Names the reference itself emits, listed with --probe list. The four new ones are
+        // for the two architectures added since: gemma4 names the joined feed-forward
+        // "ffn_moe_combined" and the expert input "ffn_norm_2", and qwen35moe names a
+        // delta-net layer's output "ssm_output".
+        //
+        // "attn_out" is in the list but is NOT comparable on gemma4, and that is worth
+        // knowing before it wastes an afternoon: the reference emits that name from two
+        // different places in the block - before the residual on the twenty-five layers that
+        // take build_std_attention, and after it on the five that do not. l_out is
+        // unambiguous everywhere and is the one to trust.
         const bool useful = n.rfind("l_out-", 0) == 0 ||
                             n.rfind("ffn_inp_normed-", 0) == 0 ||
                             n.rfind("attn_out-", 0) == 0 ||
                             n.rfind("ffn_moe_out-", 0) == 0 ||
+                            n.rfind("ffn_moe_combined-", 0) == 0 ||
+                            n.rfind("ffn_norm_2-", 0) == 0 ||
+                            n.rfind("ssm_output-", 0) == 0 ||
                             n == "result_norm";
         if (ask) {
             return useful && t->type == GGML_TYPE_F32 ? 1 : 0;
@@ -3121,7 +3531,10 @@ Budget byte_budget(const Weights& w, const HParams& h, int n_kv, double experts_
     if (w.tok_embd && h.n_vocab > 0) {
         b.dense += double(ggml_nbytes(w.tok_embd)) / double(h.n_vocab);
     }
-    b.kv = double(h.n_layer) * 2.0 * double(n_kv) * double(h.d_kv()) * 2.0;
+    // Summed per layer rather than multiplied out, because for two of the three supported
+    // architectures the per-layer width is not the model-wide one - and for one of them
+    // three quarters of the layers hold no keys at all.
+    b.kv = double(n_kv) * double(h.kv_elems_per_pos()) * 2.0;
     return b;
 }
 
@@ -4218,6 +4631,7 @@ int main(int argc, char** argv) {
     int max_tokens = 64;
     std::string probe_name;
     int n_gen = 0;
+    int decode_check = 0;
     int min_experts = -1;
     float expert_thresh = 1.0f;
     // Three states, not two: "the user said nothing" has to be distinguishable from "the user
@@ -4287,6 +4701,10 @@ int main(int argc, char** argv) {
 "  -c, --ctx N          сколько позиций держать в кэше (по умолчанию по промпту)\n"
 "  --tokens N           обрезать промпт до N токенов (%d)\n"
 "  --gen N              сгенерировать N токенов и сверить их с эталоном (%d)\n"
+"  --decode-check N     сверять КАЖДЫЙ шаг декода с llama_decode, N шагов\n"
+"                       (единственная проверка, которая ловит ошибку в переносимом\n"
+"                        состоянии дельта-сети: она деградирует плавно и читается\n"
+"                        как «модель чуть хуже», а не как поломка)\n"
 "  -n, --n-predict N    предел генерации в режиме --chat (%d)\n"
 "  --no-ref             не создавать эталонный llama_context и не сверять логиты\n"
 "\n"
@@ -4395,6 +4813,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--tokens")) { if (want_val(i, a)) max_tokens = atoi(argv[++i]); }
         else if (!strcmp(a, "--probe")) { if (want_val(i, a)) probe_name = argv[++i]; }
         else if (!strcmp(a, "--gen")) { if (want_val(i, a)) n_gen = atoi(argv[++i]); }
+        else if (!strcmp(a, "--decode-check")) {
+            if (want_val(i, a)) decode_check = atoi(argv[++i]);
+        }
         else if (!strcmp(a, "-n") || !strcmp(a, "--n-predict")) { if (want_val(i, a)) n_predict = atoi(argv[++i]); }
         else if (!strcmp(a, "--min-experts")) { if (want_val(i, a)) min_experts = atoi(argv[++i]); }
         else if (!strcmp(a, "--expert-thresh")) { if (want_val(i, a)) expert_thresh = float(atof(argv[++i])); }
@@ -4602,21 +5023,108 @@ int main(int argc, char** argv) {
            h.arch.c_str(), h.n_layer, h.n_embd, h.n_head, h.n_head_kv, h.head_dim,
            h.n_expert, h.n_expert_used, h.n_ff_exp, h.rms_eps, h.rope_base);
 
-    // The graph below is written for one architecture. Running it against another does not
-    // fail - it produces confident nonsense, because the tensor names happen to overlap and
-    // the shapes happen to be plausible. So it is refused by name.
-    if (h.arch != "qwen3moe") {
-        printf("архитектура \"%s\" не поддерживается этим движком.\n", h.arch.c_str());
-        printf("  поддерживается только: qwen3moe (целевая модель)\n");
+    // Which architecture, decided once. Everything downstream branches on these three rather
+    // than on the string, so a typo is a compile error rather than a silently skipped path.
+    const bool arch_q3  = h.arch == "qwen3moe";
+    const bool arch_g4  = h.arch == "gemma4";
+    const bool arch_q35 = h.arch == "qwen35moe";
+
+    // The graphs below are written for named architectures. Running one against another does
+    // not fail - it produces confident nonsense, because the tensor names happen to overlap
+    // and the shapes happen to be plausible. So anything else is refused by name.
+    if (!arch_q3 && !arch_g4 && !arch_q35) {
+        printf("архитектура \\"%s\\" не поддерживается этим движком.\n", h.arch.c_str());
+        printf("  поддерживаются как целевые: qwen3moe, gemma4, qwen35moe\n");
         printf("  и qwen3 — но только как модель-черновик через -md\n");
-        printf("  граф написан под одну архитектуру; на другой он выдаст не ошибку, "
+        printf("  граф написан под конкретные архитектуры; на другой он выдаст не ошибку, "
                "а уверенную чепуху\n");
         return 1;
     }
     if (h.n_expert <= 0 || h.n_expert_used <= 0 || h.n_expert_used > h.n_expert) {
-        printf("qwen3moe с %d экспертами и %d используемыми — так не бывает, "
-               "метаданные GGUF не читаются\n", h.n_expert, h.n_expert_used);
+        printf("%s с %d экспертами и %d используемыми — так не бывает, "
+               "метаданные GGUF не читаются\n", h.arch.c_str(), h.n_expert,
+               h.n_expert_used);
         return 1;
+    }
+    // The per-layer table, printed as runs rather than as thirty or forty lines. It is the
+    // one place the geometry this engine believes in becomes visible, and every one of the
+    // three architectures has at least one thing here that a scalar header would have hidden.
+    {
+        printf("геометрия по слоям:\n");
+        auto kind_name = [](LayerKind k) {
+            return k == LayerKind::DELTA_NET ? "дельта-сеть"
+                 : k == LayerKind::ATTN_SWA  ? "внимание+окно" : "внимание";
+        };
+        int run_start = 0;
+        for (int il = 1; il <= h.n_layer; ++il) {
+            const bool same = il < h.n_layer &&
+                h.L(il).kind == h.L(run_start).kind &&
+                h.L(il).n_head_kv == h.L(run_start).n_head_kv &&
+                h.L(il).head_dim == h.L(run_start).head_dim &&
+                h.L(il).n_rot == h.L(run_start).n_rot &&
+                h.L(il).rope_base == h.L(run_start).rope_base;
+            if (same) continue;
+            const LayerGeom& G = h.L(run_start);
+            if (G.kind == LayerKind::DELTA_NET) {
+                printf("  слои %2d..%-2d  %-14s состояние %zu f32 (%.2f МБ)\n", run_start,
+                       il - 1, kind_name(G.kind), h.delta_state_elems(),
+                       double(h.delta_state_elems()) * 4.0 / 1e6);
+            } else {
+                printf("  слои %2d..%-2d  %-14s головы %d/%d по %d, rope %d из %d @ %g%s\n",
+                       run_start, il - 1, kind_name(G.kind), G.n_head, G.n_head_kv,
+                       G.head_dim, G.n_rot, G.head_dim, G.rope_base,
+                       G.rope_freqs ? ", freq_factors" : "");
+            }
+            run_start = il;
+        }
+        if (h.n_swa > 0) printf("  окно %d позиций\n", h.n_swa);
+        if (h.f_attn_scale != 0.0f) {
+            printf("  масштаб внимания %g (а НЕ 1/sqrt(head_dim)=%g)\n", h.f_attn_scale,
+                   1.0f / std::sqrt(float(h.head_dim)));
+        }
+        if (h.f_logit_softcap > 0.0f) {
+            printf("  логиты ограничены: %g*tanh(x/%g)\n", h.f_logit_softcap,
+                   h.f_logit_softcap);
+        }
+        if (h.f_embd_scale > 0.0f) printf("  вложения масштабируются на %g\n", h.f_embd_scale);
+    }
+
+    // The optional modules were all written against one geometry, and every one of them
+    // indexes it as a single shape. Refused by name here rather than left to produce a
+    // plausible wrong answer - which is what they would do, because a head count that is
+    // wrong by a factor of four still slices a buffer successfully.
+    if (!arch_q3) {
+        if (zopt.on) {
+            printf("--zoned пока только для qwen3moe: модуль зон держит одну геометрию "
+                   "головы на модель, а у \"%s\" она своя на каждом слое\n", h.arch.c_str());
+            return 1;
+        }
+        if (ropt.on() || gopt.on) {
+            // Gemma's expert pair is one fused tensor and the split needs two dispatches of
+            // it; qwen35moe's shared experts are static traffic that the resident set does
+            // not model. Both are tractable, neither is verified, and an unverified split is
+            // exactly what this project has been burned by.
+            printf("--resident/--gpu-experts пока только для qwen3moe.\n");
+            if (arch_g4) {
+                printf("  у gemma4 gate и up лежат в одном тензоре ffn_gate_up_exps, и "
+                       "расщепление требует двух прогонов одного тензора с двумя списками "
+                       "id — как это сделать, написано в build_gemma4_step\n");
+            }
+            return 1;
+        }
+        if (!draft_path.empty()) {
+            printf("спекуляция пока только для qwen3moe: черновик должен делить словарь и "
+                   "геометрию с целевой моделью\n");
+            return 1;
+        }
+        if (n_gen > 0) {
+            printf("--gen пока только для qwen3moe: эта ветка несёт зонный кэш, резидентный "
+                   "набор и половину на карте, и все три написаны под одну геометрию.\n");
+            printf("  для \"%s\" есть --decode-check N: он и генерирует, и сверяет каждый "
+                   "шаг с llama_decode — что для дельта-сети и есть настоящая проверка\n",
+                   h.arch.c_str());
+            return 1;
+        }
     }
 
     llama_backend_init();
@@ -4649,9 +5157,9 @@ int main(int argc, char** argv) {
     // 152k-float logit vectors and the process itself. The 3% on the file covers the
     // repacked layout, which is the same size to within block padding.
     const int ctx_guess = n_ctx_req > 0 ? n_ctx_req : 2048;
-    const double our_kv = double(h.n_layer) * 2.0 * double(ctx_guess) * double(h.d_kv()) * 2.0;
-    const double ref_kv = want_ref ? double(h.n_layer) * 2.0 * 2048.0 * double(h.d_kv()) * 2.0
-                                   : 0.0;
+    const double our_kv = double(ctx_guess) * double(h.kv_elems_per_pos()) * 2.0 +
+                          double(h.n_delta_layers()) * double(h.delta_state_elems()) * 4.0;
+    const double ref_kv = want_ref ? 2048.0 * double(h.kv_elems_per_pos()) * 2.0 : 0.0;
     const double overhead = our_kv + ref_kv + 0.5e9;
 
     // ------------------------------------------------------------------------------------
@@ -4673,8 +5181,25 @@ int main(int argc, char** argv) {
     // Element share rather than a guess: this guard exists because guesses were wrong before.
     const double exp_elems  = double(h.n_layer) * double(h.n_expert) * 3.0 *
                               double(h.n_embd)  * double(h.n_ff_exp);
-    const double attn_elems = double(h.n_layer) * (2.0 * double(h.n_embd) * double(h.d_q()) +
-                                                   2.0 * double(h.n_embd) * double(h.d_kv()));
+    // Summed per layer: gemma4's two attention geometries differ by a factor of two in each
+    // direction, and qwen35moe's delta-net layers have a projection stack of an entirely
+    // different shape. A model-wide d_q() here used to be right by accident and is now the
+    // wrong number for two architectures out of three.
+    double attn_elems = 0.0;
+    for (int il = 0; il < h.n_layer; ++il) {
+        const LayerGeom& G = h.L(il);
+        if (G.kind == LayerKind::DELTA_NET) {
+            // qkv, its gate, and the output projection. The small ssm_* tensors are noise
+            // against these and are left out rather than guessed at.
+            const double key_dim = double(h.ssm_d_state) * double(h.ssm_n_group);
+            const double val_dim = double(h.ssm_d_inner);
+            attn_elems += double(h.n_embd) * (2.0 * key_dim + 2.0 * val_dim) +
+                          val_dim * double(h.n_embd);
+        } else {
+            attn_elems += 2.0 * double(h.n_embd) * double(G.d_q()) +
+                          2.0 * double(h.n_embd) * double(G.d_kv());
+        }
+    }
     const double emb_elems  = 2.0 * double(h.n_vocab) * double(h.n_embd);
     const double all_elems  = exp_elems + attn_elems + emb_elems;
     // token_embd is on iqk's own forbidden list (get_rows cannot read an interleaved type), so
@@ -4885,16 +5410,34 @@ int main(int argc, char** argv) {
     }
     std::memcpy(ref.data(), rl, sizeof(float) * size_t(h.n_vocab));
 
+    // One of these three is filled; which one is the architecture. Declared together so the
+    // graph dispatch below can be a straight three-way branch rather than a cast.
     Weights w;
-    if (!collect(model, h, &w)) {
-        printf("не все тензоры на месте — архитектура не та, что ожидалась\n");
-        return 1;
+    Gemma4Weights w4;
+    Qwen35Weights w35;
+    {
+        bool got = false;
+        if (arch_q3)  got = collect(model, h, &w);
+        if (arch_g4)  got = collect_gemma4(model, &h, &w4);
+        if (arch_q35) got = collect_qwen35(model, h, &w35);
+        if (!got) {
+            printf("не все тензоры на месте — архитектура не та, что ожидалась\n");
+            // The names that ARE there, because "tensor not found" on its own has cost this
+            // project days: the name present is usually one character from the name asked
+            // for.
+            print_present_tensors(model_path.c_str(), "blk.0.");
+            return 1;
+        }
     }
 
     // What the CPU half will actually run on. Printed from the loaded tensors, group by group,
     // because "repacking is on" is a request and this is the outcome: with the experts excluded
     // the win is partial by construction, so the partial has to be visible rather than assumed.
-    {
+    //
+    // Only for qwen3moe. The group list names that architecture's tensors, and printing an
+    // empty table for the others would be worse than printing nothing - it would read as
+    // "nothing got repacked".
+    if (arch_q3) {
         struct Group { const char* label; ggml_tensor* t; };
         const Weights::Layer& L0 = w.layers[0];
         const Group gs[] = {
@@ -4933,24 +5476,65 @@ int main(int argc, char** argv) {
     ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
     Graph g;
-    if (!build(&g, buft, h, w, n)) {
-        printf("наш граф не собрался\n");
-        return 1;
-    }
-
+    // The cache and the recurrent state the comparison prefill runs against.
+    //
+    // qwen3moe goes through build(), which attends over the prompt itself and needs no
+    // cache at all - it is the original verified path and is left exactly as it was. The
+    // other two go through their own step builder with n_past = 0, which is the same
+    // computation with the keys parked in a cache on the way past. That is deliberate:
+    // it means the graph the comparison validates is the SAME graph the generation uses,
+    // rather than a second one written for the comparison and never run again.
+    Cache cmp_kv;
+    DeltaState cmp_ds;
+    // Which row of g.logits holds the last token. build() keeps every row; the step
+    // builders prune to the last one, because their output head is 262144 wide and running
+    // it over a whole prompt costs more than the prompt.
+    int logit_row = n - 1;
     std::vector<int32_t> pos;
-    pos.resize(size_t(n));
-    for (int i = 0; i < n; ++i) pos[size_t(i)] = i;
     std::vector<float> mask;
-    mask.assign(size_t(n) * size_t(n), 0.0f);
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            if (j > i) mask[size_t(i) * size_t(n) + size_t(j)] = -INFINITY;
+
+    if (arch_q3) {
+        if (!build(&g, buft, h, w, n)) {
+            printf("наш граф не собрался\n");
+            return 1;
         }
+        pos.resize(size_t(n));
+        for (int i = 0; i < n; ++i) pos[size_t(i)] = i;
+        mask.assign(size_t(n) * size_t(n), 0.0f);
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                if (j > i) mask[size_t(i) * size_t(n) + size_t(j)] = -INFINITY;
+            }
+        }
+        ggml_backend_tensor_set(g.tokens, toks.data(), 0, ggml_nbytes(g.tokens));
+        ggml_backend_tensor_set(g.positions, pos.data(), 0, ggml_nbytes(g.positions));
+        ggml_backend_tensor_set(g.mask, mask.data(), 0, ggml_nbytes(g.mask));
+    } else {
+        const int nkv = pad32(n);
+        if (!cmp_kv.init(buft, h, nkv)) {
+            printf("кэш для сверки не выделился (%d позиций, %.1f МБ)\n", nkv,
+                   double(nkv) * double(h.kv_elems_per_pos()) * 2.0 / 1e6);
+            return 1;
+        }
+        if (!cmp_ds.init(buft, h)) {
+            printf("состояние дельта-сети для сверки не выделилось\n");
+            return 1;
+        }
+        // From no history. The reference's own decode starts from an empty state too, and
+        // a comparison against a recurrence that began somewhere else is not a comparison.
+        cmp_ds.clear();
+        const bool built = arch_g4
+            ? build_gemma4_step(&g, buft, h, w4, cmp_kv, n, 0, nkv, /*all_logits=*/false,
+                                /*keep_probes=*/true)
+            : build_qwen35_step(&g, buft, h, w35, cmp_kv, cmp_ds, n, 0, nkv,
+                                /*all_logits=*/false, /*keep_probes=*/true);
+        if (!built) {
+            printf("наш граф не собрался\n");
+            return 1;
+        }
+        set_graph_inputs(g, h, toks.data(), n, 0, &pos, &mask);
+        logit_row = 0;
     }
-    ggml_backend_tensor_set(g.tokens, toks.data(), 0, ggml_nbytes(g.tokens));
-    ggml_backend_tensor_set(g.positions, pos.data(), 0, ggml_nbytes(g.positions));
-    ggml_backend_tensor_set(g.mask, mask.data(), 0, ggml_nbytes(g.mask));
 
     const auto t_our = Clock::now();
     ggml_backend_graph_compute(be, g.gf);
@@ -4959,9 +5543,9 @@ int main(int argc, char** argv) {
 
     std::vector<float> ours;
     ours.assign(size_t(h.n_vocab), 0.0f);
-    // The last token's row: logits come out as [n_vocab, n_tokens].
+    // The last token's row: logits come out as [n_vocab, n_rows].
     ggml_backend_tensor_get(g.logits, ours.data(),
-                            size_t(n - 1) * size_t(h.n_vocab) * sizeof(float),
+                            size_t(logit_row) * size_t(h.n_vocab) * sizeof(float),
                             sizeof(float) * size_t(h.n_vocab));
 
     double num = 0.0, den = 0.0, worst = 0.0;
@@ -5013,6 +5597,149 @@ int main(int argc, char** argv) {
            a_ref, buf_r, a_our, buf_o, a_ref == a_our ? "совпал" : "РАСХОДЯТСЯ");
     printf("\nвремя префилла: эталон %.0f мс, наш %.0f мс (%d токенов, %d потоков)\n",
            ref_ms, our_ms, n, threads);
+
+    // ------------------------------------------------------------------------------------
+    // Step-by-step decode against the reference.
+    //
+    // This is the check that matters, and the prefill comparison above is the cheap one.
+    //
+    // A prefill validates one graph over a fixed input. It cannot see a fault in state that
+    // is CARRIED between steps, because a prefill carries nothing - it starts from zero and
+    // ends. qwen35moe's thirty delta-net layers carry a 128x128 matrix per head from one
+    // token to the next, and a slightly wrong carry degrades smoothly: the model stays
+    // grammatical, stays on topic, and reads as "a bit worse", which is indistinguishable
+    // from quantisation noise and from nothing at all. This project has already been burned
+    // once by exactly that failure shape, when a float-reassociation bug moved the logits
+    // 3-6% while every generated token still matched.
+    //
+    // So: our step and the reference's step, one token at a time, compared at each position.
+    // With --probe all it compares every layer of every step, which is the difference
+    // between "they diverge by step 6" and "layer 17 of step 6 is where it starts".
+    if (decode_check > 0) {
+        if (!want_ref) {
+            printf("--decode-check вместе с --no-ref: эта проверка не делает ничего, "
+                   "кроме сверки с эталоном\n");
+            return 1;
+        }
+        if (n_gen > 0) {
+            // Both walk the same reference context forward from position n. Running them one
+            // after the other would feed the second a context that already holds the first
+            // one's tokens, and every number it printed would be measured against the wrong
+            // history - silently, because the shapes are all still right.
+            printf("--decode-check и --gen вместе нельзя: оба продвигают один и тот же "
+                   "эталонный контекст с позиции %d\n", n);
+            return 1;
+        }
+        printf("\nпошаговая сверка декода: %d шагов\n", decode_check);
+        const int n_kv_max = pad32(n + decode_check + 1);
+        if (n_kv_max > 2048) {
+            // The reference context above was created with n_ctx = 2048. Going past it does
+            // not fail loudly - it evicts - so it is refused here instead.
+            printf("--decode-check %d при промпте %d выходит за 2048 позиций эталонного "
+                   "контекста\n", decode_check, n);
+            return 1;
+        }
+        Generator gen;
+        gen.want_probes = (probe_name == "all");
+        if (!gen.init(be, buft, &h, arch_q3 ? &w : nullptr, nullptr, n_kv_max, min_experts,
+                      expert_thresh, arch_g4 ? &w4 : nullptr,
+                      arch_q35 ? &w35 : nullptr)) {
+            return 1;
+        }
+        printf("  кэш %d позиций, %.1f МБ", n_kv_max, gen.kv.bytes(h) / 1e6);
+        if (h.n_delta_layers() > 0) {
+            printf("; состояние дельта-сети %.1f МБ на %d слоёв", gen.ds.bytes() / 1e6,
+                   h.n_delta_layers());
+        }
+        printf("\n");
+
+        // The prompt again, through the generator's own cache this time. Its last-token
+        // logits must match the reference's the same way the graph above did; if they do
+        // not, the fault is in the cached path rather than in anything carried, and the
+        // per-step numbers below would be measuring the wrong thing.
+        std::vector<float> pre;
+        if (!gen.prefill(toks.data(), n, 0, &pre)) return 1;
+        report("префилл через кэш", pre, ref);
+
+        if (!gen.build_decode(n)) return 1;
+        // Greedy, because the check is about arithmetic and not about sampling: both sides
+        // must be fed the same token at every position or the comparison decays into two
+        // different conversations after the first disagreement.
+        llama_token tok = llama_token(argmax_of(pre));
+        std::vector<float> mine, theirs;
+        int n_agree = 0, n_steps = 0;
+        double worst_step_l2 = 0.0;
+        int worst_step = -1;
+        std::vector<llama_token> produced;
+
+        for (int i = 0; i < decode_check; ++i) {
+            const int past = n + i;
+            if (!gen.step(tok, past, &mine)) return 1;
+            // The reference's cb_eval fills `probe` as a side effect of llama_decode, and it
+            // keeps the FIRST value it sees under each name - so a step's layers have to be
+            // cleared before that step's decode or every step would be compared against the
+            // prefill's.
+            if (gen.want_probes) probe.all.clear();
+            if (llama_decode(lctx, llama_batch_get_one(&tok, 1, past, 0))) {
+                printf("  шаг %d: llama_decode не прошёл\n", i);
+                return 1;
+            }
+            const float* rstep = llama_get_logits(lctx);
+            if (!rstep) {
+                printf("  шаг %d: эталонные логиты недоступны\n", i);
+                return 1;
+            }
+            theirs.assign(rstep, rstep + h.n_vocab);
+
+            double snum = 0.0, sden = 0.0;
+            for (int k = 0; k < h.n_vocab; ++k) {
+                const double d = double(mine[size_t(k)]) - double(theirs[size_t(k)]);
+                snum += d * d;
+                sden += double(theirs[size_t(k)]) * double(theirs[size_t(k)]);
+            }
+            const double l2 = sden > 0.0 ? 100.0 * std::sqrt(snum / sden) : -1.0;
+            if (l2 > worst_step_l2) { worst_step_l2 = l2; worst_step = i; }
+            const int am_mine = argmax_of(mine), am_theirs = argmax_of(theirs);
+            const bool same = am_mine == am_theirs;
+            if (same) ++n_agree;
+            ++n_steps;
+            char pm[64] = {0};
+            llama_token_to_piece(model, am_mine, pm, sizeof(pm) - 1, 0, true);
+            printf("  шаг %2d (позиция %4d): L2 %7.4f%%  токен наш %6d '%s'%s\n", i, past,
+                   l2, am_mine, pm, same ? "" : "  — РАСХОДИТСЯ С ЭТАЛОНОМ");
+            if (gen.want_probes) {
+                for (const auto& mineP : gen.dec.probes) {
+                    const std::vector<float>* ref_t = probe.get(mineP.first);
+                    if (!ref_t) continue;
+                    std::vector<float> got(size_t(ggml_nelements(mineP.second)));
+                    ggml_backend_tensor_get(mineP.second, got.data(), 0,
+                                            ggml_nbytes(mineP.second));
+                    report(("    " + mineP.first).c_str(), got, *ref_t);
+                }
+            }
+            produced.push_back(am_mine);
+            // Both sides advance on OUR token, deliberately. Feeding each side its own pick
+            // would let them drift apart into two different contexts and every later number
+            // would describe two different computations rather than one.
+            tok = am_mine;
+            if (tok == llama_token_eos(model)) {
+                printf("  (eos на шаге %d)\n", i);
+                break;
+            }
+        }
+        printf("  итог: %d из %d шагов дали тот же токен; худший L2 %.4f%% на шаге %d\n",
+               n_agree, n_steps, worst_step_l2, worst_step);
+        printf("  наш текст: %s\n",
+               detokenise(model, produced.data(), int(produced.size())).c_str());
+        if (n_agree != n_steps) {
+            printf("  РАСХОЖДЕНИЕ: токены разошлись — граф считает не то, что эталон\n");
+        } else if (worst_step_l2 > 1.0) {
+            // Same tokens is necessary and not sufficient, and this is the line that says so.
+            printf("  ВНИМАНИЕ: токены совпали, но логиты разошлись на %.4f%% — "
+                   "совпадение токенов не является доказательством\n", worst_step_l2);
+        }
+        gen.free_all();
+    }
 
     // Generation with our own cache, and the honest acceptance test: the same tokens, or
     // not. Logit L2 is a diagnostic - two implementations of the same arithmetic will differ
