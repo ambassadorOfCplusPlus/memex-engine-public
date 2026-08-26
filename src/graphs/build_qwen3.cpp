@@ -62,7 +62,7 @@ ggml_cgraph * llm_build_context::build_qwen3() {
                             ext_factor, attn_factor, beta_fast, beta_slow);
                 }
                 cb(Qcur, "Qcur", il);
-                cb(Kcur, "Kcur", il);
+                cb(Kcur, "Kcur_roped", il);
 
                 cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
@@ -312,7 +312,7 @@ ggml_cgraph * llm_build_context::build_qwen3vlmoe() {
                     n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                     );
-            cb(Kcur, "Kcur", il);
+            cb(Kcur, "Kcur_roped", il);
 
             cb(Vcur, "Vcur", il);
 

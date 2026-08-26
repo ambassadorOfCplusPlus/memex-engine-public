@@ -4909,17 +4909,129 @@ static bool llm_load_tensors(
                 ml.expert_tensor_index.deferred_bytes / 1024.0 / 1024.0 / 1024.0);
     }
 
-    if (!ml.use_mmap && ml.repack_tensors) {
-        int n_repacked = 0;
-        for (auto& it : model.tensors_by_name) {
-            if (ggml_backend_buffer_is_host(it.second->buffer)) {
-                auto orig_type = it.second->type;
-                if (it.second->view_src) continue;
-                iqk_repack_tensor(it.second);
-                if (it.second->type != orig_type) ++n_repacked;
+    if (ml.repack_tensors && !dry_run) {
+        // Start from a clean filter: it is process-global, and a second model loaded in the same
+        // process must not inherit the first one's.
+        iqk_set_repack_filter(nullptr, nullptr);
+
+        // Survey first, with no filter installed, so we know what each tensor's layout WOULD
+        // have become. That is what makes the summary below able to distinguish "this type is
+        // not repackable at all" from "this one was deliberately left as stored".
+        struct repack_survey { ggml_type orig; ggml_type wouldbe; };
+        std::unordered_map<std::string, repack_survey> survey;
+        survey.reserve(model.tensors_by_name.size());
+        for (auto & it : model.tensors_by_name) {
+            ggml_tensor * t = it.second;
+            if (t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) continue;
+            survey[it.first] = { t->type, (ggml_type) iqk_repacked_type(t) };
+        }
+
+        // Now install the filter the caller asked for.
+        if (ml.repack_filtered()) {
+            iqk_set_repack_filter(ml.repack_exclude.empty() ? nullptr : ml.repack_exclude.c_str(),
+                                  ml.repack_only.empty()    ? nullptr : ml.repack_only.c_str());
+        }
+
+        int    n_repacked      = 0;
+        size_t relocated_bytes = 0;
+
+        if (!ml.use_mmap) {
+            // The weights are private writable memory, so they can be rewritten where they lie.
+            for (auto& it : model.tensors_by_name) {
+                if (ggml_backend_buffer_is_host(it.second->buffer)) {
+                    auto orig_type = it.second->type;
+                    if (it.second->view_src) continue;
+                    iqk_repack_tensor(it.second);
+                    if (it.second->type != orig_type) ++n_repacked;
+                }
+            }
+        } else {
+            // mmap survived, which means the weights are a READ-ONLY mapping and repacking them
+            // in place would fault. Relocate just the tensors whose layout actually changes into
+            // one private CPU buffer and repack them there. Everything else - whatever the
+            // filter kept, token_embd, the F32 norms - stays file-backed, so it costs no
+            // anonymous RAM and stays cheap for another reader to page in.
+            std::vector<ggml_tensor *> todo;
+            const size_t align = std::max<size_t>(
+                    (size_t) 64, ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type()));
+            auto padded_need = [align](ggml_tensor * t, ggml_type nt) {
+                // Same size to within block padding in every case we know of, but taking the max
+                // costs nothing and a short buffer here would corrupt the next tensor silently.
+                size_t need = std::max(ggml_nbytes(t), ggml_row_size(nt, t->ne[0]) * (size_t) ggml_nrows(t));
+                return (need + align - 1) / align * align;
+            };
+            size_t total = 0;
+            for (auto & it : model.tensors_by_name) {
+                ggml_tensor * t = it.second;
+                if (t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) continue;
+                const ggml_type nt = (ggml_type) iqk_repacked_type(t);
+                if (nt == t->type) continue;   // excluded, or simply not a repackable type
+                todo.push_back(t);
+                total += padded_need(t, nt);
+            }
+            if (total > 0) {
+                ggml_backend_buffer_t rbuf =
+                    ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), total);
+                if (rbuf == nullptr) {
+                    LLAMA_LOG_WARN("%s: could not allocate %.2f MiB to repack outside the mapping; "
+                                   "leaving all tensors as stored\n", __func__, total/1024.0/1024.0);
+                } else {
+                    ggml_backend_buffer_set_usage(rbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    model.bufs.push_back(rbuf);
+                    char * base = (char *) ggml_backend_buffer_get_base(rbuf);
+                    size_t off  = 0;
+                    for (ggml_tensor * t : todo) {
+                        const ggml_type nt = (ggml_type) iqk_repacked_type(t);
+                        const size_t    nb = ggml_nbytes(t);
+                        std::memcpy(base + off, t->data, nb);
+                        t->data   = base + off;
+                        t->buffer = rbuf;
+                        off += padded_need(t, nt);
+                        const ggml_type orig_type = t->type;
+                        iqk_repack_tensor(t);
+                        if (t->type != orig_type) ++n_repacked;
+                    }
+                    relocated_bytes = off;
+                }
             }
         }
-        if (n_repacked > 0) LLAMA_LOG_INFO("============ Repacked %d tensors\n", n_repacked);
+
+        iqk_set_repack_filter(nullptr, nullptr);
+
+        // Report the groups, by name and type. The whole value of a filtered repack is that the
+        // win is PARTIAL, so the partial has to be visible at load rather than guessed at from a
+        // throughput number later.
+        std::map<std::tuple<std::string, std::string, std::string>, int> groups;
+        for (auto & it : model.tensors_by_name) {
+            auto s = survey.find(it.first);
+            if (s == survey.end()) continue;
+            if (s->second.wouldbe == s->second.orig) continue;   // not repackable in any case
+            std::string key = it.first;
+            if (key.compare(0, 4, "blk.") == 0) {
+                size_t q = key.find('.', 4);
+                if (q != std::string::npos) key = "blk.*" + key.substr(q);
+            }
+            const bool did = it.second->type != s->second.orig;
+            groups[std::make_tuple(key, std::string(ggml_type_name(s->second.orig)),
+                                   std::string(did ? ggml_type_name(it.second->type) : "(as stored)"))] += 1;
+        }
+        LLAMA_LOG_INFO("%s: load-time repack: %d tensors repacked, mmap %s%s\n", __func__,
+                n_repacked, ml.use_mmap ? "KEPT" : "off",
+                relocated_bytes ? format(", %.2f MiB relocated out of the mapping to be rewritten",
+                                         relocated_bytes/1024.0/1024.0).c_str() : "");
+        if (!ml.repack_exclude.empty()) {
+            LLAMA_LOG_INFO("%s: load-time repack: names containing [%s] EXCLUDED - they keep "
+                           "their stored type and stay mmap'd\n", __func__, ml.repack_exclude.c_str());
+        }
+        if (!ml.repack_only.empty()) {
+            LLAMA_LOG_INFO("%s: load-time repack: ONLY names containing [%s] repacked - everything "
+                           "else keeps its stored type and stays mmap'd\n", __func__, ml.repack_only.c_str());
+        }
+        for (auto & g : groups) {
+            LLAMA_LOG_INFO("%s: load-time repack: %-34s %-12s -> %-12s (%d tensors)\n", __func__,
+                    std::get<0>(g.first).c_str(), std::get<1>(g.first).c_str(),
+                    std::get<2>(g.first).c_str(), g.second);
+        }
     }
 
     if (model.arch == LLM_ARCH_BITNET) {
@@ -4965,7 +5077,8 @@ static bool llm_load_tensors(
 static int llama_model_load(const std::string & fname, llama_model & model, llama_model_params & params) {
     try {
         llama_model_loader ml(fname, params.ncmoe, params.use_mmap, params.check_tensors,
-                params.repack_tensors, params.use_thp, params.merge_qkv, params.merge_up_gate_exps,
+                params.repack_tensors, params.repack_exclude, params.repack_only,
+                params.use_thp, params.merge_qkv, params.merge_up_gate_exps,
                 params.defer_experts,
                 params.kv_overrides, params.tensor_buft_overrides);
 
@@ -7540,6 +7653,8 @@ struct llama_model_params llama_model_default_params() {
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
+        /*.repack_exclude              =*/ nullptr,
+        /*.repack_only                 =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_mlock                   =*/ false,

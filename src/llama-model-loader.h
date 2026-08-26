@@ -47,6 +47,11 @@ struct llama_model_loader {
     bool use_mmap = false;
     bool check_tensors;
     bool repack_tensors = false;
+    // Name-substring filter for load-time repacking, both senses (see llama_model_params).
+    // Copied, not aliased: the caller's strings need not outlive the call.
+    std::string repack_exclude;
+    std::string repack_only;
+    bool repack_filtered() const { return !repack_exclude.empty() || !repack_only.empty(); }
     bool use_thp = false;
     bool merge_qkv = false;
     bool merge_up_gate_exps = false;
@@ -90,7 +95,8 @@ struct llama_model_loader {
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
     llama_expert_tensor_index expert_tensor_index;
 
-    llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors, bool repack_tensors, bool use_thp,
+    llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors, bool repack_tensors,
+            const char * repack_exclude, const char * repack_only, bool use_thp,
             bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
             const llama_model_kv_override * param_overrides_p,
             const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);

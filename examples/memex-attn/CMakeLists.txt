@@ -1,0 +1,8 @@
+set(TARGET llama-memex-attn)
+set(MEMEX_DIR "C:/Users/User11/Desktop/MemeX/cpp")
+if(EXISTS "${MEMEX_DIR}/src/kv_zones.cpp")
+    add_executable(${TARGET} memex-attn.cpp "${MEMEX_DIR}/src/kv_zones.cpp")
+    target_include_directories(${TARGET} PRIVATE "${MEMEX_DIR}/include")
+    target_link_libraries(${TARGET} PRIVATE ggml ${CMAKE_THREAD_LIBS_INIT})
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+endif()

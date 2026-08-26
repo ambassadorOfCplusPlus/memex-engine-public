@@ -10146,6 +10146,106 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     ctx->transfer_ctx.reset();
 }
 
+// ---------------------------------------------------------------------------------------
+// Opt-in transfer batching (declared in ggml-vulkan.h)
+//
+// Same machinery as the set_tensor_async implementations above, but reached only by a caller
+// that names it, so enabling it costs nothing to anyone else. The reason that matters is in
+// the comment on the interface table below: the async interface entries cannot be turned on
+// wholesale without breaking the fused-MoE path in ggml_backend_sched_copy_inputs.
+//
+// One command buffer, many copies, one submit, one fence.
+// ---------------------------------------------------------------------------------------
+GGML_CALL void ggml_backend_vk_batch_begin(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->transfer_ctx.expired()) {
+        return;   // already open; nesting is a no-op so begin/end can bracket loosely
+    }
+    vk_context transfer_ctx = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
+    ctx->transfer_ctx = transfer_ctx;
+    ggml_vk_ctx_begin(ctx->device, transfer_ctx);
+}
+
+GGML_CALL bool ggml_backend_vk_batch_set_tensor(ggml_backend_t backend, ggml_tensor * tensor,
+                                               const void * data, size_t offset, size_t size) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (ctx->transfer_ctx.expired()) {
+        return false;   // no open batch
+    }
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_vk(tensor->buffer)) {
+        return false;
+    }
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+    vk_buffer dst = buf_ctx->dev_buffer;
+    // A host-visible destination is written by plain memcpy, with no command buffer at all;
+    // batching it would be slower, not faster, and buffer_write_2d_async aborts on it.
+    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+        return false;
+    }
+    // The source must be pinned. With non-pinned memory buffer_write_2d_async falls back to
+    // the single shared device staging buffer, and several batched copies would all stage
+    // through the same bytes at offset 0 - the last writer would win and the rest would
+    // silently upload the wrong expert. Refusing is the only safe answer.
+    vk_buffer src_pinned = nullptr;
+    size_t    src_offset = 0;
+    ggml_vk_host_get(ctx->device, data, src_pinned, src_offset);
+    if (src_pinned == nullptr) {
+        return false;
+    }
+    vk_context transfer_ctx = ctx->transfer_ctx.lock();
+    ggml_vk_buffer_write_async(transfer_ctx, dst,
+                               vk_tensor_offset(tensor) + tensor->view_offs + offset,
+                               data, size);
+    return true;
+}
+
+GGML_CALL void ggml_backend_vk_batch_end(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (ctx->transfer_ctx.expired()) {
+        return;
+    }
+    vk_context transfer_ctx = ctx->transfer_ctx.lock();
+    ggml_vk_ctx_end(transfer_ctx);
+    // Only pinned sources are accepted above, so in_memcpys is empty; drained anyway so the
+    // contract does not depend on that staying true.
+    for (auto& cpy : transfer_ctx->in_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    ggml_vk_submit(transfer_ctx, ctx->fence);
+    ggml_vk_wait_for_fence(ctx);
+    for (auto& cpy : transfer_ctx->out_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    ctx->transfer_ctx.reset();
+}
+
+GGML_CALL void * ggml_backend_vk_tensor_mapped_ptr(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (buffer == nullptr || !ggml_backend_buffer_is_vk(buffer)) {
+        return nullptr;
+    }
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+    vk_buffer buf = buf_ctx->dev_buffer;
+    if (buf == nullptr || buf->ptr == nullptr) {
+        return nullptr;
+    }
+    // Coherent as well as visible: without it the read would need an explicit invalidate and
+    // the caller has no way to issue one.
+    const bool visible  = (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) != vk::MemoryPropertyFlags{};
+    const bool coherent = (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent) != vk::MemoryPropertyFlags{};
+    if (!visible || !coherent) {
+        return nullptr;
+    }
+    // The tensor's own bytes, not the buffer base: several graph tensors share one buffer.
+    return (void *)((uint8_t *)buf->ptr + vk_tensor_offset(tensor) + tensor->view_offs);
+}
+
 static bool ggml_vk_is_empty(ggml_tensor * node) {
     return ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
 }
@@ -10697,7 +10797,31 @@ static bool ggml_backend_vk_offload_op(ggml_backend_t backend, const ggml_tensor
     UNUSED(backend);
 }
 
-// TODO: enable async and synchronize
+// DO NOT enable the async entries below by uncommenting them. Investigated and measured; the
+// implementations above are stale in three independent ways, in increasing order of severity:
+//
+//  1. ggml_backend_vk_cpy_tensor_async has the wrong arity. ggml_backend_i::cpy_tensor_async is
+//     (backend_src, backend_dst, src, dst) - see ggml-backend-impl.h - and the implementation
+//     takes (backend, src, dst). It does not compile as written, which dates the whole block.
+//
+//  2. set_tensor_async calls ggml_vk_buffer_write_async with sync_staging defaulted to false,
+//     and ggml_vk_buffer_write_2d_async does GGML_ABORT("Asynchronous write to non-pinned
+//     memory not supported") on any source that is not Vulkan-pinned. The fused-MoE expert
+//     copies in ggml_backend_sched_copy_inputs (ggml-backend.cpp, the
+//     ggml_backend_tensor_set_async call in the input->ne[2] > 1 branch) hand it a raw model
+//     weight pointer, which is never pinned. Enabling set_tensor_async therefore turns the
+//     fork's default -fmoe path into an immediate abort. Note that -no-fmoe bypasses exactly
+//     that branch, so a regression test with -no-fmoe would NOT catch this.
+//
+//  3. Even with pinned sources, those same expert copies are followed by
+//     ggml_backend_graph_compute_async with no intervening ggml_backend_synchronize, and
+//     ggml_backend_vk_graph_compute does not flush a pending transfer_ctx. The copies would be
+//     recorded and never submitted before the compute that reads them - silent wrong results,
+//     on a different queue from the compute, so not even orderable without a fence.
+//
+// Callers that want the fence folding can get it explicitly and safely through
+// ggml_backend_vk_batch_begin / _batch_set_tensor / _batch_end, implemented above, which
+// require a pinned source and end in exactly one submit and one fence.
 static ggml_backend_i ggml_backend_vk_interface = {
     /* .get_name                = */ ggml_backend_vk_name,
     /* .free                    = */ ggml_backend_vk_free,

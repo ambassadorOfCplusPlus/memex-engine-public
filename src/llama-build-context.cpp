@@ -1431,6 +1431,134 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     return cur;
 }
 
+
+// MemeX: make every token of a batch route to one shared set of experts.
+//
+// Why this exists. A recorded trace of this model shows the union of experts over
+// k consecutive tokens growing sublinearly - 20 experts over 5 tokens instead of
+// 40 - so consecutive tokens already want overlapping sets. Forcing them to share
+// one set closes the remaining gap and changes the shape of the work twice over:
+// the batch reads one set of weights instead of several, and the per-token
+// matrix-vector products become one matrix-matrix product, which on this CPU runs
+// several times faster (measured: 34.6 t/s prefill against 8.9 t/s generation).
+//
+// The set is chosen by summing each expert's routing score across the batch, so it
+// is the batch's own preference rather than the first token's. Gate weights are
+// left untouched: only selection is shared, and each token keeps its own weights,
+// which is what makes the change cheap in quality terms.
+//
+// Enabled by MEMEX_SHARED_EXPERTS=1 so the arm can be measured against the
+// unmodified path in the same binary.
+static void memex_share_expert_scores(struct ggml_tensor * dst,
+                                      const struct ggml_tensor * a,
+                                      int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+    const int64_t n_expert = a->ne[0];
+    const int64_t n_tokens = a->ne[1];
+    if (ith != 0) {
+        return;                       // trivially cheap: one thread does it all
+    }
+    for (int64_t e = 0; e < n_expert; ++e) {
+        float sum = 0.0f;
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            sum += *(const float *)((const char *) a->data + t*a->nb[1] + e*a->nb[0]);
+        }
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            *(float *)((char *) dst->data + t*dst->nb[1] + e*dst->nb[0]) = sum;
+        }
+    }
+}
+
+static bool memex_shared_experts_enabled() {
+    static const int on = [] {
+        const char * v = getenv("MEMEX_SHARED_EXPERTS");
+        return v && *v && *v != '0' ? 1 : 0;
+    }();
+    return on != 0;
+}
+
+
+// ---------------------------------------------------------------------------
+// MemeX: cache-conditional routing.
+//
+// The mask says which experts of each layer are resident in fast memory; the bonus is
+// applied to the selection scores so a near-tie resolves towards something already in
+// memory. Both come from the environment so the arm can be measured against the
+// unmodified path in the same binary.
+namespace memex_cc {
+
+struct Masks {
+    int n_layers = 0;
+    int n_experts = 0;
+    std::vector<float> data;      // n_layers * n_experts, 1.0 where resident
+    float bonus = 0.0f;
+    bool loaded = false;
+};
+
+static Masks & masks() {
+    static Masks m;
+    if (m.loaded) {
+        return m;
+    }
+    m.loaded = true;
+    const char * b = getenv("MEMEX_CACHE_BONUS");
+    m.bonus = b ? (float) atof(b) : 0.0f;
+    const char * path = getenv("MEMEX_RESIDENT_FILE");
+    if (m.bonus <= 0.0f || !path) {
+        return m;
+    }
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "MemeX: не открывается файл резидентных наборов %s\n", path);
+        return m;
+    }
+    int32_t hdr[2] = {0, 0};
+    if (fread(hdr, sizeof(int32_t), 2, f) == 2 && hdr[0] > 0 && hdr[1] > 0) {
+        m.n_layers = hdr[0];
+        m.n_experts = hdr[1];
+        m.data.resize((size_t) m.n_layers * m.n_experts);
+        const size_t want = m.data.size();
+        if (fread(m.data.data(), sizeof(float), want, f) != want) {
+            m.data.clear();
+            m.n_layers = 0;
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "MemeX: бонус резидентным %.3f, маска %d x %d\n",
+            m.bonus, m.n_layers, m.n_experts);
+    return m;
+}
+
+// One node, computed on the host: add bonus * row_max to the resident experts.
+static void apply_bonus(struct ggml_tensor * dst, const struct ggml_tensor * a,
+                        int ith, int nth, void * userdata) {
+    const Masks & m = masks();
+    const int layer = (int) (intptr_t) userdata;
+    const int64_t n_expert = a->ne[0];
+    const int64_t n_tokens = ggml_nelements(a) / (n_expert > 0 ? n_expert : 1);
+    const float * mask = (layer >= 0 && layer < m.n_layers &&
+                          (int) n_expert == m.n_experts)
+                             ? m.data.data() + (size_t) layer * m.n_experts
+                             : nullptr;
+    // Rows are independent, so threads split them without any synchronisation.
+    for (int64_t t = ith; t < n_tokens; t += nth) {
+        const float * src = (const float *) ((const char *) a->data + t * a->nb[1]);
+        float * out = (float *) ((char *) dst->data + t * dst->nb[1]);
+        float mx = src[0];
+        for (int64_t e = 1; e < n_expert; ++e) {
+            mx = src[e] > mx ? src[e] : mx;
+        }
+        const float add = m.bonus * mx;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            out[e] = src[e] + ((mask && mask[e] > 0.0f) ? add : 0.0f);
+        }
+    }
+}
+
+static bool enabled() { return masks().bonus > 0.0f && !masks().data.empty(); }
+
+}  // namespace memex_cc
+
 ggml_tensor * llm_build_context::llm_build_moe_ffn(
         ggml_context * ctx,
        llama_context & lctx,
@@ -1511,7 +1639,24 @@ llm_expert_gating_func_type   gating_op,
         selection_probs = logits;
     }
 
+    // MemeX: bias the selection towards experts already in fast memory. Applied to
+    // the scores only - the gate weights still come from the untouched `probs`, so a
+    // substituted expert is weighted by what the router actually said about it.
+    if (memex_cc::enabled()) {
+        selection_probs = ggml_map_custom1(ctx, selection_probs, memex_cc::apply_bonus,
+                                           GGML_N_TASKS_MAX,
+                                           (void *) (intptr_t) il);
+        cb(selection_probs, "ffn_moe_probs_cachecond", il);
+    }
+
     // select experts
+    if (selected_experts == nullptr && memex_shared_experts_enabled() && n_tokens > 1) {
+        // one set for the whole batch: identical score rows make top_k agree
+        ggml_tensor * shared = ggml_map_custom1(ctx, selection_probs,
+                memex_share_expert_scores, 1, nullptr);
+        cb(shared, "ffn_moe_shared_scores", il);
+        selected_experts = ggml_top_k(ctx, shared, n_expert_used);
+    }
     if (selected_experts == nullptr) {
         const bool grouped_routing = lctx.cparams.grouped_expert_routing &&
                 (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_BAILINGMOE3);
@@ -1519,9 +1664,18 @@ llm_expert_gating_func_type   gating_op,
             auto& hparams = lctx.model.hparams;
             selected_experts = ggml_grouped_topk(ctx, selection_probs, hparams.n_expert_groups, hparams.n_group_used, 2, n_expert_used);
         } else {
-            //selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
-            //        lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens]
-            selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+            // Expert reduction, when asked for. This was commented out, which made -ser a
+            // flag that parsed cleanly and did nothing - the worst kind, because a sweep
+            // over it reports "no effect" and the idea gets written off. Restored behind
+            // the same condition the option implies: reduction only when a floor was set.
+            if (lctx.cparams.min_experts >= 0 &&
+                lctx.cparams.min_experts < n_expert_used) {
+                selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
+                        lctx.cparams.min_experts,
+                        lctx.cparams.thresh_experts); // [n_expert_used, n_tokens]
+            } else {
+                selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+            }
         }
     }
     cb(selected_experts, "ffn_moe_topk", il);

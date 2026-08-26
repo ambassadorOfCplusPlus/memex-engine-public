@@ -419,12 +419,29 @@ extern "C" {
 
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 
+        // Which tensors load-time repacking may touch, selected by name substring. Both are
+        // comma-separated lists; NULL (the default) means "not set", i.e. today's behaviour of
+        // repacking everything repackable. Only meaningful together with repack_tensors.
+        //   repack_exclude : a tensor whose name contains any entry is left as stored.
+        //   repack_only    : if set, only tensors whose name contains an entry are repacked.
+        // They are the two boundaries of the same question and both are needed, because which
+        // half of the model wants the interleaved layout depends on which half runs on the CPU:
+        //   repack_exclude="_exps."  experts stay plain and uploadable to another backend;
+        //   repack_only   ="_exps."  experts get the fast CPU kernels, attention/head/router
+        //                            stay plain and uploadable instead.
+        // Setting either one also keeps mmap alive: only the tensors that are actually rewritten
+        // are relocated out of the read-only mapping, the rest stay file-backed. Note that this
+        // is not free memory - a repacked tensor is private memory by necessity, whichever it is
+        // - it only spares the tensors that keep their stored layout.
+        const char * repack_exclude;
+        const char * repack_only;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;    // only load the vocabulary, no weights
         bool use_mmap;      // use mmap if possible
         bool use_mlock;     // force system to keep model in RAM
         bool check_tensors; // validate model tensor data
-        bool repack_tensors;// repack if available
+        bool repack_tensors;// repack if available (see repack_exclude / repack_only above)
         bool use_thp;       // use transparent huge pages (linux only)
         bool validate_quants; // if true, check for NaNs while loading the model
         bool merge_qkv;     // if true, merge separate Q, K, V tensors into a single, contiguous tensor

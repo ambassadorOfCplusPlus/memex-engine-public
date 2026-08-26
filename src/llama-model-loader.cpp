@@ -301,7 +301,8 @@ static void coalesce_ranges(std::vector<llama_file_range> & ranges) {
 }
 
 llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors,
-        bool repack_tensors, bool use_thp, bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
+        bool repack_tensors, const char * repack_exclude, const char * repack_only,
+        bool use_thp, bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
     int trace = 0;
@@ -585,7 +586,19 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
         use_mmap = false;
     }
-    if (repack_tensors) {
+    // Repacking rewrites the weights in place, and on every platform here the model mapping is
+    // read-only (Windows: CreateFileMappingA(PAGE_READONLY) + MapViewOfFile(FILE_MAP_READ), see
+    // llama-mmap.cpp:454). So "repack in place" and "mmap" are genuinely exclusive - for the
+    // tensors that get repacked.
+    //
+    // With a filter set they are no longer all of them, so the mapping is worth keeping and only
+    // the rewritten minority is relocated out of it (llm_load_tensors does that, right where the
+    // in-place repack used to be). Note what this does and does not buy: a repacked tensor is
+    // private memory by necessity, so the saving is exactly the bytes that keep their stored
+    // layout - large when the experts are excluded, small when only the experts are repacked.
+    this->repack_exclude = repack_exclude ? repack_exclude : "";
+    this->repack_only    = repack_only    ? repack_only    : "";
+    if (repack_tensors && !repack_filtered()) {
         use_mmap = false;
     }
 

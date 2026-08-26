@@ -327,6 +327,26 @@ void repack_bf16_bf16_r16(const void * GGML_RESTRICT src, void * GGML_RESTRICT d
 void iqk_repack_tensor(struct ggml_tensor * tensor);
 bool iqk_modify_tensor(struct ggml_tensor * tensor);
 
+// Load-time repack filter, by tensor-name substring, in both senses.
+//
+// There is already a hard-wired exclusion list (token_embd.weight, per_layer_token_embd.weight)
+// because ggml_get_rows on a repacked tensor silently produces wrong numbers: a
+// dequantize_row_*_r4/_r8 decodes several interleaved rows at once, while get_rows calls it one
+// row at a time. This extends that same list with caller-supplied name substrings, so a
+// consumer that needs some tensors to keep their stored layout - because another backend has to
+// read the plain bytes, say - can say which by name instead of a second, parallel mechanism.
+//
+// Both arguments are comma-separated substring lists; nullptr or "" means "not set".
+//   exclude : a tensor whose name CONTAINS any entry is never repacked.
+//   only    : if set, a tensor whose name contains NO entry is never repacked.
+// They compose (exclude wins), so either boundary can be expressed without a rebuild:
+//   exclude="_exps."  -> repack everything but the experts
+//   only   ="_exps."  -> repack only the experts
+//
+// Set before loading; read, never written, by the repack worker threads. Both iqk_repack_tensor
+// and iqk_repacked_type honour it, so the reported type and the actual layout cannot disagree.
+void iqk_set_repack_filter(const char * exclude, const char * only);
+
 int iqk_repacked_type(const struct ggml_tensor * tensor); // int instead of ggml_type so we don't need to include ggml.h
 bool iqk_should_modify_tensor(const struct ggml_tensor * tensor);
 

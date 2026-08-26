@@ -8445,9 +8445,64 @@ const Modify * get_modify_info(ggml_type type) {
     auto it = k_mod_map.find(type);
     return it != k_mod_map.end() ? &it->second : nullptr;
 }
-bool is_forbidden_tensor(const std::string& name) {
-    return (name == "token_embd.weight" || name == "per_layer_token_embd.weight");
+// Caller-supplied name substrings, in both senses. Written once (before the model is loaded),
+// read from the repack worker threads, hence the shared_ptr swap rather than mutating a vector
+// in place: a reader always sees a complete list.
+struct RepackFilter {
+    std::vector<std::string> exclude;   // matching -> never repacked
+    std::vector<std::string> only;      // if non-empty, non-matching -> never repacked
+};
+std::mutex& repack_filter_mutex() {
+    static std::mutex mu;
+    return mu;
 }
+std::shared_ptr<const RepackFilter>& repack_filter() {
+    static std::shared_ptr<const RepackFilter> f;
+    return f;
+}
+bool name_matches_any(const std::string& name, const std::vector<std::string>& pats) {
+    for (const auto& s : pats) {
+        if (name.find(s) != std::string::npos) return true;
+    }
+    return false;
+}
+
+bool is_forbidden_tensor(const std::string& name) {
+    if (name == "token_embd.weight" || name == "per_layer_token_embd.weight") return true;
+    std::shared_ptr<const RepackFilter> f;
+    {
+        std::lock_guard<std::mutex> lk(repack_filter_mutex());
+        f = repack_filter();
+    }
+    if (!f) return false;
+    if (name_matches_any(name, f->exclude)) return true;
+    if (!f->only.empty() && !name_matches_any(name, f->only)) return true;
+    return false;
+}
+
+void split_substrings(const char * s, std::vector<std::string>& out) {
+    if (!s) return;
+    const char * p = s;
+    while (*p) {
+        const char * q = std::strchr(p, ',');
+        std::string item = q ? std::string(p, q) : std::string(p);
+        size_t a = item.find_first_not_of(" \t");
+        size_t b = item.find_last_not_of(" \t");
+        if (a != std::string::npos) out.push_back(item.substr(a, b - a + 1));
+        if (!q) break;
+        p = q + 1;
+    }
+}
+}
+
+void iqk_set_repack_filter(const char * exclude, const char * only) {
+    auto f = std::make_shared<RepackFilter>();
+    split_substrings(exclude, f->exclude);
+    split_substrings(only,    f->only);
+    std::lock_guard<std::mutex> lk(repack_filter_mutex());
+    repack_filter() = (f->exclude.empty() && f->only.empty())
+                          ? nullptr
+                          : std::shared_ptr<const RepackFilter>(f);
 }
 
 bool iqk_should_modify_tensor([[maybe_unused]] const struct ggml_tensor * tensor) {
