@@ -699,6 +699,85 @@ int main(int argc, char** argv) {
     }
 
     // ===========================================================================================
+    // MEASUREMENT 5. The chain of adds is a laboratory graph. A real one is mostly matmuls, and for
+    // a graph that IS matmuls the submit rule reads differently and, it turns out, badly at exactly
+    // the size the card plan uses.
+    //
+    // With N identical matmuls of B bytes each, total_mat_mul_bytes = N*B and the threshold is
+    // N*B/40. Each matmul adds B to the accumulator, so a submit happens every ceil(N/40) matmuls -
+    // and ceil(N/40) is ONE for every N up to forty. A fifteen-node layer graph submits after every
+    // matmul in it. Only once the graph holds more than forty matmuls does the rule start batching,
+    // and the doubling for the first three submits pushes the useful threshold higher still.
+    //
+    // So the same 720 nodes cost very different amounts depending on whether they are handed to
+    // ggml as forty-eight graphs of fifteen nodes or as one graph of 720. This measures which.
+    // ===========================================================================================
+    printf("\n"
+           "===========================================================================\n"
+           "ИЗМЕРЕНИЕ 5 — граф из одних matmul: цена узла как функция размера ГРАФА.\n"
+           "  Правило ggml даёт submit каждые ceil(N/40) матумножений, а ceil(N/40)\n"
+           "  равно единице для любого N до сорока. Значит граф на слой (15 узлов)\n"
+           "  делает submit после каждого matmul, а граф на весь токен — нет.\n"
+           "===========================================================================\n");
+    {
+        const int d = 256;                       // src0 = 256x256 f32 = 256 КиБ
+        const std::vector<int> nm = {8, 15, 30, 45, 60, 120, 240};
+        printf("  %8s %14s %14s %16s\n", "matmul", "всего,мкс", "мкс/узел", "submit каждые");
+        for (int n : nm) {
+            std::vector<double> v;
+            for (int r = 0; r < replicates; ++r) {
+                // Built here rather than through build(): the chain is matmuls, not adds.
+                ggml_init_params ip_in = {ggml_tensor_overhead() * 4 + 1024, nullptr, true};
+                ggml_context* c_in = ggml_init(ip_in);
+                ggml_tensor* w = ggml_new_tensor_2d(c_in, GGML_TYPE_F32, d, d);
+                ggml_tensor* x = ggml_new_tensor_2d(c_in, GGML_TYPE_F32, d, 1);
+                ggml_backend_buffer_t b_in = ggml_backend_alloc_ctx_tensors_from_buft(c_in, buft);
+                if (!b_in) { ggml_free(c_in); printf("  %8d  нет памяти\n", n); break; }
+                {
+                    std::vector<float> h(std::size_t(d) * std::size_t(d), 0.01f);
+                    ggml_backend_tensor_set(w, h.data(), 0, sizeof(float) * h.size());
+                    std::vector<float> hx(std::size_t(d), 0.5f);
+                    ggml_backend_tensor_set(x, hx.data(), 0, sizeof(float) * hx.size());
+                }
+                ggml_init_params ip = {
+                    ggml_tensor_overhead() * std::size_t(n + 8) + ggml_graph_overhead(), nullptr, true};
+                ggml_context* c = ggml_init(ip);
+                ggml_cgraph* gf = ggml_new_graph(c);
+                ggml_tensor* cur = x;
+                for (int i = 0; i < n; ++i) cur = ggml_mul_mat(c, w, cur);
+                ggml_build_forward_expand(gf, cur);
+                ggml_gallocr_t ga = ggml_gallocr_new(buft);
+                if (!ga || !ggml_gallocr_reserve(ga, gf) || !ggml_gallocr_alloc_graph(ga, gf)) {
+                    if (ga) ggml_gallocr_free(ga);
+                    ggml_free(c); ggml_backend_buffer_free(b_in); ggml_free(c_in);
+                    printf("  %8d  не удалось разместить\n", n);
+                    break;
+                }
+                for (int i = 0; i < 8; ++i) ggml_backend_graph_compute(be, gf);
+                std::vector<double> inner;
+                for (int s = 0; s < 5; ++s) {
+                    const int reps = std::max(8, std::min(2000, 40000 / std::max(n, 1)));
+                    const auto t0 = Clock::now();
+                    for (int q = 0; q < reps; ++q) ggml_backend_graph_compute(be, gf);
+                    inner.push_back(us_since(t0) / double(reps));
+                }
+                v.push_back(median_of(inner));
+                ggml_gallocr_free(ga);
+                ggml_free(c);
+                ggml_backend_buffer_free(b_in);
+                ggml_free(c_in);
+            }
+            if (v.empty()) continue;
+            const point p = summarise(v);
+            printf("  %8d %14.1f %14.2f %16d   (разброс %.1f%%)\n",
+                   n, p.med, p.med / double(n), (n + 39) / 40, 100.0 * p.spread);
+        }
+        printf("  «submit каждые» — предсказание по правилу ggml, не измерение. Если цена\n"
+               "  узла падает там же, где это число становится больше единицы, правило\n"
+               "  прочитано верно.\n");
+    }
+
+    // ===========================================================================================
     // What it means for the plan, in the plan's own units.
     // ===========================================================================================
     printf("\n"
