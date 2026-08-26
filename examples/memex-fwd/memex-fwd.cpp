@@ -635,6 +635,23 @@ ggml_tensor* norm(ggml_context* c, ggml_tensor* x, ggml_tensor* w, float eps) {
     return ggml_mul(c, ggml_rms_norm(c, x, eps), w);
 }
 
+// The same thing as one op, which is what the reference's llm_build_norm actually calls
+// (llama-build-context.cpp: LLM_NORM_RMS with a weight goes to ggml_fused_rms_norm).
+//
+// It matters that it is the same OP and not merely the same arithmetic. The fused kernel
+// computes (scale*w[j])*x[j] and the pair above computes (scale*x[j])*w[j]; in f32 those
+// differ in the last bit, which is harmless on its own and is exactly the kind of harmless
+// that compounds through thirty layers into a divergence nobody can attribute afterwards.
+// This project has already lost days to a 3-6% logit difference that turned out to be pure
+// reassociation, so the two new architectures are built out of the reference's own ops
+// wherever one exists.
+//
+// norm() above is deliberately left alone: the qwen3moe path is verified against the
+// reference with it, and re-verifying that is a separate job from landing two architectures.
+ggml_tensor* fnorm(ggml_context* c, ggml_tensor* x, ggml_tensor* w, float eps) {
+    return ggml_fused_rms_norm(c, x, w, eps);
+}
+
 struct Weights {
     ggml_tensor* tok_embd = nullptr;
     ggml_tensor* out_norm = nullptr;
@@ -745,6 +762,248 @@ bool collect_dense(llama_model* m, const HParams& h, DenseWeights* w) {
     }
     return ok;
 }
+
+// Gemma 4 26B-A4B. Every layer carries BOTH a dense feed-forward and a routed one, and the
+// two are combined through their own pair of post-norms rather than one replacing the other -
+// so "gate/up/down" and "gate_up_exps/down_exps" are both present and both live.
+struct Gemma4Weights {
+    ggml_tensor* tok_embd = nullptr;
+    ggml_tensor* out_norm = nullptr;
+    ggml_tensor* out = nullptr;          // tied to tok_embd: the file has no output.weight
+    struct Layer {
+        ggml_tensor* attn_norm = nullptr;
+        ggml_tensor* wq = nullptr;
+        ggml_tensor* wk = nullptr;
+        // Absent on the five full-attention layers, and that is the architecture rather than
+        // a broken file: those layers use the K projection as their V. See collect_gemma4.
+        ggml_tensor* wv = nullptr;
+        ggml_tensor* wo = nullptr;
+        ggml_tensor* q_norm = nullptr;
+        ggml_tensor* k_norm = nullptr;
+        ggml_tensor* post_attn_norm = nullptr;
+        // The dense half
+        ggml_tensor* ffn_norm = nullptr;
+        ggml_tensor* gate = nullptr;
+        ggml_tensor* up = nullptr;
+        ggml_tensor* down = nullptr;
+        // The routed half
+        ggml_tensor* pre_ffw_norm_2 = nullptr;
+        ggml_tensor* router = nullptr;
+        ggml_tensor* router_scale = nullptr;    // rms weight for the ROUTER's own input
+        ggml_tensor* gate_up_exps = nullptr;    // fused: [n_embd, 2*n_ff_exp, n_expert]
+        ggml_tensor* down_exps = nullptr;
+        ggml_tensor* down_scale = nullptr;      // [n_expert], folded into the routing weight
+        // The join
+        ggml_tensor* post_ffw_norm_1 = nullptr;
+        ggml_tensor* post_ffw_norm_2 = nullptr;
+        ggml_tensor* post_ffw_norm = nullptr;
+        ggml_tensor* out_scale = nullptr;       // [1], multiplies the whole layer output
+    };
+    std::vector<Layer> layers;
+};
+
+// Qwen 3.6 35B-A3B. A hybrid: one layer in four is attention, the rest are a gated
+// delta-net with a fixed-size recurrent state. Every layer, of either kind, has the same
+// routed-plus-shared feed-forward hanging off it.
+struct Qwen35Weights {
+    ggml_tensor* tok_embd = nullptr;
+    ggml_tensor* out_norm = nullptr;
+    ggml_tensor* out = nullptr;
+    struct Layer {
+        ggml_tensor* attn_norm = nullptr;   // every layer
+        // post_attention_norm under its own name, because that is not what it does: the file
+        // has no ffn_norm, and the reference aliases layer.ffn_norm = layer.attn_post_norm
+        // (llama-load-tensors.cpp). It is the feed-forward's PRE-norm. Nothing normalises the
+        // attention output before its residual in this architecture.
+        ggml_tensor* ffn_norm = nullptr;
+        // Attention layers only. wq is DOUBLE width: per head it carries 256 of query then
+        // 256 of output gate, interleaved, not two contiguous halves.
+        ggml_tensor* wq = nullptr;
+        ggml_tensor* wk = nullptr;
+        ggml_tensor* wv = nullptr;
+        ggml_tensor* wo = nullptr;
+        ggml_tensor* q_norm = nullptr;
+        ggml_tensor* k_norm = nullptr;
+        // Delta-net layers only.
+        ggml_tensor* wqkv = nullptr;        // [n_embd, 2*key_dim + value_dim], q|k|v in order
+        ggml_tensor* wqkv_gate = nullptr;   // [n_embd, value_dim]
+        ggml_tensor* ssm_conv1d = nullptr;  // [d_conv, conv_dim]
+        ggml_tensor* ssm_dt = nullptr;      // [n_v_heads] bias
+        ggml_tensor* ssm_a = nullptr;       // [n_v_heads], holds -exp(A_log): all negative
+        ggml_tensor* ssm_beta = nullptr;    // [n_embd, n_v_heads]
+        ggml_tensor* ssm_alpha = nullptr;   // [n_embd, n_v_heads]
+        ggml_tensor* ssm_norm = nullptr;    // [head_v_dim], the gated output norm
+        ggml_tensor* ssm_out = nullptr;     // [value_dim, n_embd]
+        // Every layer.
+        ggml_tensor* router = nullptr;
+        ggml_tensor* gate_exps = nullptr;
+        ggml_tensor* up_exps = nullptr;
+        ggml_tensor* down_exps = nullptr;
+        ggml_tensor* shexp_gate = nullptr;  // [n_embd] -> one sigmoid scalar per token
+        ggml_tensor* gate_shexp = nullptr;
+        ggml_tensor* up_shexp = nullptr;
+        ggml_tensor* down_shexp = nullptr;
+    };
+    std::vector<Layer> layers;
+};
+
+// Gemma 4's tensors, plus the two per-layer facts that are stored as tensors rather than as
+// metadata: whether the layer has its own V projection, and the rope divisors.
+bool collect_gemma4(llama_model* m, HParams* h, Gemma4Weights* w) {
+    bool ok = true;
+    w->tok_embd = need(m, "token_embd.weight", &ok);
+    w->out_norm = need(m, "output_norm.weight", &ok);
+    w->out = llama_get_model_tensor(m, "output.weight");
+    if (!w->out) {
+        // Expected for this file rather than tolerated: gemma4 ships no output head.
+        printf("gemma4: output.weight отсутствует, голова связана с token_embd\n");
+        w->out = w->tok_embd;
+    }
+    // One model-level tensor, not one per layer - the name carries no %d. Its 256 entries are
+    // 1.0 for the first 64 pairs and 1e30 for the remaining 192, and 1e30 drives theta to
+    // zero: the full-attention layers therefore rotate only dimensions 0..127 of their 512.
+    // Handing null instead does not fail, it rotates 384 dimensions that must not move.
+    ggml_tensor* rope_freqs = llama_get_model_tensor(m, "rope_freqs.weight");
+    w->layers.resize(size_t(h->n_layer));
+    int n_shared_v = 0;
+    for (int il = 0; il < h->n_layer; ++il) {
+        const std::string p = "blk." + std::to_string(il) + ".";
+        Gemma4Weights::Layer& L = w->layers[size_t(il)];
+        LayerGeom& G = h->L(il);
+        L.attn_norm = need(m, p + "attn_norm.weight", &ok);
+        L.wq = need(m, p + "attn_q.weight", &ok);
+        L.wk = need(m, p + "attn_k.weight", &ok);
+        // Optional by architecture. The five layers without it are exactly the five
+        // full-attention layers, and they take V from the K projection - the raw one, before
+        // attn_k_norm and before the rotation, put through an unweighted rms_norm. Verified
+        // against the file (layers 5, 11, 17, 23, 29) and against the reference's own branch
+        // in build_gemma4.cpp, which does `Vcur = Kcur` at exactly that point.
+        L.wv = llama_get_model_tensor(m, (p + "attn_v.weight").c_str());
+        if (!L.wv) ++n_shared_v;
+        L.wo = need(m, p + "attn_output.weight", &ok);
+        L.q_norm = need(m, p + "attn_q_norm.weight", &ok);
+        L.k_norm = need(m, p + "attn_k_norm.weight", &ok);
+        L.post_attn_norm = need(m, p + "post_attention_norm.weight", &ok);
+        L.ffn_norm = need(m, p + "ffn_norm.weight", &ok);
+        L.gate = need(m, p + "ffn_gate.weight", &ok);
+        L.up = need(m, p + "ffn_up.weight", &ok);
+        L.down = need(m, p + "ffn_down.weight", &ok);
+        L.pre_ffw_norm_2 = need(m, p + "pre_ffw_norm_2.weight", &ok);
+        L.router = need(m, p + "ffn_gate_inp.weight", &ok);
+        L.router_scale = need(m, p + "ffn_gate_inp.scale", &ok);
+        L.gate_up_exps = need(m, p + "ffn_gate_up_exps.weight", &ok);
+        L.down_exps = need(m, p + "ffn_down_exps.weight", &ok);
+        L.down_scale = llama_get_model_tensor(m, (p + "ffn_down_exps.scale").c_str());
+        L.post_ffw_norm_1 = need(m, p + "post_ffw_norm_1.weight", &ok);
+        L.post_ffw_norm_2 = need(m, p + "post_ffw_norm_2.weight", &ok);
+        L.post_ffw_norm = need(m, p + "post_ffw_norm.weight", &ok);
+        L.out_scale = llama_get_model_tensor(m, (p + "layer_output_scale.weight").c_str());
+        // The reference hands freq_factors only to the full-attention layers; the windowed
+        // ones rotate their whole 256 at base 1e4 and get null.
+        G.rope_freqs = G.kind == LayerKind::ATTN ? rope_freqs : nullptr;
+    }
+    if (!ok) return false;
+    // The geometry the file states and the geometry its tensors actually have must agree, or
+    // every view built from the first is a plausible misreading of the second. Checked once,
+    // here, rather than discovered as a wrong answer.
+    for (int il = 0; il < h->n_layer && ok; ++il) {
+        const LayerGeom& G = h->L(il);
+        const Gemma4Weights::Layer& L = w->layers[size_t(il)];
+        const int64_t want_q = int64_t(G.d_q()), want_kv = int64_t(G.d_kv());
+        if (L.wq->ne[1] != want_q || L.wk->ne[1] != want_kv || L.wo->ne[0] != want_q ||
+            L.q_norm->ne[0] != G.head_dim || L.k_norm->ne[0] != G.head_dim ||
+            (L.wv && L.wv->ne[1] != want_kv)) {
+            printf("gemma4: слой %d — метаданные обещают %d голов по %d (kv %d), "
+                   "а тензоры дают q %lld, k %lld, o %lld, q_norm %lld\n", il, G.n_head,
+                   G.head_dim, G.n_head_kv, (long long)L.wq->ne[1], (long long)L.wk->ne[1],
+                   (long long)L.wo->ne[0], (long long)L.q_norm->ne[0]);
+            ok = false;
+        }
+    }
+    int n_win = 0;
+    for (int il = 0; il < h->n_layer; ++il) {
+        if (h->L(il).kind == LayerKind::ATTN_SWA) ++n_win;
+    }
+    // Printed rather than trusted. The two counts have to agree - the layers without a V
+    // projection are precisely the full-attention ones - and a file where they do not is a
+    // file this builder is about to misread.
+    printf("gemma4: слоёв %d — с окном %d, полных %d; V берётся из K на %d слоях; "
+           "rope_freqs %s\\n", h->n_layer, n_win, h->n_layer - n_win, n_shared_v,
+           rope_freqs ? "есть" : "НЕТ (полные слои будут вращаться целиком — это ошибка)");
+    if (n_shared_v && n_shared_v != h->n_layer - n_win) {
+        printf("gemma4: %d слоёв без attn_v против %d полных слоёв — это не та раскладка, "
+               "под которую написан граф\\n", n_shared_v, h->n_layer - n_win);
+        ok = false;
+    }
+    return ok;
+}
+
+// Qwen 3.6's tensors. Which set a layer has is decided by its kind, which came from the
+// metadata - so a disagreement between the two shows up here as a missing tensor with a
+// name, rather than later as a shape that happens to fit.
+bool collect_qwen35(llama_model* m, const HParams& h, Qwen35Weights* w) {
+    bool ok = true;
+    w->tok_embd = need(m, "token_embd.weight", &ok);
+    w->out_norm = need(m, "output_norm.weight", &ok);
+    w->out = llama_get_model_tensor(m, "output.weight");
+    if (!w->out) {
+        printf("qwen35moe: output.weight отсутствует, беру token_embd (связанные веса)\n");
+        w->out = w->tok_embd;
+    }
+    w->layers.resize(size_t(h.n_layer));
+    for (int il = 0; il < h.n_layer; ++il) {
+        const std::string p = "blk." + std::to_string(il) + ".";
+        Qwen35Weights::Layer& L = w->layers[size_t(il)];
+        const LayerGeom& G = h.L(il);
+        L.attn_norm = need(m, p + "attn_norm.weight", &ok);
+        L.ffn_norm = need(m, p + "post_attention_norm.weight", &ok);
+        if (G.kind == LayerKind::DELTA_NET) {
+            L.wqkv = need(m, p + "attn_qkv.weight", &ok);
+            L.wqkv_gate = need(m, p + "attn_gate.weight", &ok);
+            L.ssm_conv1d = need(m, p + "ssm_conv1d.weight", &ok);
+            L.ssm_dt = need(m, p + "ssm_dt.bias", &ok);
+            L.ssm_a = need(m, p + "ssm_a", &ok);          // no .weight suffix in this arch
+            L.ssm_beta = need(m, p + "ssm_beta.weight", &ok);
+            L.ssm_alpha = need(m, p + "ssm_alpha.weight", &ok);
+            L.ssm_norm = need(m, p + "ssm_norm.weight", &ok);
+            L.ssm_out = need(m, p + "ssm_out.weight", &ok);
+        } else {
+            L.wq = need(m, p + "attn_q.weight", &ok);
+            L.wk = need(m, p + "attn_k.weight", &ok);
+            L.wv = need(m, p + "attn_v.weight", &ok);
+            L.wo = need(m, p + "attn_output.weight", &ok);
+            L.q_norm = need(m, p + "attn_q_norm.weight", &ok);
+            L.k_norm = need(m, p + "attn_k_norm.weight", &ok);
+        }
+        L.router = need(m, p + "ffn_gate_inp.weight", &ok);
+        L.gate_exps = need(m, p + "ffn_gate_exps.weight", &ok);
+        L.up_exps = need(m, p + "ffn_up_exps.weight", &ok);
+        L.down_exps = need(m, p + "ffn_down_exps.weight", &ok);
+        L.shexp_gate = need(m, p + "ffn_gate_inp_shexp.weight", &ok);
+        L.gate_shexp = need(m, p + "ffn_gate_shexp.weight", &ok);
+        L.up_shexp = need(m, p + "ffn_up_shexp.weight", &ok);
+        L.down_shexp = need(m, p + "ffn_down_shexp.weight", &ok);
+    }
+    if (!ok) return false;
+    // The attention layers' Q projection is twice as wide as its head count implies, because
+    // half of every head's rows are an output gate. Checked rather than assumed: if a future
+    // file ever stopped fusing the gate, the views below would silently take the first half
+    // of the queries and call it all of them.
+    for (int il = 0; il < h.n_layer && ok; ++il) {
+        const LayerGeom& G = h.L(il);
+        if (G.kind == LayerKind::DELTA_NET) continue;
+        const Qwen35Weights::Layer& L = w->layers[size_t(il)];
+        if (L.wq->ne[1] != int64_t(2 * G.d_q())) {
+            printf("qwen35moe: слой %d — attn_q даёт %lld строк, а ожидались %d "
+                   "(запрос и выходной вентиль вперемежку по головам)\n", il,
+                   (long long)L.wq->ne[1], 2 * G.d_q());
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+struct Graph {
 
 struct Graph {
     ggml_context* ctx = nullptr;
@@ -1163,6 +1422,73 @@ struct Cache {
         if (buf) ggml_backend_buffer_free(buf);
         if (ctx) ggml_free(ctx);
         buf = nullptr; ctx = nullptr;
+    }
+};
+
+// The gated delta-net's carried state, which is what qwen35moe has instead of a KV cache on
+// three quarters of its layers.
+//
+// The shape of the thing is the point: it is FIXED. A KV cache grows one position per token
+// and a decode step re-reads all of it; this is a convolution window of three positions and
+// a 128x128 matrix per head, 2.20 MB a layer, and it costs the same at position 1 and at
+// position 100000. Nothing here is re-aimed per step for the same reason - there is no
+// offset to move, the graph writes the same slot every time.
+//
+// It lives in its own backend buffer rather than in the graph allocator's, because the graph
+// both reads it at the top of a layer and writes it at the bottom, and the value has to
+// survive between computations. Which also means it must be cleared before a prefill: a
+// second prompt run against a state left over from the first is not an error, it is a wrong
+// answer that looks like a distracted model.
+struct DeltaState {
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    std::vector<ggml_tensor*> s;     // per layer, [state_dim, 1] f32, or null
+    std::size_t state_dim = 0;
+
+    bool init(ggml_backend_buffer_type_t buft, const HParams& h) {
+        state_dim = h.delta_state_elems();
+        s.assign(std::size_t(h.n_layer), nullptr);
+        if (state_dim == 0 || h.n_delta_layers() == 0) return true;   // nothing to carry
+        ggml_init_params ip = {ggml_tensor_overhead() * std::size_t(h.n_layer) + 4096,
+                               nullptr, true};
+        ctx = ggml_init(ip);
+        if (!ctx) return false;
+        for (int il = 0; il < h.n_layer; ++il) {
+            if (h.L(il).kind != LayerKind::DELTA_NET) continue;
+            // Two dimensions rather than one so that nb[1] == ne[0]*nb[0] exactly, which is
+            // what makes the sub-views below genuinely contiguous rather than accidentally
+            // so. ggml_reshape asserts contiguity and a one-row view of a wider tensor is
+            // not the same thing.
+            s[std::size_t(il)] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                    int64_t(state_dim), 1);
+        }
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        return buf != nullptr;
+    }
+
+    // Back to no history at all. Called before every prefill, and before any run that is not
+    // a continuation of the one before it.
+    void clear() {
+        if (!buf || state_dim == 0) return;
+        std::vector<float> z(state_dim, 0.0f);
+        for (ggml_tensor* t : s) {
+            if (t) ggml_backend_tensor_set(t, z.data(), 0, ggml_nbytes(t));
+        }
+    }
+
+    std::size_t bytes() const {
+        std::size_t n = 0;
+        for (const ggml_tensor* t : s) {
+            if (t) n += std::size_t(state_dim) * sizeof(float);
+        }
+        return n;
+    }
+
+    void free_all() {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        buf = nullptr; ctx = nullptr;
+        s.clear();
     }
 };
 
@@ -2032,6 +2358,246 @@ bool build_dense_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& 
     }
     if (!ggml_gallocr_alloc_graph(g->alloc, g->gf)) {
         printf("черновик: размещение графа не удалось\n");
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------
+// Gemma 4 26B-A4B
+// ---------------------------------------------------------------------------------------
+
+// One graph, whatever the token count: a prefill is this with n_tokens = the prompt and
+// n_past = 0, a decode step is this with n_tokens = 1 and the writes re-aimed. Written out
+// separately from build_step rather than sharing it behind a flag, for the reason the file
+// already gives for build_dense_step: the two architectures' arithmetic would then live in
+// one place where a change to either can reach the other, and there is no way to notice.
+//
+// The block, taken from the reference's build_gemma4() and not from a description of it:
+//
+//   attn_out = attn_norm -> attention -> post_attention_norm -> + residual
+//   dense    = ffn_down( gelu(ffn_gate.h) * ffn_up.h ),   h = rms(attn_out)*ffn_norm
+//   routed   = MoE( rms(attn_out)*pre_ffw_norm_2 ),  router reads attn_out, not h
+//   cur      = rms(dense)*post_ffw_norm_1 + rms(routed)*post_ffw_norm_2
+//   cur      = rms(cur)*post_ffw_norm + attn_out
+//   cur      = cur * layer_output_scale
+//
+// Note what the router reads. Its input is the post-attention residual stream, normalised
+// with a scale tensor of its own (ffn_gate_inp.scale) - NOT the activation the experts see.
+// Feeding it the expert input instead produces a routing that is wrong in a way no shape
+// check can catch and no output obviously betrays.
+bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
+                       const Gemma4Weights& w, Cache& kv, int n_tokens, int n_past,
+                       int n_kv, bool all_logits, bool keep_probes) {
+    if (n_tokens <= 0 || n_kv <= 0 || n_past < 0) {
+        printf("gemma4: бессмысленные размеры n_tokens %d, n_past %d, n_kv %d\n",
+               n_tokens, n_past, n_kv);
+        return false;
+    }
+    // Attention is a dozen nodes, the dense feed-forward four, the routed half a dozen plus
+    // the eight-way fold, and the join four. Ninety-six a layer is roughly double what it
+    // needs, which is the right side to be wrong on: running out shows up as a truncated
+    // graph rather than as an error.
+    const size_t n_nodes = size_t(h.n_layer) * 96 + 256;
+    ggml_init_params ip = {ggml_tensor_overhead() * (n_nodes + 512) +
+                           ggml_graph_overhead_custom(n_nodes, false), nullptr, true};
+    g->ctx = ggml_init(ip);
+    if (!g->ctx) return false;
+    ggml_context* c = g->ctx;
+
+    g->tokens = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tokens);
+    g->positions = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tokens);
+    g->mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, n_kv, n_tokens);
+    if (h.any_swa()) {
+        g->mask_swa = ggml_new_tensor_2d(c, GGML_TYPE_F32, n_kv, n_tokens);
+    }
+    g->n_kv_built = n_kv;
+    g->inputs = ggml_backend_alloc_ctx_tensors_from_buft(c, buft);
+    if (!g->inputs) return false;
+    g->gf = ggml_new_graph_custom(c, n_nodes, false);
+
+    const float eps = h.rms_eps;
+    ggml_tensor* cur = ggml_get_rows(c, w.tok_embd, g->tokens);
+    // sqrt(n_embd) on the embeddings. Gemma has always done this and it is not folded into
+    // the table by the converter, so leaving it out scales every activation in the model by
+    // 1/53 and still generates fluent text.
+    if (h.f_embd_scale > 0.0f) cur = ggml_scale(c, cur, h.f_embd_scale);
+
+    for (int il = 0; il < h.n_layer; ++il) {
+        const Gemma4Weights::Layer& L = w.layers[size_t(il)];
+        const LayerGeom& G = h.L(il);
+        const int hd = G.head_dim;
+        // 1.0, not 1/sqrt(hd). See HParams::f_attn_scale - this is the single constant in
+        // gemma4 most likely to be silently wrong, because the wrong value still produces
+        // grammatical output.
+        const float kq_scale = h.f_attn_scale != 0.0f ? h.f_attn_scale
+                                                      : 1.0f / std::sqrt(float(hd));
+        ggml_tensor* inpSA = cur;
+        ggml_tensor* x = fnorm(c, cur, L.attn_norm, eps);
+
+        ggml_tensor* q = ggml_mul_mat(c, L.wq, x);
+        ggml_tensor* k = ggml_mul_mat(c, L.wk, x);
+        // V's source: its own projection where there is one, and otherwise the RAW output of
+        // the K projection - the node before attn_k_norm and before the rotation, which is
+        // what `Vcur = Kcur` in the reference picks up at that point in its graph. Taking the
+        // normed or roped K instead would be a different model that still runs.
+        ggml_tensor* v = L.wv ? ggml_mul_mat(c, L.wv, x) : k;
+
+        q = ggml_reshape_3d(c, q, hd, G.n_head, n_tokens);
+        q = fnorm(c, q, L.q_norm, eps);
+        q = ggml_rope_ext(c, q, g->positions, G.rope_freqs, G.n_rot, h.rope_type,
+                          h.n_ctx_train, G.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+        // V is rms-normed per head with NO weight, on every gemma4 layer - the ones that have
+        // their own V projection included. There is no v_norm tensor in the file; the norm is
+        // unweighted and it is still there.
+        v = ggml_rms_norm(c, ggml_reshape_3d(c, v, hd, G.n_head_kv, n_tokens), eps);
+
+        k = ggml_reshape_3d(c, k, hd, G.n_head_kv, n_tokens);
+        k = fnorm(c, k, L.k_norm, eps);
+        k = ggml_rope_ext(c, k, g->positions, G.rope_freqs, G.n_rot, h.rope_type,
+                          h.n_ctx_train, G.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+        ggml_tensor* Kc = ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));
+        ggml_tensor* Vc = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3));
+        {
+            ggml_tensor* kc = kv.k[size_t(il)];
+            ggml_tensor* vc = kv.v[size_t(il)];
+            ggml_tensor* kdst = ggml_view_3d(c, kc, hd, n_tokens, G.n_head_kv,
+                                             kc->nb[1], kc->nb[2],
+                                             size_t(n_past) * kc->nb[1]);
+            ggml_tensor* vdst = ggml_view_3d(c, vc, n_tokens, hd, G.n_head_kv,
+                                             vc->nb[1], vc->nb[2],
+                                             size_t(n_past) * ggml_element_size(vc));
+            ggml_tensor* kcpy = ggml_cpy(c, Kc, kdst);
+            ggml_tensor* vcpy = ggml_cpy(c, Vc, vdst);
+            ggml_build_forward_expand(g->gf, kcpy);
+            ggml_build_forward_expand(g->gf, vcpy);
+            g->writes.push_back({kcpy, kdst, kc, kc->nb[1], kc->ne[1], n_tokens});
+            g->writes.push_back({vcpy, vdst, vc, ggml_element_size(vc), vc->ne[0], n_tokens});
+        }
+
+        ggml_tensor* Q = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));
+        ggml_tensor* K = ggml_view_3d(c, kv.k[size_t(il)], hd, n_kv, G.n_head_kv,
+                                      kv.k[size_t(il)]->nb[1], kv.k[size_t(il)]->nb[2], 0);
+        ggml_tensor* V = ggml_view_3d(c, kv.v[size_t(il)], n_kv, hd, G.n_head_kv,
+                                      kv.v[size_t(il)]->nb[1], kv.v[size_t(il)]->nb[2], 0);
+        // Which mask. The window lives in the mask's contents, not in the cache's extent -
+        // the windowed layers still read the whole occupied cache and throw away what falls
+        // outside. Narrowing the read is a real saving and a different change.
+        ggml_tensor* msk = (G.kind == LayerKind::ATTN_SWA && g->mask_swa) ? g->mask_swa
+                                                                         : g->mask;
+        ggml_tensor* kq = ggml_mul_mat(c, K, Q);
+        ggml_tensor* pr = ggml_soft_max_ext(c, kq, msk, kq_scale, 0.0f);
+        ggml_tensor* kqv = ggml_mul_mat(c, V, pr);
+        g->reads.push_back({K, V, kq, pr, msk});
+        kqv = ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), G.d_q(), n_tokens);
+        if (keep_probes) {
+            ggml_set_output(inpSA);
+            ggml_set_output(kqv);
+            g->dbg.push_back({inpSA, kqv});
+        }
+
+        // Post-attention norm BEFORE the residual, which is the gemma shape and the reverse
+        // of what every llama-derived block does.
+        ggml_tensor* attn = fnorm(c, ggml_mul_mat(c, L.wo, kqv), L.post_attn_norm, eps);
+        ggml_tensor* attn_out = ggml_add(c, attn, inpSA);
+        if (keep_probes) g->probes.push_back({"attn_out-" + std::to_string(il), attn_out});
+
+        // ---- the dense half. gelu(gate) * up, which is what LLM_FFN_GELU + LLM_FFN_PAR
+        // resolves to; ggml_fused_up_gate is the reference's own op for it.
+        ggml_tensor* hd_in = fnorm(c, attn_out, L.ffn_norm, eps);
+        ggml_tensor* dense = ggml_mul_mat(c, L.down,
+            ggml_fused_up_gate(c, L.up, L.gate, hd_in, GGML_UNARY_OP_GELU));
+
+        // ---- the routed half.
+        ggml_tensor* moe_in = fnorm(c, attn_out, L.pre_ffw_norm_2, eps);
+        if (keep_probes) g->probes.push_back({"ffn_norm_2-" + std::to_string(il), moe_in});
+        ggml_tensor* rlogits = ggml_mul_mat(c, L.router,
+                                            fnorm(c, attn_out, L.router_scale, eps));
+        ggml_tensor* probs = ggml_soft_max(c, rlogits);
+        ggml_tensor* sel = ggml_top_k(c, probs, h.n_expert_used);
+        ggml_tensor* weights = ggml_get_rows(c,
+            ggml_reshape_3d(c, probs, 1, h.n_expert, n_tokens), sel);
+        weights = ggml_reshape_2d(c, weights, h.n_expert_used, n_tokens);
+        weights = ggml_div(c, weights, ggml_sum_rows(c, weights));
+        if (L.down_scale) {
+            // The per-expert scale, folded into the ROUTING WEIGHT after renormalisation
+            // rather than applied to the expert's output. Algebraically the same thing; the
+            // reference does it here, and doing it there instead would reassociate a
+            // multiply into a different place in every one of thirty layers. Matching the
+            // association is what lets a later mismatch mean something.
+            ggml_tensor* sc = ggml_reshape_3d(c, L.down_scale, 1, h.n_expert, 1);
+            sc = ggml_repeat_4d(c, sc, 1, h.n_expert, n_tokens, 1);
+            sc = ggml_get_rows(c, sc, sel);
+            weights = ggml_mul(c, weights,
+                               ggml_reshape_2d(c, sc, h.n_expert_used, n_tokens));
+        }
+        weights = ggml_reshape_3d(c, weights, 1, h.n_expert_used, n_tokens);
+
+        ggml_tensor* xe = ggml_reshape_3d(c, moe_in, h.n_embd, 1, n_tokens);
+        // The experts, from ONE fused tensor. Its rows are [0, n_ff_exp) gate and
+        // [n_ff_exp, 2*n_ff_exp) up, and the result is (up.x) * GELU(gate.x) - verified down
+        // to the kernel's own argument order (ggml.c passes base+nb02/2 as Aup and base as
+        // Agate; iqk_mul_mat.cpp applies the unary to Agate's product). Calling the fused op
+        // rather than slicing two views is what keeps this bit-identical to the reference.
+        //
+        // NOTE for whoever unblocks --resident and --gpu-experts here: those need one id list
+        // dispatched twice, and this single op cannot be split that way. The split is blocked
+        // on verification, not on being impossible - build the two halves as two
+        // ggml_moe_up_gate calls over the same fused tensor with the two id lists, keep the
+        // per-slot add BEFORE the weighting exactly as build_step does, and check it against
+        // the unsplit path. The row ranges above are the only thing that needed research.
+        ggml_tensor* par = ggml_moe_up_gate(c, L.gate_up_exps, nullptr, xe, sel,
+                                            GGML_UNARY_OP_GELU);
+        ggml_tensor* eo = ggml_mul_mat_id(c, L.down_exps, par, sel);
+        eo = ggml_mul(c, eo, weights);
+        ggml_tensor* routed = ggml_view_2d(c, eo, h.n_embd, n_tokens, eo->nb[2], 0);
+        for (int e = 1; e < h.n_expert_used; ++e) {
+            routed = ggml_add(c, routed, ggml_view_2d(c, eo, h.n_embd, n_tokens, eo->nb[2],
+                                                      size_t(e) * eo->nb[1]));
+        }
+        if (keep_probes) g->probes.push_back({"ffn_moe_out-" + std::to_string(il), routed});
+
+        // ---- the join. Each half gets its own rms and its own weight, then they are added:
+        // one op in the reference, and one op here, because splitting it into two norms and
+        // an add would reassociate nothing but would compute the two scales in a different
+        // order from the kernel that is being compared against.
+        ggml_tensor* comb = ggml_fused_rms_rms_add(c, dense, L.post_ffw_norm_1,
+                                                   routed, L.post_ffw_norm_2, eps);
+        if (keep_probes) g->probes.push_back({"ffn_moe_combined-" + std::to_string(il), comb});
+        comb = fnorm(c, comb, L.post_ffw_norm, eps);
+        cur = ggml_add(c, comb, attn_out);
+        // A single learned scalar per layer, 0.07 at layer 0 and 0.20 at layer 29. Not a
+        // normalisation constant that could be folded away - dropping it changes the residual
+        // stream by more than an order of magnitude.
+        if (L.out_scale) cur = ggml_mul(c, cur, L.out_scale);
+        if (keep_probes) g->probes.push_back({"l_out-" + std::to_string(il), cur});
+    }
+
+    if (n_tokens > 1 && !all_logits) {
+        cur = ggml_cont(c, ggml_view_2d(c, cur, h.n_embd, 1, cur->nb[1],
+                                        size_t(n_tokens - 1) * cur->nb[1]));
+    }
+    cur = fnorm(c, cur, w.out_norm, eps);
+    if (keep_probes) g->probes.push_back({"result_norm", cur});
+    g->logits = ggml_mul_mat(c, w.out, cur);
+    // 30*tanh(x/30). Stated in the file and applied by the reference; without it the top of
+    // the distribution is uncapped and every temperature and top-p threshold means something
+    // slightly different from what it means in llama-cli.
+    if (h.f_logit_softcap > 0.0f) {
+        g->logits = ggml_softcap(c, g->logits, 1.0f / h.f_logit_softcap, h.f_logit_softcap);
+    }
+    ggml_set_output(g->logits);
+    for (auto& pr : g->probes) ggml_set_output(pr.second);
+    ggml_build_forward_expand(g->gf, g->logits);
+    g->alloc = ggml_gallocr_new(buft);
+    if (!g->alloc) {
+        printf("gemma4: ggml_gallocr_new не удался\n");
+        return false;
+    }
+    if (!ggml_gallocr_reserve(g->alloc, g->gf) || !ggml_gallocr_alloc_graph(g->alloc, g->gf)) {
+        printf("gemma4: граф не разместился (n_tokens %d, n_kv %d)\n", n_tokens, n_kv);
         return false;
     }
     return true;

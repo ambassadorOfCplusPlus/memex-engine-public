@@ -59,8 +59,14 @@ double us_since(const Clock::time_point& t) {
 
 // One measurement: a chain of `n_nodes` adds over `n_elem` floats, computed `reps` times.
 // Returns microseconds per graph_compute call.
+// `chain` true: node i depends on node i-1, so the backend must place a barrier between every
+// pair and each dispatch's latency is exposed. That is the shape of most of a transformer layer.
+// `chain` false: all n_nodes are independent reads of the same two inputs, so nothing forces
+// them to serialise and the GPU may overlap them. The DIFFERENCE between the two slopes is what
+// separates "a dispatch costs this much to launch" from "a dependency costs this much to wait
+// for", and those two have opposite consequences: the first says fuse, the second says widen.
 double time_graph(ggml_backend_t be, ggml_backend_buffer_type_t buft, int n_nodes, int n_elem,
-                  int reps, int* built_nodes) {
+                  int reps, int* built_nodes, bool chain = true) {
     // Two persistent inputs in their own buffer, so the graph allocator only has to place the
     // intermediates. Both are written once; nothing is transferred inside the timed loop.
     ggml_init_params ip_in = {ggml_tensor_overhead() * 4 + 1024, nullptr, true};
@@ -72,7 +78,10 @@ double time_graph(ggml_backend_t be, ggml_backend_buffer_type_t buft, int n_node
     ggml_backend_buffer_t b_in = ggml_backend_alloc_ctx_tensors_from_buft(c_in, buft);
     if (!b_in) { ggml_free(c_in); return -1.0; }
     {
-        std::vector<float> h(std::size_t(n_elem));
+        // Braces, not parentheses: `std::vector<float> h(std::size_t(n_elem));` is the most
+        // vexing parse and declares a function.
+        std::vector<float> h;
+        h.resize(std::size_t(n_elem));
         for (int i = 0; i < n_elem; ++i) h[std::size_t(i)] = 1.0f / float(i + 1);
         ggml_backend_tensor_set(x, h.data(), 0, sizeof(float) * std::size_t(n_elem));
         for (int i = 0; i < n_elem; ++i) h[std::size_t(i)] = 1e-6f;
@@ -87,11 +96,20 @@ double time_graph(ggml_backend_t be, ggml_backend_buffer_type_t buft, int n_node
     ggml_context* c = ggml_init(ip);
     if (!c) { ggml_backend_buffer_free(b_in); ggml_free(c_in); return -1.0; }
     ggml_cgraph* gf = ggml_new_graph(c);
-    ggml_tensor* cur = x;
-    for (int i = 0; i < n_nodes; ++i) {
-        cur = ggml_add(c, cur, k);
+    if (chain) {
+        ggml_tensor* cur = x;
+        for (int i = 0; i < n_nodes; ++i) {
+            cur = ggml_add(c, cur, k);
+        }
+        ggml_build_forward_expand(gf, cur);
+    } else {
+        // n_nodes independent adds off the same two inputs. ggml does no common-subexpression
+        // elimination - every ggml_add allocates a fresh tensor - so these really are n_nodes
+        // separate dispatches with no dependency between them.
+        for (int i = 0; i < n_nodes; ++i) {
+            ggml_build_forward_expand(gf, ggml_add(c, x, k));
+        }
     }
-    ggml_build_forward_expand(gf, cur);
     if (built_nodes) *built_nodes = ggml_graph_n_nodes(gf);
 
     ggml_gallocr_t ga = ggml_gallocr_new(buft);
@@ -170,60 +188,93 @@ int main(int argc, char** argv) {
 
     const std::vector<int> ns = {1, 2, 4, 8, 16, 32, 64, 128};
 
-    // [replicate][point]
-    std::vector<std::vector<double>> runs(std::size_t(replicates));
-    for (int r = 0; r < replicates; ++r) {
-        runs[std::size_t(r)].reserve(ns.size());
-        for (int n : ns) {
-            int built = 0;
-            const double us = time_graph(be, buft, n, n_elem, reps, &built);
-            if (us < 0.0) {
-                printf("не удалось построить или разместить граф на %d узлов\n", n);
-                ggml_backend_free(be);
-                return 1;
+    double s_chain = 0, b_chain = 0, s_wide = 0, b_wide = 0;
+    double worst_spread_all = 0.0;
+
+    for (int mode = 0; mode < 2; ++mode) {
+        const bool chain = mode == 0;
+        printf("%s\n", chain
+            ? "--- ЗАВИСИМАЯ ЦЕПОЧКА: узел i читает выход узла i-1, между ними барьер ---"
+            : "--- НЕЗАВИСИМЫЕ УЗЛЫ: все читают одни и те же входы, ничто не заставляет их "
+              "сериализоваться ---");
+
+        // [replicate][point]
+        std::vector<std::vector<double>> runs;
+        runs.resize(std::size_t(replicates));
+        for (int r = 0; r < replicates; ++r) {
+            runs[std::size_t(r)].reserve(ns.size());
+            for (int n : ns) {
+                int built = 0;
+                // Equal wall time per point, not equal repetitions. At n=1 a graph takes ~80 us,
+                // so 400 repetitions is 32 ms and the operating system's scheduling jitter is a
+                // third of what is being measured - which is exactly what the first version of
+                // this showed, as a 38% spread on the smallest points and 2% on the largest.
+                // Scaling the repetition count keeps every point around a second.
+                const int rn = std::min(30000, std::max(reps, (reps * 64) / std::max(n, 1)));
+                const double us = time_graph(be, buft, n, n_elem, rn, &built, chain);
+                if (us < 0.0) {
+                    printf("не удалось построить или разместить граф на %d узлов\n", n);
+                    ggml_backend_free(be);
+                    return 1;
+                }
+                if (built != n) {
+                    // Says so rather than silently fitting against the wrong x. If ggml ever
+                    // fuses or drops one of these, the node count is not the dispatch count and
+                    // the whole measurement means something else.
+                    printf("ВНИМАНИЕ: просили %d узлов, граф содержит %d — ось X не та\n", n, built);
+                }
+                runs[std::size_t(r)].push_back(us);
             }
-            if (built != n) {
-                // Says so rather than silently fitting against the wrong x. If ggml ever fuses
-                // or drops one of these, the node count is not the dispatch count and the whole
-                // measurement means something else.
-                printf("ВНИМАНИЕ: просили %d узлов, граф содержит %d — ось X не та\n", n, built);
-            }
-            runs[std::size_t(r)].push_back(us);
         }
+
+        // Per point: median across replicates, and the spread, which is what says whether a
+        // number is a result at all. The noise floor on this machine is 4.2%.
+        printf("  %6s %12s %12s %12s %10s\n", "узлов", "медиана,мкс", "мин,мкс", "макс,мкс",
+               "разброс");
+        std::vector<double> xs, ys, xs_lo, ys_lo;
+        double worst_spread = 0.0;
+        for (std::size_t i = 0; i < ns.size(); ++i) {
+            std::vector<double> v;
+            for (int r = 0; r < replicates; ++r) v.push_back(runs[std::size_t(r)][i]);
+            std::sort(v.begin(), v.end());
+            const double med = v[v.size() / 2];
+            const double lo = v.front(), hi = v.back();
+            const double spread = med > 0.0 ? (hi - lo) / med : 0.0;
+            worst_spread = std::max(worst_spread, spread);
+            printf("  %6d %12.2f %12.2f %12.2f %9.1f%%\n", ns[i], med, lo, hi, 100.0 * spread);
+            xs.push_back(double(ns[i]));
+            ys.push_back(med);
+            // ggml submits every 100 nodes (ggml-vulkan.cpp:10353), so 128 sits past a submit
+            // boundary. The plan's graph is fifteen nodes, so the sub-100 fit is the relevant one.
+            if (ns[i] < 100) { xs_lo.push_back(double(ns[i])); ys_lo.push_back(med); }
+        }
+
+        double s_all = 0, b_all = 0, s_lo = 0, b_lo = 0;
+        fit(xs, ys, &s_all, &b_all);
+        fit(xs_lo, ys_lo, &s_lo, &b_lo);
+        printf("  подгонка 1..128:  наклон %.2f мкс/узел, свободный член %.1f мкс\n", s_all, b_all);
+        printf("  подгонка 1..64 (до границы submit): наклон %.2f мкс/узел, "
+               "свободный член %.1f мкс\n", s_lo, b_lo);
+        printf("  худший разброс между повторами: %.1f%% (порог 4.2%%)%s\n\n",
+               100.0 * worst_spread,
+               worst_spread > 0.05 ? "  — ВЫШЕ ПОРОГА" : "");
+        worst_spread_all = std::max(worst_spread_all, worst_spread);
+        if (chain) { s_chain = s_lo; b_chain = b_lo; }
+        else       { s_wide  = s_lo; b_wide  = b_lo; }
     }
 
-    // Per point: median across replicates, and the spread, which is what says whether a number
-    // is a result at all. The noise floor on this machine is 4.2%.
-    printf("  %6s %12s %12s %12s %10s\n", "узлов", "медиана,мкс", "мин,мкс", "макс,мкс", "разброс");
-    std::vector<double> xs, ys, xs_lo, ys_lo;
-    double worst_spread = 0.0;
-    for (std::size_t i = 0; i < ns.size(); ++i) {
-        std::vector<double> v;
-        for (int r = 0; r < replicates; ++r) v.push_back(runs[std::size_t(r)][i]);
-        std::sort(v.begin(), v.end());
-        const double med = v[v.size() / 2];
-        const double lo = v.front(), hi = v.back();
-        const double spread = med > 0.0 ? (hi - lo) / med : 0.0;
-        worst_spread = std::max(worst_spread, spread);
-        printf("  %6d %12.2f %12.2f %12.2f %9.1f%%\n", ns[i], med, lo, hi, 100.0 * spread);
-        xs.push_back(double(ns[i]));
-        ys.push_back(med);
-        // ggml submits every 100 nodes (ggml-vulkan.cpp:10353), so 128 sits past a submit
-        // boundary. The plan's graph is fifteen nodes, so the sub-100 fit is the relevant one.
-        if (ns[i] < 100) { xs_lo.push_back(double(ns[i])); ys_lo.push_back(med); }
-    }
-
-    double s_all = 0, b_all = 0, s_lo = 0, b_lo = 0;
-    fit(xs, ys, &s_all, &b_all);
-    fit(xs_lo, ys_lo, &s_lo, &b_lo);
-
-    printf("\n  подгонка по всему свипу (1..128):  наклон %.2f мкс/узел, свободный член %.1f мкс\n",
-           s_all, b_all);
-    printf("  подгонка ниже границы submit (1..64): наклон %.2f мкс/узел, свободный член %.1f мкс\n",
-           s_lo, b_lo);
-    printf("  худший разброс между повторами: %.1f%% (шумовой порог проекта 4.2%%)%s\n",
-           100.0 * worst_spread,
-           worst_spread > 0.05 ? "  — ВЫШЕ ПОРОГА, число не считается" : "");
+    const double s_lo = s_chain, b_lo = b_chain;
+    const double worst_spread = worst_spread_all;
+    printf("  зависимая цепочка : %.2f мкс/узел, свободный член %.1f мкс\n", s_chain, b_chain);
+    printf("  независимые узлы  : %.2f мкс/узел, свободный член %.1f мкс\n", s_wide, b_wide);
+    printf("  отношение         : %.2fx — %s\n", s_wide > 0 ? s_chain / s_wide : 0.0,
+           (s_wide > 0 && s_chain / s_wide > 1.5)
+               ? "платится ЗАВИСИМОСТЬ, а не запуск: узлы, которые можно запустить "
+                 "параллельно, дешевле"
+               : "платится ЗАПУСК сам по себе: параллельность не помогает, помогает только "
+                 "уменьшение числа узлов");
+    printf("  худший разброс: %.1f%%%s\n", 100.0 * worst_spread,
+           worst_spread > 0.05 ? "  — выше порога на самой мелкой точке" : "");
 
     // What the answer means for the plan, said in the plan's own units rather than left to be
     // multiplied later.
