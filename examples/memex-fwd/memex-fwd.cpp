@@ -31,6 +31,34 @@
 // provably distribution-preserving, and expert reduction is neither, which is why it stays
 // behind a flag it has always been behind. The greedy default is unchanged to the token,
 // because the only reason any of this can be trusted is that the old comparison still runs.
+// EDITING THIS FILE WITH A SCRIPT: read this first.
+//
+// Most of the recent growth here arrived through generated patches - a python script doing
+// anchored string replacement - and that method has two failure modes which have both
+// already happened, in this file, and which behave very differently from a typo.
+//
+//   1. An anchor that slips duplicates a line. A second `struct Graph {` got in this way.
+//      The compiler does catch it, but the error lands at the end of the translation unit
+//      rather than at the duplication, and it costs a full build to find out.
+//
+//   2. An escape that survives into the output. Twenty-two printf strings ended up holding
+//      a literal backslash followed by n instead of a newline, because the replacement text
+//      was a python RAW string where "\\n" stays two characters - and, separately, because
+//      this shell's heredocs collapse doubled backslashes on the way through. THE COMPILER
+//      CANNOT SEE THIS. "...\\n" is a valid C string. The only symptom is output that runs
+//      together, which reads as a formatting slip rather than as a corrupted patch, and the
+//      next person to edit nearby will copy it forward.
+//
+// Both are the same underlying mistake: generating code with a tool whose escaping rules
+// differ from the target language's. Neither is caught by review at the diff level, because
+// a diff renders both of them as exactly what you meant to write.
+//
+// So: run check_source.py in this directory after any scripted edit and before any build.
+// It checks brace balance, escaped newlines and duplicated adjacent lines, and it takes a
+// second where a build takes fifteen minutes.
+//
+//     python examples/memex-fwd/check_source.py
+//
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -1437,6 +1465,34 @@ struct Cache {
 // survive between computations. Which also means it must be cleared before a prefill: a
 // second prompt run against a state left over from the first is not an error, it is a wrong
 // answer that looks like a distracted model.
+//
+// FOR WHOEVER MOVES THESE LAYERS ONTO THE CARD - read this before you design the transfer,
+// because the obvious design is the wrong one.
+//
+// The boundary is one handoff per layer. Anything finer loses: a crossing costs about 177 us
+// of host-side coordination (thread wakeup, mutex, condition variable), measured separately
+// from the GPU work. On the 48-layer model the card plan is priced against, a per-block cut
+// is roughly 4 crossings x 48 x 177 us = 34 ms per token - more than the whole win - and a
+// per-node cut is 170 ms, which is absurd. (48 is that plan's reference model; this file's
+// two new architectures have 30 and 40 layers, and the conclusion is the same for both.)
+// That is why the card runs the ENTIRE layer graph - norms, ropes, softmaxes and all, at
+// about 3 us each on the device - rather than only the parts with bytes in them. Cheap in
+// bytes is not cheap in place: the cost of a norm on the host is the boundary it creates,
+// not the work it does.
+//
+// Which puts this buffer on the card, and it must STAY there. It is not a value to be
+// mirrored to the host each step. Two facts make that unambiguous:
+//
+//   - The size is fixed and small: 2.20 MB a layer, 65.9 MB for all thirty. It fits on any
+//     device that could run the model at all, so there is no reason to evict it.
+//   - It is read AND written every token, in place, by ggml_delta_net and ggml_ssm_conv.
+//     Shuttling it would add 65.9 MB of traffic in each direction per token to save nothing,
+//     and - worse - would put a second boundary crossing inside every one of thirty layers,
+//     which is exactly the per-block cut that the arithmetic above rules out.
+//
+// So: device-resident, updated in place, never copied host-ward except when a human asks to
+// inspect it. `clear()` below is the one host-side write, and it happens once per prompt
+// rather than once per token.
 struct DeltaState {
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
@@ -2121,6 +2177,35 @@ bool build_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
         // is what forces the split to preserve slots. It is deliberately outside the split -
         // both halves come back here as one per-slot tensor - because that is what makes the
         // split bit-exact rather than merely close. See below.
+        //
+        // QUEUED: this is eight nodes where ggml_mul_multi_add is one, and the same
+        // substitution is already made twice in this file (build_gemma4_step and
+        // qwen35_ffn). Deliberately NOT taken yet - the two new architectures have to be
+        // proven first, because a regression here with three things in flight would be very
+        // hard to attribute. Three findings that the change rests on, all checked already:
+        //
+        //  - Association matches. The kernel (iqk_cpu_ops.cpp, iqk_mul_multi_add, the branch
+        //    with no src[2]) writes y = x0*w0 for slot zero and then accumulates y += xj*wj
+        //    from slot one upward: the same left-to-right order as the chain below, and the
+        //    same per-slot product. The one thing left to confirm on the machine is whether
+        //    the compiler contracts `y[k] += x0[k]*x1[0]` into an FMA, which would leave the
+        //    product unrounded and make the two differ in the last bit.
+        //
+        //  - If it does differ, the FUSED one is right. The reference's cparams.fused_mmad
+        //    defaults to true (llama.cpp:7728) and llm_build_moe_ffn takes that branch for
+        //    qwen3moe, so the eight-node chain below is already the spelling that does NOT
+        //    match what llama_decode computes. Taking the fused op moves this path toward
+        //    the reference rather than away from it.
+        //
+        //  - The resident split stays safe, and by construction rather than by luck. The
+        //    per-slot add of the two halves happens OUTSIDE this lambda (see the call site
+        //    below: ggml_add(o_res, o_oth) is passed IN). So the fused op would receive one
+        //    already-summed per-slot tensor, exactly as this chain does, and the rule that
+        //    came out of the 3-6% logit incident - sum per slot, before the routing weights
+        //    and before the fold - is preserved without needing a new argument. Verify with
+        //    --decode-check and not only with the prefill comparison: this is the generation
+        //    path, and the incident it guards against was invisible in the tokens.
+        //
         auto weight_and_fold = [&](ggml_tensor* o) {
             o = ggml_mul(c, o, weights);
             ggml_tensor* s = ggml_view_2d(c, o, h.n_embd, n_tokens, o->nb[2], 0);
@@ -2915,12 +3000,20 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
                 ggml_set_output(kqv);
                 g->dbg.push_back({inpSA, kqv});
             }
-            // The output gate, applied to the attention result BEFORE the output projection.
-            if (n_tokens == 1) {
-                kqv = ggml_fused_mul_unary(c, agate, kqv, GGML_UNARY_OP_SIGMOID);
-            } else {
-                kqv = ggml_mul(c, kqv, ggml_sigmoid(c, agate));
-            }
+            // The output gate, applied to the attention result BEFORE the output
+            // projection.
+            //
+            // Two nodes, not one, and deliberately. ggml_fused_mul_unary looks like the
+            // right op and is not available here: its broadcast form accepts SIGMOID but
+            // needs a->ne[0] == 1, and the gate is full width; its same-shape form is the
+            // one that fits and it asserts the op is GELU, RELU or SILU (ggml.c, in
+            // ggml_fused_mul_unary_impl). Handing it SIGMOID with matching shapes aborts.
+            //
+            // The reference reached the same wall from the other side: build_std_attention
+            // has this exact fusion written out and guarded by `if (false && ...)`, with a
+            // note that SIGMOID would have to be added to the fused op's supported list
+            // first. So two nodes is also what llama_decode runs.
+            kqv = ggml_mul(c, kqv, ggml_sigmoid(c, agate));
             attn_out = ggml_add(c, ggml_mul_mat(c, L.wo, kqv), inpSA);
             if (keep_probes) {
                 g->probes.push_back({"attn_out-" + std::to_string(il), attn_out});
@@ -4689,7 +4782,8 @@ int main(int argc, char** argv) {
         const char* a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
             printf(
-"llama-memex-fwd — наш собственный движок вывода для qwen3moe.\n"
+"llama-memex-fwd — наш собственный движок вывода.\n"
+"Целевые архитектуры: qwen3moe, gemma4, qwen35moe; qwen3 — только как черновик.\n"
 "Граф свой, llama.cpp используется только для GGUF, токенизатора и ядер ggml;\n"
 "llama_decode не вызывается никогда, кроме эталонного сравнения.\n"
 "\n"

@@ -1150,6 +1150,31 @@ static vk_instance_t vk_instance;
 
 static bool vk_perf_logger_enabled = false;
 
+// ---------------------------------------------------------------------------------------
+// MemeX: the submit policy, made adjustable. See the long comment at the point of use in
+// ggml_backend_vk_graph_compute; the short version is that upstream's heuristic assumes the
+// graph handed to graph_compute is a whole model forward pass, and ours is one layer.
+//
+//   GGML_VK_SUBMIT_DIVISOR  how many byte-triggered submits to aim for across the graph.
+//                           Upstream 40. 0 turns the byte rule off entirely.
+//   GGML_VK_SUBMIT_NODES    hard cap on nodes per submit. Upstream 100.
+//   GGML_VK_SUBMIT_TAIL     1 keeps the almost_ready submit at 80% of the graph, which is
+//                           what lets ggml_vk_wait_for_fence sleep through the bulk and
+//                           only spin over the tail. 0 removes it, and one submit with it.
+// ---------------------------------------------------------------------------------------
+static int  vk_submit_divisor = 40;
+static int  vk_submit_nodes   = 100;
+static bool vk_submit_tail    = true;
+
+static int ggml_vk_env_int(const char * name, int fallback) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == 0) {
+        return fallback;
+    }
+    const int parsed = atoi(v);
+    return parsed < 0 ? fallback : parsed;
+}
+
 #ifdef GGML_VULKAN_CHECK_RESULTS
 static size_t vk_skip_checks;
 static size_t vk_output_tensor;
@@ -3850,6 +3875,14 @@ static void ggml_vk_instance_init() {
     }
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+
+    // MemeX: submit policy, see the declarations above.
+    vk_submit_divisor = ggml_vk_env_int("GGML_VK_SUBMIT_DIVISOR", 40);
+    vk_submit_nodes   = ggml_vk_env_int("GGML_VK_SUBMIT_NODES",   100);
+    vk_submit_tail    = ggml_vk_env_int("GGML_VK_SUBMIT_TAIL",    1) != 0;
+    if (vk_submit_nodes < 1) {
+        vk_submit_nodes = 1;
+    }
 
     // Emulate behavior of CUDA_VISIBLE_DEVICES for Vulkan
     char * devices_env = getenv("GGML_VK_VISIBLE_DEVICES");
@@ -10350,11 +10383,58 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
     // (and scaled down based on model size, so smaller models submit earlier).
     // Also submit at least every 100 nodes, in case there are workloads without as much matmul.
-    int nodes_per_submit = 100;
+    //
+    // ---------------------------------------------------------------------------------------
+    // MemeX: the constants above are now GGML_VK_SUBMIT_DIVISOR / _NODES / _TAIL, and the
+    // integer division has a floor under it. Why, measured rather than argued:
+    //
+    // WHAT A SUBMIT COSTS HERE. llama-memex-vksplit sweeps the node count of a graph of tiny
+    // chained ops and fits the slope, once with the byte rule active and once without. The two
+    // graphs differ by one row of an eight-element matrix - 32 bytes of src[0] against 64 -
+    // which is enough to land on either side of the integer division below, and nothing else.
+    // Dependent chain, RX 6500 XT, three runs, slope spread 1.1% and 2.7% against a 4.2% noise
+    // floor:
+    //
+    //     submit after every node   27.05 us/node
+    //     submits batched            2.99 us/node
+    //     difference                24.06 us  <- this is one vkQueueSubmit
+    //
+    // Of the 2.99 that remains, process CPU time accounts for under 1 us and device timestamps
+    // (GGML_VK_PERF_LOGGER, fitted against 1/N to remove the command-buffer boundary) for 2.2
+    // to 3.5. So recording a dispatch is nearly free and submitting one is not.
+    //
+    // WHY THE RULE MISFIRES ON A SMALL GRAPH. The threshold is total_mat_mul_bytes/divisor, so
+    // a submit lands every ceil(N/divisor) matmuls for a graph of N of them - and ceil(N/40) is
+    // ONE for every N up to forty. The rule was written for a whole model forward pass, where N
+    // is hundreds; a graph of one transformer layer is fifteen nodes and submits after nearly
+    // every matmul in it. Measured on a chain of 256x256 matmuls, the same node costs
+    // 23.2 us in a graph of 8, 16.3 in a graph of 15, and 3.35 in a graph of 240.
+    //
+    // THE FLOOR. total_mat_mul_bytes/40u is an integer division, so any graph whose matmul
+    // bytes total less than forty gets a threshold of zero, and `mul_mat_bytes >= 0` is true at
+    // every node - including a graph with no matmul at all, where the total is zero. That turns
+    // the rule from "submit every 100 MB" into "submit every node", which is the opposite of
+    // what it says. Below zero means "never", not "always".
+    //
+    // WHAT IS GIVEN UP BY SUBMITTING LESS OFTEN. The stated purpose above is overlap: the GPU
+    // works on early nodes while the host records later ones. Host recording measures under
+    // 1 us/node, so for a fifteen-node layer the overlap on offer is worth about 15 us against
+    // roughly 120 us of submits - which is why this is adjustable and not simply raised. On a
+    // prefill graph, where the matmuls are large and recording is a smaller share of the work,
+    // the trade is different, so the sweep below is run on both.
+    // ---------------------------------------------------------------------------------------
+    int nodes_per_submit = vk_submit_nodes;
     int submitted_nodes = 0;
     int submit_count = 0;
     uint64_t mul_mat_bytes = 0;
-    uint64_t mul_mat_bytes_per_submit = std::min(uint64_t(100*1000*1000), total_mat_mul_bytes / 40u);
+    uint64_t mul_mat_bytes_per_submit = vk_submit_divisor > 0
+        ? std::min(uint64_t(100*1000*1000), total_mat_mul_bytes / uint64_t(vk_submit_divisor))
+        : UINT64_MAX;
+    if (mul_mat_bytes_per_submit == 0) {
+        // The floor described above: too little matmul to be worth chunking by bytes, so let the
+        // node cap and the last-node rule decide instead of submitting after every node.
+        mul_mat_bytes_per_submit = UINT64_MAX;
+    }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
@@ -10369,7 +10449,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
-        bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
+        // MemeX: optional, because it forces one submit per graph_compute on top of the last-node
+        // one. Keeping it lets ggml_vk_wait_for_fence sleep through the bulk of the graph and spin
+        // only over the tail; dropping it makes the host spin for the whole wait.
+        bool almost_ready = vk_submit_tail && ((cgraph->n_nodes - i) < cgraph->n_nodes / 5);
         bool submit = (submitted_nodes >= nodes_per_submit) ||
                       (mul_mat_bytes >= mul_mat_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops == last_node) ||
@@ -10405,7 +10488,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             first_node_in_batch = true;
             submitted_nodes = 0;
             mul_mat_bytes = 0;
-            if (submit_count < 3) {
+            // MemeX: the <= guard keeps the doubling from wrapping when the byte rule is off and
+            // the threshold is UINT64_MAX. Wrapping would turn "never" back into "often".
+            if (submit_count < 3 && mul_mat_bytes_per_submit <= UINT64_MAX / 2) {
                 mul_mat_bytes_per_submit *= 2;
             }
             submit_count++;
