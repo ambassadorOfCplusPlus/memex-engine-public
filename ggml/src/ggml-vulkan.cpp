@@ -1166,6 +1166,31 @@ static int  vk_submit_divisor = 40;
 static int  vk_submit_nodes   = 100;
 static bool vk_submit_tail    = true;
 
+// GGML_VK_SUBMIT_STATS=1 prints, at backend teardown, how many graphs went through
+// graph_compute, how many nodes and how many submits they contained, and how long the host spent
+// inside graph_compute in total.
+//
+// This exists because tok/s cannot see it. On the configuration the submit policy is being tuned
+// for - experts on the CPU, everything else on the card - the Vulkan side is a small share of a
+// token, and the machine it is measured on has been moving by 15 to 25 percent for reasons nobody
+// has identified yet. An effect worth a few percent of a token cannot be read off a number that
+// noisy. Submits per token can: it does not depend on how fast the CPU ran its half, so it stays
+// still while everything around it moves, and it is the quantity the policy actually changes.
+static bool     vk_submit_stats = false;
+static uint64_t vk_stat_graphs  = 0;
+static uint64_t vk_stat_nodes   = 0;
+static uint64_t vk_stat_submits = 0;
+static double   vk_stat_us      = 0.0;
+
+// One graph_compute call IS one Vulkan split: ggml_backend_sched cuts the graph wherever the
+// backend changes and calls the backend once per piece, so cgraph->n_nodes is the split size.
+// A mean over those would hide the thing worth knowing. When the experts are forced host-side the
+// scheduler does not produce one uniform slice per layer - it produces a few distinct shapes,
+// repeated once per layer, plus a couple of one-off pieces at the ends. "30 nodes per graph on
+// average" is consistent with 30x48 and with 15x48 interleaved with 45x48, and those imply very
+// different submit counts. So: count graphs and submits per distinct split size.
+static std::map<int, std::pair<uint64_t, uint64_t>> vk_stat_by_size;   // n_nodes -> (grafov, submitov)
+
 static int ggml_vk_env_int(const char * name, int fallback) {
     const char * v = getenv(name);
     if (v == nullptr || *v == 0) {
@@ -3880,6 +3905,7 @@ static void ggml_vk_instance_init() {
     vk_submit_divisor = ggml_vk_env_int("GGML_VK_SUBMIT_DIVISOR", 40);
     vk_submit_nodes   = ggml_vk_env_int("GGML_VK_SUBMIT_NODES",   100);
     vk_submit_tail    = ggml_vk_env_int("GGML_VK_SUBMIT_TAIL",    1) != 0;
+    vk_submit_stats   = ggml_vk_env_int("GGML_VK_SUBMIT_STATS",   0) != 0;
     if (vk_submit_nodes < 1) {
         vk_submit_nodes = 1;
     }
@@ -10068,6 +10094,31 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
+    // MemeX: see vk_submit_stats. Printed once, at teardown, so it costs nothing during the run.
+    if (vk_submit_stats && vk_stat_graphs > 0) {
+        fprintf(stderr,
+                "ggml_vulkan submit stats: grafov %llu, uzlov %llu (%.1f na graf), submitov %llu "
+                "(%.2f na graf, %.3f na uzel), v graph_compute %.1f ms (%.1f us na graf)\n",
+                (unsigned long long) vk_stat_graphs,
+                (unsigned long long) vk_stat_nodes,
+                double(vk_stat_nodes) / double(vk_stat_graphs),
+                (unsigned long long) vk_stat_submits,
+                double(vk_stat_submits) / double(vk_stat_graphs),
+                vk_stat_nodes ? double(vk_stat_submits) / double(vk_stat_nodes) : 0.0,
+                vk_stat_us / 1000.0,
+                vk_stat_us / double(vk_stat_graphs));
+        // The shape of the carve-up, largest splits first, so the per-layer piece is at the top.
+        // Ten lines is enough: if there are more than ten distinct shapes the interesting ones are
+        // still the big frequent ones, and the tail is one-offs at the graph's ends.
+        int shown = 0;
+        for (auto it = vk_stat_by_size.rbegin(); it != vk_stat_by_size.rend() && shown < 10; ++it, ++shown) {
+            fprintf(stderr, "  uzlov v splite %4d: grafov %6llu, submitov %.2f na graf\n",
+                    it->first,
+                    (unsigned long long) it->second.first,
+                    it->second.first ? double(it->second.second) / double(it->second.first) : 0.0);
+        }
+    }
+
     ggml_vk_cleanup(ctx);
 
     delete ctx;
@@ -10318,6 +10369,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    // MemeX: see vk_submit_stats. Cheap enough to leave unconditional - one clock read per graph
+    // against tens of microseconds of submit - but the counting is skipped when it is off anyway.
+    const std::chrono::steady_clock::time_point vk_stat_t0 =
+        vk_submit_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
         dul.pLabelName = "ggml_backend_vk_graph_compute";
@@ -10522,6 +10578,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ggml_vk_graph_cleanup(ctx);
+
+    if (vk_submit_stats) {
+        // submit_count is already the number of submits this graph made - it is what the doubling
+        // rule counts - so nothing new has to be tracked to read it.
+        vk_stat_graphs++;
+        vk_stat_nodes   += uint64_t(cgraph->n_nodes);
+        vk_stat_submits += uint64_t(submit_count);
+        vk_stat_us      += std::chrono::duration<double, std::micro>(
+                               std::chrono::steady_clock::now() - vk_stat_t0).count();
+        auto& e = vk_stat_by_size[cgraph->n_nodes];
+        e.first++;
+        e.second += uint64_t(submit_count);
+    }
 
     return GGML_STATUS_SUCCESS;
 
