@@ -194,11 +194,16 @@ void GpuExperts::print_queues() {
         vkDestroyInstance(inst, nullptr);
         return;
     }
-    std::vector<VkPhysicalDevice> devs(std::size_t(n));
+    // Not `std::vector<T> v(std::size_t(n))`: that is the most vexing parse - the compiler
+    // reads it as a function declaration, and every later use then fails with an unrelated
+    // message about indexing a non-array.
+    std::vector<VkPhysicalDevice> devs;
+    devs.resize(std::size_t(n));
     vkEnumeratePhysicalDevices(inst, &n, devs.data());
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(devs[0], &nq, nullptr);
-    std::vector<VkQueueFamilyProperties> qfp(std::size_t(nq));
+    std::vector<VkQueueFamilyProperties> qfp;
+    qfp.resize(std::size_t(nq));
     vkGetPhysicalDeviceQueueFamilyProperties(devs[0], &nq, qfp.data());
 
     printf("  семейств очередей: %u\n", unsigned(nq));
