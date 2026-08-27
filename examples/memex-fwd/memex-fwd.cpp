@@ -5394,11 +5394,30 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
-    if (sopt.on && gopt.on) {
-        printf("--gpu-static vmeste s --gpu-experts poka ne podderzhan: oba berut "
-               "ggml_backend_vk_init(0), a ggml keshiruet ustrojstva, tak chto oni podelili "
-               "by odnu ochered i odin staging-bufer mezhdu dvuh potokov\n");
-        return 1;
+    // --gpu-static and --gpu-experts together: this is the whole design, not an exotic
+    // combination. The card holds the static half (802 MB, every resident byte read on every
+    // token) and the popular experts in whatever video memory is left, and the crossing the
+    // static half already pays per layer is the crossing the expert split rides on.
+    //
+    // It was refused until now on a reading of the source that turns out to be wrong in the
+    // part that mattered. Both modules do call ggml_backend_vk_init(0) and ggml does cache its
+    // devices (ggml-vulkan.cpp:3067-3073), so they share one vk_device - but they get SEPARATE
+    // ggml_backend_vk_contexts, and a command pool is per (context, queue) rather than per
+    // device ("There's an instance of this for each (context,queue) pair", ggml-vulkan.cpp at
+    // struct vk_command_pool). What is genuinely shared is protected where it is touched:
+    // queue submits by the file-scope queue_mutex (ggml_vk_submit, :1432 and :1502), buffer
+    // reads and writes and the sync_staging buffer behind them by device->mutex (:4725, :4816,
+    // :4846, :4881), and pipeline compilation by the same (:1342, :1556).
+    //
+    // What is NOT protected is two contexts' prealloc buffers, and those are per context. So
+    // the remaining exposure is the one thing measurement can see: a wrong answer under
+    // --gpu-experts-check, or a device-lost. Both are loud. Refusing the combination outright
+    // meant the design could never be measured at all, which is a worse failure than either.
+    if (sopt.on && gopt.on && !gopt.check) {
+        printf("--gpu-static i --gpu-experts vmeste: dva konteksta Vulkan na odnom "
+               "ustrojstve. Ochered, bufery i kompiljacija konvejerov zashchishcheny "
+               "sobstvennymi mutexami ggml; pervyj progon stoit gonjat s "
+               "--gpu-experts-check\n");
     }
     if (sopt.on && (sopt.rows < 1 || sopt.rows > 64)) {
         printf("--gpu-static-rows %d vne diapazona 1..64\n", sopt.rows);
