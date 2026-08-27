@@ -6618,9 +6618,9 @@ int main(int argc, char** argv) {
             // indistinguishable from one that did not help unless the run says which it was
             // (rule 68). MEMEX_PROMO_DRAIN=1 is the pre-drain behaviour - one fence per
             // promotion - kept reachable so both arms live in one binary.
-            printf("  дренаж очереди подкачек: до %d промоушенов в ОДНОМ пакете "
-                   "(кольцо %d, MEMEX_PROMO_DRAIN=%s)%s\n",
-                   gx->promo_drain(), gx->stage_slots(),
+            printf("  дренаж очереди подкачек: до %d промоушенов в ОДНОМ пакете, уступает "
+                   "диспатчу %s (кольцо %d, MEMEX_PROMO_DRAIN=%s)%s\n",
+                   gx->promo_drain(), gx->promo_yield() ? "ДА" : "НЕТ", gx->stage_slots(),
                    getenv("MEMEX_PROMO_DRAIN") ? getenv("MEMEX_PROMO_DRAIN") : "не задан",
                    gx->promo_drain() > gx->stage_slots()
                        ? " — ВЫШЕ КОЛЬЦА: upload закроет и откроет пакет внутри дренажа, "
@@ -7367,6 +7367,34 @@ int main(int argc, char** argv) {
             rrep.set_size = rset->n_resident(0);
             rrep.win_distinct = rset->window_distinct(0);
             rrep.pending_end = rset->n_pending(0);
+#ifdef MEMEX_FWD_GPU_EXPERTS
+            // THE BYTES IN VIDEO MEMORY, AFTER the whole generation rather than only after the
+            // initial fill. The step-0 check above runs before a single promotion has been
+            // drained, so it validates the fill and nothing else; a batching or landing bug
+            // lives entirely in the promotions that follow it. Sampled across layers and slots
+            // because verify_slot reads back through a fence, and a full sweep of 3072 slots
+            // would cost more than the run.
+            if (gxp) {
+                gxp->drain();
+                int probed = 0, bad = 0;
+                std::string verr;
+                for (int il = 0; il < h.n_layer; il += 3) {
+                    for (int s = 0; s < gxp->capacity(); s += 4) {
+                        std::string e;
+                        if (!gxp->verify_slot(il, s, &e)) {
+                            if (e == "слот пуст") continue;
+                            ++bad;
+                            if (verr.empty()) verr = e;
+                        }
+                        ++probed;
+                    }
+                }
+                printf("  видеопамять против модели ПОСЛЕ генерации: сверено слотов %d, "
+                       "расхождений %d%s%s\n", probed, bad, bad ? " — " : "",
+                       bad ? verr.c_str() : "");
+                printf("VERIFY_AB slots %d bad %d\n", probed, bad);
+            }
+#endif
         } else {
             for (int i = 0; i < n_gen; ++i) {
                 ours_seq.push_back(next);
@@ -7660,11 +7688,12 @@ int main(int argc, char** argv) {
                 // is broken is worse than no number (the barrier arm measured a 10% faster
                 // layer and 0 of 192 correct tokens), so the harness must be able to gate on
                 // correctness from the same line it reads the timings off.
-                printf("PROMO_AB drain %d ring %d pinned %d match %d of %d promo %llu "
+                printf("PROMO_AB drain %d yield %d ring %d pinned %d match %d of %d promo %llu "
                        "batches %llu per_batch %.4f promo_ms_tok %.4f ms_per_promo %.4f "
                        "gbs %.4f mb_tok %.4f join_wait_tok %.4f job_tok %.4f cpu_tok %.4f "
                        "fill_ms %.1f fill_promo %llu\n",
-                       gxp->promo_drain(), gxp->stage_slots(), gxp->stage_pinned() ? 1 : 0,
+                       gxp->promo_drain(), gxp->promo_yield() ? 1 : 0, gxp->stage_slots(),
+                       gxp->stage_pinned() ? 1 : 0,
                        same, n_gen,
                        (unsigned long long)promo_n_gen, (unsigned long long)promo_b_gen,
                        promo_b_gen ? double(promo_n_gen) / double(promo_b_gen) : 0.0,

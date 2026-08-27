@@ -858,6 +858,10 @@ bool GpuExperts::init(const GpuExpertsConfig& cfg, ggml_tensor* const* up,
             if (v >= 1) promo_drain_ = v;
         }
         if (promo_drain_ < 1) promo_drain_ = 1;
+        // Close the batch early when a dispatch is waiting. On by default because the first
+        // measurement of the drain showed the cost is the hold, not the fence.
+        promo_yield_ = true;
+        if (const char* e = getenv("MEMEX_PROMO_YIELD")) promo_yield_ = (atoi(e) != 0);
     }
 
     slot_of_.assign(std::size_t(cfg_.n_layers) * std::size_t(cfg_.n_experts), int16_t(-1));
@@ -1092,13 +1096,41 @@ void GpuExperts::worker_loop() {
             // its dirty_ bit cleared and pending_ decremented under the lock, so the slots
             // still in the queue are exactly those not in this batch, and sync_slots keeps its
             // hands off all of them because is_claimed() covers pending as well as resident.
+            //
+            // AND IT YIELDS. The first measurement of the drain said the fence count is not
+            // where the time is: folding 6.77 promotions behind one fence took the prefetch
+            // from 8.94 to 8.27 ms/token (-7.5%) and pushed the join wait UP, 11.58 to 15.18
+            // ms/token, because a dispatch arriving mid-batch now queues behind the whole
+            // batch instead of behind one promotion. So the batch is closed as soon as a
+            // dispatch is waiting: whatever was already recorded still costs one fence, and
+            // the dispatch waits for the tail of the batch rather than for all of it.
+            // MEMEX_PROMO_YIELD=0 turns the check off, which is the non-yielding arm.
             const auto t_pr = std::chrono::steady_clock::now();
             batch_begin();
-            for (std::size_t j = 0; j < dr_slot_.size(); ++j) {
+            std::size_t j = 0;
+            for (; j < dr_slot_.size(); ++j) {
+                if (promo_yield_ && j > 0) {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (job_active_) break;
+                }
                 if (dr_expert_[j] < 0) continue;
-                if (!upload(dr_il_[j], dr_slot_[j], dr_expert_[j])) break;
+                if (!upload(dr_il_[j], dr_slot_[j], dr_expert_[j])) { ++j; break; }
             }
             batch_end();
+            // Anything not uploaded goes back on the queue exactly as it was: the dirty bit
+            // set again and pending_ restored. Without this the slot would keep its new
+            // occupant in the map while its bytes were never sent - the one way the map and
+            // the device could disagree about what a slot holds.
+            if (j < dr_slot_.size()) {
+                std::lock_guard<std::mutex> lk(mu_);
+                for (std::size_t r = j; r < dr_slot_.size(); ++r) {
+                    const std::size_t sb = std::size_t(dr_il_[r]) * std::size_t(cfg_.capacity);
+                    if (dirty_[sb + std::size_t(dr_slot_[r])]) continue;   // never twice
+                    dirty_[sb + std::size_t(dr_slot_[r])] = 1;
+                    ++pending_[std::size_t(dr_il_[r])];
+                    ++pending_total_;
+                }
+            }
             const double pr_ms =
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t_pr).count();

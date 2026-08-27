@@ -217,6 +217,9 @@ class GpuExperts {
     // Overridable by MEMEX_PROMO_DRAIN so both arms live in one binary - and printed, because
     // a setting that did not apply is indistinguishable from one that did not help (rule 68).
     int  promo_drain()  const { return promo_drain_; }
+    // Whether a batch is closed early as soon as a dispatch is waiting. The fence saving is
+    // kept for whatever was already recorded; what is given up is the tail of the batch.
+    bool promo_yield()  const { return promo_yield_; }
     bool readback_mapped() const { return !out_mapped_.empty() && out_mapped_.back() != nullptr; }
 
     // Recompute the slot map from the resident set and queue the uploads the change implies.
@@ -381,6 +384,7 @@ class GpuExperts {
     // make upload() close and reopen the batch mid-drain, reintroducing exactly the fence per
     // ring-full that the drain exists to remove, while making an arriving dispatch wait longer.
     int                   promo_drain_ = 1;
+    bool                  promo_yield_ = true;
     // Scratch for the drain, owned by the worker thread: filled under mu_, uploaded outside it.
     std::vector<int>      dr_il_, dr_slot_, dr_expert_;
     bool                  batching_    = false;   // a batch is open on this thread
