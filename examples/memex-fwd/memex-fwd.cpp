@@ -7331,12 +7331,24 @@ int main(int argc, char** argv) {
                 // doubled latency bill that no bandwidth argument would ever show. At 48
                 // layers a per-token figure of 49 and one of 96 look equally plausible until
                 // the division is written down.
-                printf("vnimanie i marshrutizator na karte: %llu peresechenij, %.1f na "
-                       "tokjen = %.2f na sloj%s\n",
-                       (unsigned long long)ss.layer_calls, lc / tk,
-                       lc / (tk * double(h.n_layer > 0 ? h.n_layer : 1)),
-                       lc / (tk * double(h.n_layer > 0 ? h.n_layer : 1)) > 1.35
-                           ? " - BOLSHE ODNOGO NA SLOJ" : "");
+                // The divisor is n_gen, and the numerator counts the PROMPT's crossings too,
+                // so the per-layer figure only means anything once generation dominates. At
+                // --gen 4 it printed "2.00 na sloj - BOLSHE ODNOGO NA SLOJ" over a graph that
+                // crosses exactly once, because 512 prompt tokens' worth of crossings were
+                // being divided by four. Said properly or not said.
+                const double per_layer =
+                    lc / (tk * double(h.n_layer > 0 ? h.n_layer : 1));
+                if (n_gen >= 32) {
+                    printf("vnimanie i marshrutizator na karte: %llu peresechenij, %.1f na "
+                           "tokjen = %.2f na sloj%s\n",
+                           (unsigned long long)ss.layer_calls, lc / tk, per_layer,
+                           per_layer > 1.35 ? " - BOLSHE ODNOGO NA SLOJ" : "");
+                } else {
+                    printf("vnimanie i marshrutizator na karte: %llu peresechenij, %.1f na "
+                           "tokjen (na sloj ne schitaetsja: pri --gen %d peresechenija promta "
+                           "v chislitele perevesivajut)\n",
+                           (unsigned long long)ss.layer_calls, lc / tk, n_gen);
+                }
                 printf("  na odno peresechenie: vsego %.3f ms = podjom %.3f + ustrojstvo "
                        "%.3f + zabor %.3f\n", ss.layer_ms_total / lc,
                        ss.layer_ms_upload / lc, ss.layer_ms_device / lc,

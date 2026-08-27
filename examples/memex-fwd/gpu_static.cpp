@@ -959,6 +959,19 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         G.K = K; G.V = V; G.kq = kq; G.probs = p;
         G.mapped = nullptr;
         G.mapped_probed = false;
+        // COUNTED, ONCE, BECAUSE THIS IS THE PRICE OF THE CROSSING.
+        //
+        // The device spends 0.467 ms per crossing on a layer whose weights are 10.6 MB; at
+        // this card's 131 GB/s the bytes are worth 0.081 ms. The rest is launch, and launch
+        // is priced per NODE: measured two commits ago as a slope, 38 nodes -> 29 moved the
+        // device time 0.683 -> 0.618, i.e. 7.2 us a node, with submits per graph unchanged
+        // at 2.00. So the node count is not a curiosity of the build, it is 29 x 7.2 us =
+        // 0.21 ms of every crossing, and it belongs in the output where the 0.467 is.
+        if (il == 0) {
+            printf("  graf sloja: %d uzlov; pri 7.2 us na uzel eto %.3f ms zapuska iz "
+                   "kazhdogo peresechenija\n",
+                   ggml_graph_n_nodes(gf), 0.0072 * double(ggml_graph_n_nodes(gf)));
+        }
     }
     return true;
 }
