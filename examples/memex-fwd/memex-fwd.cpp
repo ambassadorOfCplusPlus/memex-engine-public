@@ -1434,15 +1434,34 @@ bool build(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h, const We
         // takes, because cparams.fused_mmad defaults to true and llm_build_moe_ffn calls
         // ggml_mul_multi_add on that branch (llama-build-context.cpp:1822).
         ggml_tensor* moe = ggml_mul_multi_add(c, out, weights);
-        // TWO names for one tensor, deliberately. "ffn_moe_out" was our own invention and
-        // matches nothing on the reference side, so for the whole life of this file the
-        // qwen3moe MoE tail has produced a probe line that could never be compared - the
-        // same hole that was found and closed on gemma4. The reference calls this node
-        // "ffn_moe_weighted" (llama-build-context.cpp:1824), so that name is what actually
-        // puts a number next to it. The old name stays because existing comparisons ask for
-        // this intermediate by it, and it now points at the fused output.
+        // THE NAMES ARE THE WHOLE POINT HERE, so they are read off the reference rather than
+        // invented. "ffn_moe_out" was our own coinage and matches nothing the reference emits,
+        // which means that for the entire life of this file the qwen3moe MoE tail produced a
+        // probe line that could never be compared - the comparison loop skips a name the
+        // reference did not emit. --probe list says what it actually calls these:
+        //
+        //     uzel 38: ffn_moe_gate_par-0   f32 ne 768,8,12    silu(gate)*up, per slot
+        //     uzel 39: ffn_moe_down-0       f32 ne 2048,8,12   expert outputs, per slot
+        //     uzel 40: routed_out-0         f32 ne 2048,12,1   weighted and folded
+        //
+        // Note what is NOT in that list: ffn_moe_up and ffn_moe_gate. The reference fuses
+        // them into ggml_moe_up_gate (llama-build-context.cpp:1760) whenever
+        // cparams.fused_moe_up_gate holds and up and gate share a type, which they do here.
+        // Our four nodes there are, like the eight-node tail was, a spelling llama_decode
+        // does not take.
+        //
+        // The old name is kept pointing at the fused output because comparisons ask for this
+        // intermediate by it.
         g->probes.push_back({"ffn_moe_out-" + std::to_string(il), moe});
-        g->probes.push_back({"ffn_moe_weighted-" + std::to_string(il), moe});
+        g->probes.push_back({"routed_out-" + std::to_string(il), moe});
+        // Per-slot, and only on the first two layers: 2048x8x12 floats is 786 KB a layer and
+        // the long-prompt arm would otherwise hold gigabytes. Two layers is enough, because
+        // what these answer is "does slot j of layer 0 already differ", and a divergence that
+        // starts deeper is caught by routed_out at every layer anyway.
+        if (il < 2) {
+            g->probes.push_back({"ffn_moe_gate_par-" + std::to_string(il), act});
+            g->probes.push_back({"ffn_moe_down-" + std::to_string(il), out});
+        }
         cur = ggml_add(c, moe, ffn_inp);
         g->probes.push_back({"l_out-" + std::to_string(il), cur});
     }
@@ -3575,6 +3594,13 @@ int probe_cb(ggml_tensor* t, bool ask, void* user_data) {
                             n.rfind("attn_out-", 0) == 0 ||
                             n.rfind("ffn_moe_out-", 0) == 0 ||
                             n.rfind("ffn_moe_weighted-", 0) == 0 ||
+                            // qwen3moe's own names for the MoE tail, from --probe list. The
+                            // per-slot pair is restricted to layers 0 and 1 for the same
+                            // reason the intra-attention names are: they are eight times as
+                            // wide as a layer output.
+                            n.rfind("routed_out-", 0) == 0 ||
+                            (head_two && (n.rfind("ffn_moe_gate_par-", 0) == 0 ||
+                                          n.rfind("ffn_moe_down-", 0) == 0)) ||
                             n.rfind("ffn_norm_1-", 0) == 0 ||
                             n.rfind("ffn_moe_combined-", 0) == 0 ||
                             n.rfind("ffn_norm_2-", 0) == 0 ||
