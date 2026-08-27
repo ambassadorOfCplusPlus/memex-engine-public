@@ -1149,21 +1149,32 @@ void GpuExperts::compute(int il, int k) {
 
     ggml_backend_graph_compute(be_, gf_[std::size_t(k)]);
 
-    // The readback. graph_compute already forced a fence on its last submit, so the bytes are
-    // final; if this width's output landed in host-visible coherent memory there is nothing to
-    // transfer and the second fence per layer disappears.
+    // THE READBACK, AND IT WAS COSTING THE WHOLE SCHEME. Measured, not reasoned about.
+    //
+    // What stood here: if this width's output landed in host-visible coherent memory, take the
+    // mapped pointer and memcpy, so the second fence per layer disappears. The counter beside
+    // it counted FENCES, and by that measure it was a total success - 9188 readbacks, 0 fences.
+    //
+    // What it actually cost: a host READ from the BAR aperture is uncached and uncombined, so
+    // every cache line is its own PCIe transaction. The same shortcut was measured directly in
+    // GpuStatic's layer path at 16.9 KB per call: 0.758 ms, i.e. 22 MB/s. This output is
+    // n_embd * k floats - about 46 KB at the average compacted width - which is roughly 2 ms
+    // per layer, 91 ms per token over forty-eight. That is the entire difference between the
+    // full scheme running at 5.74 tok/s and the static half alone running at 12.02.
+    //
+    // The direction is what decides it, not the size. Writes through the same mapping are
+    // write-combined and nearly free, which is why the inputs above are written exactly that
+    // way (8 KB at 0.003 ms). Reads are not. ggml_vk_buffer_read
+    // (ggml-vulkan.cpp:4805-4831) already refuses the aperture on a non-UMA device for this
+    // reason and takes the hardware copy path; rb_ being Vulkan-pinned makes that one DMA into
+    // our own buffer rather than a hop through the backend's shared staging. It costs the
+    // submit and fence this branch was written to avoid - about 59 us - against 2000.
+    //
+    // Kept as a counted quantity rather than deleted, because "fences per layer" is still worth
+    // knowing; it is simply not the quantity that decides this.
     const std::size_t ki = std::size_t(k);
-    if (!out_mapped_probed_[ki]) {
-        out_mapped_probed_[ki] = 1;
-        out_mapped_[ki] = (float*)ggml_backend_vk_tensor_mapped_ptr(n_out_[ki]);
-    }
-    const float* src = out_mapped_[ki];
-    if (src != nullptr) {
-        std::memcpy(rb_, src, ne * std::size_t(k) * sizeof(float));
-        std::lock_guard<std::mutex> lk(mu_);
-        ++st_.readback_mapped;
-    } else {
-        ggml_backend_tensor_get(n_out_[ki], rb_, 0, ne * std::size_t(k) * sizeof(float));
+    ggml_backend_tensor_get(n_out_[ki], rb_, 0, ne * std::size_t(k) * sizeof(float));
+    {
         std::lock_guard<std::mutex> lk(mu_);
         ++st_.readback_fenced;
     }

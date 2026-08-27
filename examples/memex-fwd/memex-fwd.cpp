@@ -3973,6 +3973,9 @@ struct ResidentReport {
     double worst_rel = 0.0;         // worst relative L2 on the logits, split vs unsplit
     uint64_t picks_checked  = 0;    // slots where the graph's split was compared to the host's
     uint64_t split_disagree = 0;    // ...and disagreed. Must be zero.
+    // Who computed the resident half. The verdict on a non-zero logit difference depends on
+    // it entirely: two CPU halves must agree to the bit, a CPU half and a device half must not.
+    bool device_half = false;
     int set_size     = 0;           // resident experts in layer 0 when the run ended
     int win_distinct = 0;           // distinct experts the window held, layer 0
     int pending_end  = 0;           // promotions still in flight in layer 0 at the end
@@ -4054,18 +4057,39 @@ void print_resident(const ResidentOpt& r, const ResidentReport& rep, const HPara
                rep.split_disagree == 0 ? " — маска дошла до графа" : " — МАСКА НЕ ТА");
     }
     if (rep.checked > 0) {
-        // Bit-exactness is the claim, not "close": the halves are added per slot before the
-        // weighting, so every slot arrives at the fold with the unsplit path's own bits. A
-        // non-zero L2 here is therefore a fault, not rounding, and it is said as one.
+        // WHAT A NON-ZERO L2 MEANS HERE DEPENDS ON WHO COMPUTED THE RESIDENT HALF, and reading
+        // it wrong costs a hunt for a bug that is not there.
+        //
+        // Both halves on the CPU (--resident without --gpu-experts): bit-exactness is the
+        // claim, not "close". The halves are added per slot before the weighting, mul_mat_id
+        // zeroed the slice of every slot the other half owns, and x + 0.0f is x - so every slot
+        // reaches the fold with the unsplit path's own bits. A non-zero L2 is then a fault.
+        //
+        // The resident half on the device (--gpu-experts): the halves are computed by DIFFERENT
+        // KERNELS and differ by more than rounding. On one mul_mat_id against a double-precision
+        // reference the CPU measured 5.0e-2 and Vulkan 9.4e-8, so the device is the more
+        // accurate of the two, and a few percent on the logits is the expected shape of that
+        // difference rather than evidence of a mis-wired split. The structural claim is still
+        // checked, by something that does not depend on the kernels: the per-slot partition
+        // against the host's own bitset, and the two exact zeros printed above.
+        //
+        // The line used to assert the first reading unconditionally. On the first run of the
+        // whole scheme it printed "половины складываются не послотно" over a split whose 73728
+        // slots had just been verified against the host with zero discrepancies, in the same
+        // output, four lines earlier.
         printf("    расщеплённый граф против нерасщеплённого: %d шагов, argmax совпал "
                "%d/%d, худшая отн. L2 логитов %.9f%%%s\n", rep.checked, rep.argmax_same,
                rep.checked, 100.0 * rep.worst_rel,
                (rep.argmax_same == rep.checked && rep.worst_rel == 0.0)
                    ? " — сумма половин ПОБИТОВО равна нерасщеплённому результату"
-                   : (rep.argmax_same == rep.checked
-                          ? " — токены те же, но биты РАСХОДЯТСЯ: половины складываются не "
-                            "послотно"
-                          : " — СУММА ПОЛОВИН РАСХОДИТСЯ"));
+                   : (rep.argmax_same != rep.checked
+                          ? " — СУММА ПОЛОВИН РАСХОДИТСЯ"
+                          : (rep.device_half
+                                 ? " — токены те же; резидентную половину считало устройство, "
+                                   "поэтому биты и не обязаны совпадать (его ядро точнее, см. "
+                                   "--gpu-experts-selftest)"
+                                 : " — токены те же, но биты РАСХОДЯТСЯ: половины складываются "
+                                   "не послотно")));
     }
 }
 
@@ -6505,6 +6529,7 @@ int main(int argc, char** argv) {
 
         std::unique_ptr<memex::ResidentSet> rset;
         ResidentReport rrep;
+        rrep.device_half = (gxp != nullptr);
         if (ropt.on()) {
             memex::ResidentParams rp;
             rp.n_layers  = h.n_layer;
