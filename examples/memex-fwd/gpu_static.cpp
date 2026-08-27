@@ -588,6 +588,13 @@ bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::str
         return false;
     }
     cfg_.n_kv_max = n_kv_max;
+    // rb_ is the pinned readback staging, allocated for a block of logits. The layer output is
+    // far smaller, but "far smaller" is an argument and this is a bounds check.
+    if (!rb_ || std::size_t(cfg_.n_vocab) * std::size_t(cfg_.max_rows) <
+                std::size_t(2 * cfg_.n_embd + cfg_.n_expert)) {
+        *err = "bufer zabora menshe vyhoda sloja";
+        return false;
+    }
     if (!alloc_layers(layers, err)) return false;
     if (!build_layer_graphs(err)) return false;
     // The same for every layer graph, and for the same three reasons: the pipelines for the
@@ -1067,21 +1074,35 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
         auto tb = std::chrono::steady_clock::now();
         ggml_backend_graph_compute(be_, G.gf);
         auto tc = std::chrono::steady_clock::now();
-        // A small output lands in host-visible coherent memory on this driver, and the
-        // readback is then a memcpy through the mapping rather than a submit and a fence.
-        // Probed once, after the allocator has run, because the answer is a property of where
-        // the allocator put the buffer.
-        if (!G.mapped_probed) {
-            G.mapped_probed = true;
-            G.mapped = (const float*)ggml_backend_vk_tensor_mapped_ptr(G.out);
-        }
-        if (G.mapped) {
-            std::memcpy(dst->data, G.mapped, out_floats * sizeof(float));
-            ++st_.layer_readback_mapped;
-        } else {
-            ggml_backend_tensor_get(G.out, dst->data, 0, out_floats * sizeof(float));
-            ++st_.layer_readback_fenced;
-        }
+        // THE READBACK, AND THIS IS A CORRECTED MISTAKE RATHER THAN A CHOICE.
+        //
+        // The first version took the mapped pointer: the layer's output is 16.9 KB, so the
+        // allocator puts it in the host-visible BAR window, and a memcpy through that mapping
+        // costs no submit and no fence at all. It measured 0.758 ms per layer - 22 MB/s - and
+        // that was HALF the entire per-layer cost, 36 ms of a token.
+        //
+        // The reason is that a host READ from the BAR aperture is uncached and uncombined:
+        // every cache line is a separate PCIe transaction, and the direction matters. Writes
+        // through the same mapping are write-combined and genuinely free, which is why the
+        // inputs above are written exactly this way. Reads are not.
+        //
+        // So the readback goes the other way: ggml_vk_buffer_read
+        // (ggml-vulkan.cpp:4805-4831) deliberately takes the hardware copy path on a non-UMA
+        // device even for host-visible memory, and rb_ being Vulkan-pinned is what makes it a
+        // single DMA into our own buffer rather than a hop through the backend's staging. It
+        // costs one submit and one fence, about 59 us, and moves the bytes at DMA speed.
+        //
+        // The head path already had this right and said so in its comment. The layer path
+        // reintroduced the shortcut because the output is small - and small is exactly where
+        // the fixed 59 us looks expensive, which is what made the trade look different. It is
+        // not different: 59 us beats 758 us by an order of magnitude.
+        //
+        // rb_ is shared with the head. Safe by construction rather than by luck: both run from
+        // ggml_map_custom with n_tasks == 1 on the one thread that executes the node, and the
+        // head is the last node of the graph while every layer is strictly before it.
+        ggml_backend_tensor_get(G.out, rb_, 0, out_floats * sizeof(float));
+        std::memcpy(dst->data, rb_, out_floats * sizeof(float));
+        ++st_.layer_readback_fenced;
         auto td = std::chrono::steady_clock::now();
         st_.layer_ms_upload += std::chrono::duration<double, std::milli>(tb - ta).count();
         st_.layer_ms_device += std::chrono::duration<double, std::milli>(tc - tb).count();

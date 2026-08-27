@@ -5481,6 +5481,29 @@ int main(int argc, char** argv) {
                "mnogotokennyj, on pishet kesh hosta, a shag chitaet kesh karty\n");
         return 1;
     }
+    // ggml reads GGML_VK_SUBMIT_* ONCE, when the device is created (ggml-vulkan.cpp:3905),
+    // and something before us already creates it: stderr carries "Vulkan0: using device
+    // Vulkan0 - 3824 MiB free" from the model loader. So setting these inside GpuStatic::init
+    // is too late - it runs after the load - and the default divisor of 40 would stand.
+    //
+    // Why 1. The backend picks submit points by mul_mat_bytes >= total_mat_mul_bytes/divisor,
+    // doubling the threshold for each of the first three submits, so a layer graph with seven
+    // matmuls submits five or six times at a measured 24.1 us each: 120-145 us a layer, 6-7 ms
+    // a token, against a stage whose whole budget is about 20. A divisor of 1 makes it one.
+    //
+    // Safe only because these graphs are small. Upstream submits early to bound how long one
+    // submission runs against the two-second kernel timeout on Windows - the failure mode there
+    // is a device-lost, not a slow run - and a 10 MB layer cannot approach it. An environment
+    // that already carries a value wins, so a sweep over the divisor can still say so.
+    if (sopt.layers) {
+#ifdef _WIN32
+        if (!getenv("GGML_VK_SUBMIT_DIVISOR")) _putenv_s("GGML_VK_SUBMIT_DIVISOR", "1");
+        if (!getenv("GGML_VK_SUBMIT_TAIL"))    _putenv_s("GGML_VK_SUBMIT_TAIL", "0");
+#else
+        if (!getenv("GGML_VK_SUBMIT_DIVISOR")) setenv("GGML_VK_SUBMIT_DIVISOR", "1", 0);
+        if (!getenv("GGML_VK_SUBMIT_TAIL"))    setenv("GGML_VK_SUBMIT_TAIL", "0", 0);
+#endif
+    }
     if (sopt.layers && zopt.on) {
         printf("--gpu-static-layers vmeste s --zoned nelzja: zonnyj kesh stroit svoj "
                "podgraf vnimanija na hoste\n");
