@@ -1214,7 +1214,17 @@ static bool vk_no_sync = false;
 // CONDITIONAL barrier could be dropped at four of the layer's nineteen dispatches; a NARROWER
 // one applies to all nineteen. Same measured cost, five times the reach.
 // ---------------------------------------------------------------------------------------
-static bool vk_narrow_sync = false;
+// 1 - only the access masks; 2 - the pipeline STAGE masks as well.
+//
+// Two levels because the first one was measured and bought nothing: 201.55 -> 201.29 us on the
+// same 32-node probe where removing the barrier entirely gives 113.41. So the 2.76 us a barrier
+// costs is not the cache flush the transfer ACCESS bits ask for. The remaining candidate is the
+// STAGE mask: the compute queue is created with eComputeShader | eTransfer
+// (ggml-vulkan.cpp:3679), and a barrier naming eTransfer as both source and destination stage
+// may drain more of the pipeline than a compute-to-compute dependency needs. Level 2 asks that
+// question and is the last variant of this branch; if it also buys nothing, the cost is in
+// vkCmdPipelineBarrier itself and the barrier cannot be made cheaper, only fewer.
+static int vk_narrow_sync = 0;
 
 // GGML_VK_SUBMIT_STATS=1 prints, at backend teardown, how many graphs went through
 // graph_compute, how many nodes and how many submits they contained, and how long the host spent
@@ -1237,6 +1247,17 @@ static double   vk_stat_us      = 0.0;
 // read, and the fix was exactly this - a way to ask the system whether the switch took.
 static uint64_t vk_stat_sync_issued  = 0;
 static uint64_t vk_stat_sync_skipped = 0;
+// Dispatches recorded, so the ratio barriers/dispatches can be READ rather than inferred. It
+// matters because the barrier turned out to cost 2.8 us apiece and to be un-narrowable: the
+// only correct way left to make it cheaper is to issue FEWER, and the first question that asks
+// is whether we already issue one per dispatch or nearer two.
+static uint64_t vk_stat_dispatches   = 0;
+// Barriers issued with no dispatch recorded since the previous barrier. Those are redundant by
+// the Vulkan spec, so removing them is safe - unlike dropping a barrier between two dispatches
+// that touch the same buffer. Counted rather than reasoned about, because the alternative is to
+// audit thirty-one call sites and hope.
+static uint64_t vk_stat_sync_b2b     = 0;
+static bool     vk_stat_dispatched   = false;
 
 // One graph_compute call IS one Vulkan split: ggml_backend_sched cuts the graph wherever the
 // backend changes and calls the backend once per piece, so cgraph->n_nodes is the split size.
@@ -1841,6 +1862,8 @@ static void ggml_vk_sync_buffers(vk_context& ctx) {
         return;
     }
     ++vk_stat_sync_issued;
+    if (!vk_stat_dispatched) ++vk_stat_sync_b2b;
+    vk_stat_dispatched = false;
 
     const bool transfer_queue = ctx->p->q->transfer_only;
 
@@ -1854,9 +1877,14 @@ static void ggml_vk_sync_buffers(vk_context& ctx) {
                    : (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite));
 
+    const vk::PipelineStageFlags stages =
+        (vk_narrow_sync >= 2 && !transfer_queue)
+            ? vk::PipelineStageFlags(vk::PipelineStageFlagBits::eComputeShader)
+            : ctx->p->q->stage_flags;
+
     ctx->s->buffer.pipelineBarrier(
-        ctx->p->q->stage_flags,
-        ctx->p->q->stage_flags,
+        stages,
+        stages,
         {},
         { { { acc }, { acc } } },
         {},
@@ -3978,7 +4006,7 @@ static void ggml_vk_instance_init() {
     vk_submit_tail    = ggml_vk_env_int("GGML_VK_SUBMIT_TAIL",    1) != 0;
     vk_submit_stats   = ggml_vk_env_int("GGML_VK_SUBMIT_STATS",   0) != 0;
     vk_no_sync        = ggml_vk_env_int("GGML_VK_NO_SYNC",        0) != 0;
-    vk_narrow_sync    = ggml_vk_env_int("GGML_VK_NARROW_SYNC",    0) != 0;
+    vk_narrow_sync    = ggml_vk_env_int("GGML_VK_NARROW_SYNC",    0);
     if (vk_submit_nodes < 1) {
         vk_submit_nodes = 1;
     }
@@ -4569,6 +4597,8 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
                                 { descriptor_set },
                                 {});
     subctx->s->buffer.dispatch(wg0, wg1, wg2);
+    ++vk_stat_dispatches;                   // MemeX, see vk_stat_dispatches
+    vk_stat_dispatched = true;
 }
 
 static void ggml_vk_end_submission(vk_submission& s, std::vector<vk_semaphore> wait_semaphores, std::vector<vk_semaphore> signal_semaphores) {
@@ -10187,8 +10217,17 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
                 (unsigned long long) vk_stat_sync_issued,
                 (unsigned long long) vk_stat_sync_skipped,
                 vk_no_sync ? "PRIMENJON" :
-                    (vk_narrow_sync ? "vykljuchen, no NARROW_SYNC PRIMENJON"
+                    (vk_narrow_sync ? (vk_narrow_sync >= 2
+                                           ? "vykljuchen, NARROW_SYNC=2 (dostupy+stadii) PRIMENJON"
+                                           : "vykljuchen, NARROW_SYNC=1 (dostupy) PRIMENJON")
                                     : "vykljuchen"));
+        fprintf(stderr,
+                "ggml_vulkan barjery: dispatchej %llu, %.2f barjera na dispatch, podrjad bez "
+                "dispatcha %llu (%.1f%% - eto te, chto snjat bezopasno)\n",
+                (unsigned long long) vk_stat_dispatches,
+                vk_stat_dispatches ? double(vk_stat_sync_issued) / double(vk_stat_dispatches) : 0.0,
+                (unsigned long long) vk_stat_sync_b2b,
+                vk_stat_sync_issued ? 100.0 * double(vk_stat_sync_b2b) / double(vk_stat_sync_issued) : 0.0);
         // The shape of the carve-up, largest splits first, so the per-layer piece is at the top.
         // Ten lines is enough: if there are more than ten distinct shapes the interesting ones are
         // still the big frequent ones, and the tail is one-offs at the graph's ends.
