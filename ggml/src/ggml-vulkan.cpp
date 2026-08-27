@@ -1166,6 +1166,35 @@ static int  vk_submit_divisor = 40;
 static int  vk_submit_nodes   = 100;
 static bool vk_submit_tail    = true;
 
+// ---------------------------------------------------------------------------------------
+// MemeX: GGML_VK_NO_SYNC=1 turns ggml_vk_sync_buffers into a no-op.
+//
+// THIS IS A MEASURING INSTRUMENT, NOT AN OPTIMISATION, and it is deliberately the crude
+// version of a change that was asked for in a careful version.
+//
+// The careful version is a CONDITIONAL barrier: keep the barrier where consecutive dispatches
+// touch overlapping tensors and drop it where they do not. That is a correctness-critical
+// edit in thirty-one call sites of shared code, and it is worth writing only if the prize is
+// real. The prize is bounded above by what turning ALL the barriers off buys - a conditional
+// barrier can never beat no barrier at all - so the bound can be measured for a few lines
+// instead of earned for a few hundred.
+//
+// With it on the arithmetic is NOT expected to be right, and that is the point: this switch
+// answers "how much time is in the barriers", never "is this a good idea". Any speed number
+// taken with it on is a ceiling, and any correctness number taken with it on is meaningless.
+//
+// What we already know it has to beat: the chain-versus-fan ratio measured 1.003x WITH the
+// barriers in place, which admits two readings - the barrier is what stops the overlap, or a
+// single mul_mat_vec already fills all sixteen CUs and there is nothing to overlap. Re-running
+// that same probe with this switch on separates them, and only the first reading justifies
+// building the conditional version.
+//
+// Read at device creation like the rest, because ggml reads these once when vk_device is
+// built and the device is built by the model loader before any of our code runs (rule 68);
+// setting it later is silently ignored. GGML_VK_SUBMIT_STATS=1 reports whether it took.
+// ---------------------------------------------------------------------------------------
+static bool vk_no_sync = false;
+
 // GGML_VK_SUBMIT_STATS=1 prints, at backend teardown, how many graphs went through
 // graph_compute, how many nodes and how many submits they contained, and how long the host spent
 // inside graph_compute in total.
@@ -1181,6 +1210,12 @@ static uint64_t vk_stat_graphs  = 0;
 static uint64_t vk_stat_nodes   = 0;
 static uint64_t vk_stat_submits = 0;
 static double   vk_stat_us      = 0.0;
+// Counted always, not only under the stats flag: they are two increments, and their whole job
+// is to make an UNAPPLIED setting distinguishable from a useless one. Rule 68 was written
+// after GGML_VK_SUBMIT_DIVISOR spent an evening looking useless while in fact never being
+// read, and the fix was exactly this - a way to ask the system whether the switch took.
+static uint64_t vk_stat_sync_issued  = 0;
+static uint64_t vk_stat_sync_skipped = 0;
 
 // One graph_compute call IS one Vulkan split: ggml_backend_sched cuts the graph wherever the
 // backend changes and calls the backend once per piece, so cgraph->n_nodes is the split size.
@@ -1777,6 +1812,14 @@ static vk_subbuffer ggml_vk_subbuffer(vk_buffer& buf) {
 
 static void ggml_vk_sync_buffers(vk_context& ctx) {
     VK_LOG_DEBUG("ggml_vk_sync_buffers()");
+
+    // MemeX: see vk_no_sync. Off by default; on, this is a measuring instrument and the
+    // results are not expected to be correct.
+    if (vk_no_sync) {
+        ++vk_stat_sync_skipped;
+        return;
+    }
+    ++vk_stat_sync_issued;
 
     const bool transfer_queue = ctx->p->q->transfer_only;
 
@@ -3906,6 +3949,7 @@ static void ggml_vk_instance_init() {
     vk_submit_nodes   = ggml_vk_env_int("GGML_VK_SUBMIT_NODES",   100);
     vk_submit_tail    = ggml_vk_env_int("GGML_VK_SUBMIT_TAIL",    1) != 0;
     vk_submit_stats   = ggml_vk_env_int("GGML_VK_SUBMIT_STATS",   0) != 0;
+    vk_no_sync        = ggml_vk_env_int("GGML_VK_NO_SYNC",        0) != 0;
     if (vk_submit_nodes < 1) {
         vk_submit_nodes = 1;
     }
@@ -10107,6 +10151,14 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
                 vk_stat_nodes ? double(vk_stat_submits) / double(vk_stat_nodes) : 0.0,
                 vk_stat_us / 1000.0,
                 vk_stat_us / double(vk_stat_graphs));
+        // Whether GGML_VK_NO_SYNC took. An unapplied setting and a useless one look identical
+        // from tok/s, and telling them apart is the whole reason rule 68 exists.
+        fprintf(stderr,
+                "ggml_vulkan barjery: vydano %llu, propushcheno %llu (GGML_VK_NO_SYNC %s)
+",
+                (unsigned long long) vk_stat_sync_issued,
+                (unsigned long long) vk_stat_sync_skipped,
+                vk_no_sync ? "PRIMENJON" : "vykljuchen");
         // The shape of the carve-up, largest splits first, so the per-layer piece is at the top.
         // Ten lines is enough: if there are more than ten distinct shapes the interesting ones are
         // still the big frequent ones, and the tail is one-offs at the graph's ends.
