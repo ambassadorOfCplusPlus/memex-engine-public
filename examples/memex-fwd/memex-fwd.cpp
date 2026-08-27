@@ -1430,16 +1430,19 @@ bool build(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h, const We
         gate = ggml_silu(c, gate);
         ggml_tensor* act = ggml_mul(c, up, gate);
         ggml_tensor* out = ggml_mul_mat_id(c, L.down, act, sel);
-        out = ggml_mul(c, out, weights);
-        // Sum the chosen experts' contributions: they arrive as n_expert_used slices.
-        ggml_tensor* moe = ggml_view_2d(c, out, h.n_embd, n_tokens,
-                                        out->nb[2], 0);
-        for (int e = 1; e < h.n_expert_used; ++e) {
-            moe = ggml_add(c, moe,
-                           ggml_view_2d(c, out, h.n_embd, n_tokens, out->nb[2],
-                                        size_t(e) * out->nb[1]));
-        }
+        // Weight by the router and fold the eight slots in ONE node - the op the reference
+        // takes, because cparams.fused_mmad defaults to true and llm_build_moe_ffn calls
+        // ggml_mul_multi_add on that branch (llama-build-context.cpp:1822).
+        ggml_tensor* moe = ggml_mul_multi_add(c, out, weights);
+        // TWO names for one tensor, deliberately. "ffn_moe_out" was our own invention and
+        // matches nothing on the reference side, so for the whole life of this file the
+        // qwen3moe MoE tail has produced a probe line that could never be compared - the
+        // same hole that was found and closed on gemma4. The reference calls this node
+        // "ffn_moe_weighted" (llama-build-context.cpp:1824), so that name is what actually
+        // puts a number next to it. The old name stays because existing comparisons ask for
+        // this intermediate by it, and it now points at the fused output.
         g->probes.push_back({"ffn_moe_out-" + std::to_string(il), moe});
+        g->probes.push_back({"ffn_moe_weighted-" + std::to_string(il), moe});
         cur = ggml_add(c, moe, ffn_inp);
         g->probes.push_back({"l_out-" + std::to_string(il), cur});
     }
@@ -2278,42 +2281,40 @@ bool build_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
         // both halves come back here as one per-slot tensor - because that is what makes the
         // split bit-exact rather than merely close. See below.
         //
-        // QUEUED: this is eight nodes where ggml_mul_multi_add is one, and the same
-        // substitution is already made twice in this file (build_gemma4_step and
-        // qwen35_ffn). Deliberately NOT taken yet - the two new architectures have to be
-        // proven first, because a regression here with three things in flight would be very
-        // hard to attribute. Three findings that the change rests on, all checked already:
+        // ONE node, not eight, and - the reason it is done at all - the spelling the
+        // reference actually runs. cparams.fused_mmad defaults to true (llama.cpp:7728) and
+        // llm_build_moe_ffn takes ggml_mul_multi_add on that branch
+        // (llama-build-context.cpp:1822), naming the result "ffn_moe_weighted". The
+        // eight-node chain that stood here was therefore the spelling that does NOT match
+        // llama_decode, and the qwen3moe MoE tail had never been compared against the
+        // reference under a name the reference uses. So this is a correctness fix that
+        // happens to save nodes, and not the other way round.
         //
-        //  - Association matches. The kernel (iqk_cpu_ops.cpp, iqk_mul_multi_add, the branch
-        //    with no src[2]) writes y = x0*w0 for slot zero and then accumulates y += xj*wj
-        //    from slot one upward: the same left-to-right order as the chain below, and the
-        //    same per-slot product. The one thing left to confirm on the machine is whether
-        //    the compiler contracts `y[k] += x0[k]*x1[0]` into an FMA, which would leave the
-        //    product unrounded and make the two differ in the last bit.
+        // Three things it rests on, all checked in the source rather than assumed:
         //
-        //  - If it does differ, the FUSED one is right. The reference's cparams.fused_mmad
-        //    defaults to true (llama.cpp:7728) and llm_build_moe_ffn takes that branch for
-        //    qwen3moe, so the eight-node chain below is already the spelling that does NOT
-        //    match what llama_decode computes. Taking the fused op moves this path toward
-        //    the reference rather than away from it.
+        //  - Association matches. iqk_mul_multi_add (iqk_cpu_ops.cpp:430, the branch with no
+        //    src[2]) writes y[k] = x0[k]*w0 for slot zero and then y[k] += xj[k]*wj from slot
+        //    one upward - the same per-slot product and the same left-to-right order as the
+        //    chain. The one residual risk is FMA contraction of `y[k] += x0[k]*x1[0]`, which
+        //    would leave the product unrounded and differ in the last bit; if it does, the
+        //    FUSED one is the right answer, because it is the one the reference computes.
         //
-        //  - The resident split stays safe, and by construction rather than by luck. The
-        //    per-slot add of the two halves happens OUTSIDE this lambda (see the call site
-        //    below: ggml_add(o_res, o_oth) is passed IN). So the fused op would receive one
-        //    already-summed per-slot tensor, exactly as this chain does, and the rule that
-        //    came out of the 3-6% logit incident - sum per slot, before the routing weights
-        //    and before the fold - is preserved without needing a new argument. Verify with
-        //    --decode-check and not only with the prefill comparison: this is the generation
-        //    path, and the incident it guards against was invisible in the tokens.
+        //  - The resident split stays exact by construction. The per-slot add of the two
+        //    halves happens OUTSIDE this lambda (see the call sites below: ggml_add(o_res,
+        //    o_oth) is passed IN), so the fused op receives one already-summed per-slot
+        //    tensor exactly as the chain did. The rule that came out of the 3-6% logit
+        //    incident - sum per slot, before the routing weights and before the fold - is
+        //    preserved without a new argument.
         //
+        //  - Shape is the same. mul_multi_add returns [ne0, ne2] = [n_embd, n_tokens], which
+        //    is what the view-and-add chain produced; the difference is that the result is a
+        //    fresh contiguous tensor rather than a strided view of the expert outputs.
+        //
+        // What it is NOT worth: these are HOST nodes. The 29-node figure printed by
+        // GpuStatic belongs to the DEVICE layer graph and is untouched by this. See the
+        // note in gpu_static.cpp about the two separate node budgets.
         auto weight_and_fold = [&](ggml_tensor* o) {
-            o = ggml_mul(c, o, weights);
-            ggml_tensor* s = ggml_view_2d(c, o, h.n_embd, n_tokens, o->nb[2], 0);
-            for (int e = 1; e < h.n_expert_used; ++e) {
-                s = ggml_add(c, s, ggml_view_2d(c, o, h.n_embd, n_tokens, o->nb[2],
-                                                size_t(e) * o->nb[1]));
-            }
-            return s;
+            return ggml_mul_multi_add(c, o, weights);
         };
         ggml_tensor* moe = nullptr;
         if (rsplit) {

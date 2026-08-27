@@ -959,18 +959,39 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         G.K = K; G.V = V; G.kq = kq; G.probs = p;
         G.mapped = nullptr;
         G.mapped_probed = false;
-        // COUNTED, ONCE, BECAUSE THIS IS THE PRICE OF THE CROSSING.
+        // COUNTED, ONCE, BECAUSE THIS IS THE PRICE OF THE CROSSING - AND COUNTED TWICE OVER,
+        // because only one of the two counts is priced at 7.2 us.
         //
         // The device spends 0.467 ms per crossing on a layer whose weights are 10.6 MB; at
         // this card's 131 GB/s the bytes are worth 0.081 ms. The rest is launch, and launch
-        // is priced per NODE: measured two commits ago as a slope, 38 nodes -> 29 moved the
-        // device time 0.683 -> 0.618, i.e. 7.2 us a node, with submits per graph unchanged
-        // at 2.00. So the node count is not a curiosity of the build, it is 29 x 7.2 us =
-        // 0.21 ms of every crossing, and it belongs in the output where the 0.467 is.
+        // is priced per DISPATCH: measured as a slope, 38 nodes -> 29 moved the device time
+        // 0.683 -> 0.618, i.e. 7.2 us, with submits per graph unchanged at 2.00.
+        //
+        // ggml_graph_n_nodes is NOT the dispatch count. It counts RESHAPE and VIEW nodes, and
+        // the Vulkan backend does not dispatch those: ggml_vk_is_empty (ggml-vulkan.cpp:10333)
+        // returns true for NONE / RESHAPE / VIEW / PERMUTE / TRANSPOSE and graph_compute skips
+        // the node entirely. They cost a loop iteration, not a launch. The nine nodes whose
+        // removal produced the 7.2 us slope were all real - four rms_norm+mul pairs folded into
+        // fused_rms_norm, four ggml_cont that are pure reshapes for a single token - so the
+        // slope is a per-dispatch price and multiplying it by 29 overstates the launch item.
+        //
+        // Separately, and worth not confusing with this: the eight-node MoE tail in
+        // memex-fwd.cpp's build_step is a HOST budget. Different nodes, different price, and
+        // cutting it does not move this number at all.
         if (il == 0) {
-            printf("  graf sloja: %d uzlov; pri 7.2 us na uzel eto %.3f ms zapuska iz "
-                   "kazhdogo peresechenija\n",
-                   ggml_graph_n_nodes(gf), 0.0072 * double(ggml_graph_n_nodes(gf)));
+            int total = ggml_graph_n_nodes(gf);
+            int disp = 0;
+            for (int i = 0; i < total; ++i) {
+                ggml_tensor* n = ggml_graph_node(gf, i);
+                const bool empty = ggml_is_empty(n) || n->op == GGML_OP_NONE ||
+                                   n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW ||
+                                   n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE;
+                if (!empty) ++disp;
+            }
+            printf("  graf sloja: %d uzlov, iz nih %d dispatchej (%d reshape/view bekend "
+                   "propuskaet); pri 7.2 us na dispatch eto %.3f ms zapuska iz kazhdogo "
+                   "peresechenija\n",
+                   total, disp, total - disp, 0.0072 * double(disp));
         }
     }
     return true;
