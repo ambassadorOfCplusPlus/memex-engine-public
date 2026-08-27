@@ -851,29 +851,47 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         sites_[std::size_t(il)].self = this;
         sites_[std::size_t(il)].il = il;
 
-        // Node for node the host's own qwen3moe decode block, in the host's own order. The
-        // point of this path is that the card computes the SAME quantity, not a rearranged
-        // one: this project has already lost days to a reassociation that produced correct
-        // tokens and 3-6% on the logits.
+        // Node for node the host's own qwen3moe decode block, in the host's own order, with
+        // two families of node removed. Both removals are counted rather than assumed, because
+        // the dispatch is what this stage pays: measured 38 graph nodes, 2 submits, and 0.683
+        // ms of device time against 0.11 ms of weight bandwidth - so about 20 us per dispatch,
+        // and a node is worth roughly a fifth of a millisecond a token across 48 layers.
+        //
+        // REMOVAL ONE: the four rms_norm + mul pairs become ggml_fused_rms_norm. That is the
+        // op the REFERENCE's llm_build_norm actually calls, so this moves the card toward
+        // llama_decode rather than away from it. It is not bit-identical to the pair: the
+        // fused kernel computes (scale*w[j])*x[j] and the pair computes (scale*x[j])*w[j],
+        // which differ in the last bit. Four nodes a layer, 192 a token.
+        //
+        // REMOVAL TWO: the four ggml_cont after ggml_permute are pure reshapes HERE and only
+        // here, because this graph is built for exactly one token. q is [hd, n_head, 1] and
+        // permute(0,2,1,3) asks for [hd, 1, n_head]; the swapped dimension has extent one, so
+        // element (i,0,j) of the result sits at the same offset j*hd+i as element (i,j,0) of
+        // the source. The copy moves bytes to where they already are. The host path cannot do
+        // this - it must work for n_tokens > 1, where the permutation is real - which is why
+        // the two paths differ here and why this is a place to be explicit rather than clever.
+        // Bit-identical, and four of the most byte-moving nodes in the layer.
         ggml_tensor* cur = t_lx_;
-        ggml_tensor* x = ggml_mul(c, ggml_rms_norm(c, cur, cfg_.rms_eps), L.attn_norm);
+        ggml_tensor* x = ggml_fused_rms_norm(c, cur, L.attn_norm, cfg_.rms_eps);
 
         ggml_tensor* q = ggml_mul_mat(c, L.wq, x);
         ggml_tensor* k = ggml_mul_mat(c, L.wk, x);
         ggml_tensor* v = ggml_mul_mat(c, L.wv, x);
 
         q = ggml_reshape_3d(c, q, hd, nh, 1);
-        q = ggml_mul(c, ggml_rms_norm(c, q, cfg_.rms_eps), L.q_norm);
+        q = ggml_fused_rms_norm(c, q, L.q_norm, cfg_.rms_eps);
         q = ggml_rope_multi(c, q, t_pos_, nullptr, hd, sections, cfg_.rope_type,
                             cfg_.n_ctx_train, cfg_.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         k = ggml_reshape_3d(c, k, hd, nkvh, 1);
-        k = ggml_mul(c, ggml_rms_norm(c, k, cfg_.rms_eps), L.k_norm);
+        k = ggml_fused_rms_norm(c, k, L.k_norm, cfg_.rms_eps);
         k = ggml_rope_multi(c, k, t_pos_, nullptr, hd, sections, cfg_.rope_type,
                             cfg_.n_ctx_train, cfg_.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
-        ggml_tensor* Kc = ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));
-        ggml_tensor* Vc = ggml_cont(c, ggml_permute(
-            c, ggml_reshape_3d(c, v, hd, nkvh, 1), 1, 2, 0, 3));
+        // [hd, n_head_kv, 1] -> [hd, 1, n_head_kv], same bytes at the same offsets.
+        ggml_tensor* Kc = ggml_reshape_3d(c, k, hd, 1, nkvh);
+        // v is [n_head_kv*hd, 1]; the host writes it as permute(reshape(v,hd,nkvh,1),1,2,0,3),
+        // which for one token is [1, hd, n_head_kv] over the same contiguous bytes.
+        ggml_tensor* Vc = ggml_reshape_3d(c, v, 1, hd, nkvh);
         ggml_tensor* kcache = kv_k_[std::size_t(il)];
         ggml_tensor* vcache = kv_v_[std::size_t(il)];
         ggml_tensor* kdst = ggml_view_3d(c, kcache, hd, 1, nkvh,
@@ -883,7 +901,7 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         ggml_tensor* kcpy = ggml_cpy(c, Kc, kdst);
         ggml_tensor* vcpy = ggml_cpy(c, Vc, vdst);
 
-        ggml_tensor* Q = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));
+        ggml_tensor* Q = ggml_reshape_3d(c, q, hd, 1, nh);
         ggml_tensor* K = ggml_view_3d(c, kcache, hd, cfg_.n_kv_max, nkvh,
                                       kcache->nb[1], kcache->nb[2], 0);
         ggml_tensor* V = ggml_view_3d(c, vcache, cfg_.n_kv_max, hd, nkvh,
@@ -891,10 +909,12 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         ggml_tensor* kq = ggml_mul_mat(c, K, Q);
         ggml_tensor* p = ggml_soft_max_ext(c, kq, t_mask_, kq_scale, 0.0f);
         ggml_tensor* kqv = ggml_mul_mat(c, V, p);
-        kqv = ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), dq, 1);
+        // [hd, 1, n_head] -> [n_head*hd, 1]: the host's cont_2d(permute(...)) over the same
+        // contiguous bytes, for one token.
+        kqv = ggml_reshape_2d(c, kqv, dq, 1);
 
         ggml_tensor* ffn_inp = ggml_add(c, ggml_mul_mat(c, L.wo, kqv), cur);
-        ggml_tensor* xf = ggml_mul(c, ggml_rms_norm(c, ffn_inp, cfg_.rms_eps), L.ffn_norm);
+        ggml_tensor* xf = ggml_fused_rms_norm(c, ffn_inp, L.ffn_norm, cfg_.rms_eps);
         ggml_tensor* rl = ggml_mul_mat(c, L.router, xf);
 
         // One readback rather than three. Each ggml_backend_tensor_get on a device buffer the
