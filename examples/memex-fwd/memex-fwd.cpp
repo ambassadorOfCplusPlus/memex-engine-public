@@ -3970,6 +3970,19 @@ struct ResidentOpt {
     // router selections token by token through observe/end_token, i.e. exactly the same code
     // path the generated tokens take.
     int  trace   = 0;      // --resident-trace, tokens per segment; 0 = off
+    // --resident-freeze-at N: freeze the set after N observed tokens of the PROMPT.
+    //
+    // This exists because --resident-freeze and "period 100000" are not the same object and
+    // putting them in one table invites a reader to explain a difference that is purely
+    // definitional. --resident-freeze freezes a set that the warm-up already built, which is
+    // the arm that measured 69,32% hits and +10,5% on speed. Period 100000 never refreshes at
+    // all, so the set is never populated and the hit rate is 0% BY CONSTRUCTION - that is "no
+    // resident set", not "a stale resident set", and it is only good as an instrument check.
+    //
+    // In the adaptation test the whole measurement lives in the prompt, so the comparable arm
+    // has to freeze mid-prompt: at the domain switch. Then the question "does the set really
+    // adapt" gets a control that MUST NOT recover, next to arms that must.
+    int  freeze_at = 0;    // --resident-freeze-at, tokens of the prompt; 0 = off
 
     bool on() const { return capacity > 0; }
     const char* policy_name() const { return lfu ? "lfu" : "lru"; }
@@ -5317,6 +5330,8 @@ int main(int argc, char** argv) {
 "  --resident-trace N   доля попаданий по отрезкам из N токенов, отдельно на промпте\n"
 "                       и на генерации: средняя не отличает адаптивный набор от замершего\n"
 "  --resident-freeze    после прогрева набор больше не меняется: ноль подкачек\n"
+"  --resident-freeze-at N  заморозить набор после N токенов ПРОМПТА: контроль,\n"
+"                       который обязан НЕ восстановиться после смены домена\n"
 "  --gpu-experts        считать резидентную половину на Vulkan ОДНОВРЕМЕННО с CPU\n"
 "                       (ВЫКЛЮЧЕНО по умолчанию; --resident без него оставляет обе\n"
 "                        половины на CPU. Без --resident N ёмкость выбирается по\n"
@@ -5428,6 +5443,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--resident-budget")) { if (want_val(i, a)) ropt.budget = atoi(argv[++i]); }
         else if (!strcmp(a, "--resident-freeze")) { ropt.freeze = true; }
         else if (!strcmp(a, "--resident-trace")) { if (want_val(i, a)) ropt.trace = atoi(argv[++i]); }
+        else if (!strcmp(a, "--resident-freeze-at")) { if (want_val(i, a)) ropt.freeze_at = atoi(argv[++i]); }
         else if (!strcmp(a, "--gpu-experts")) { gopt.on = true; }
         else if (!strcmp(a, "--gpu-experts-check")) { gopt.on = true; gopt.check = true; }
         else if (!strcmp(a, "--gpu-experts-selftest")) { gopt.selftest = true; }
@@ -6711,9 +6727,9 @@ int main(int argc, char** argv) {
             // arm whose setting is not confirmed from the run own output is not an arm.
             // The capacity is here too because with --gpu-experts it is chosen by the
             // device rather than by the flag.
-            printf("RSET_CFG period %d capacity %d window %d budget %d policy %s frozen %d\n",
+            printf("RSET_CFG period %d capacity %d window %d budget %d policy %s frozen %d freeze_at %d\n",
                    ropt.period, ropt.capacity, ropt.window, ropt.budget,
-                   ropt.policy_name(), ropt.freeze ? 1 : 0);
+                   ropt.policy_name(), ropt.freeze ? 1 : 0, ropt.freeze_at);
             printf("  один эксперт %.2f МБ, весь резидентный набор %.2f ГБ на %d слоёв\n",
                    expert_bytes_one(w, h) / 1e6,
                    expert_bytes_one(w, h) * double(ropt.capacity) * double(h.n_layer) / 1e9,
@@ -6864,6 +6880,14 @@ int main(int argc, char** argv) {
                                   h.n_expert_used);
                 }
                 rset->end_token();
+                // Frozen mid-prompt, if asked, and BEFORE the segment line for that token
+                // so the trace shows the freeze taking effect on the next segment rather than
+                // straddling it.
+                if (ropt.freeze_at > 0 && t + 1 == ropt.freeze_at && !rset->frozen()) {
+                    rset->set_frozen(true);
+                    printf("RSET_FROZEN_AT tok %d resident %d\n",
+                           t + 1, rset->n_resident(0));
+                }
                 if (ropt.trace > 0 && (t + 1) % ropt.trace == 0) {
                     const memex::ResidentStats sg = rset->stats().since(seg_base);
                     printf("RSET_SEG phase warm tok %d hits %.4f promo %llu evict %llu "
