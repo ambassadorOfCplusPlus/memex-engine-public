@@ -4040,16 +4040,34 @@ void print_resident(const ResidentOpt& r, const ResidentReport& rep, const HPara
     }
     const double from_vram = expert_bytes_per_token * g.hit_rate();
     const double from_ram = expert_bytes_per_token - from_vram;
-    printf("    ИЗ ВИДЕОПАМЯТИ вместо ОЗУ было бы %.1f МБ/токен, в ОЗУ осталось бы "
-           "%.1f МБ/токен\n", from_vram / 1e6, from_ram / 1e6);
-    printf("      это %.2f мс/токен, которые CPU при %.1f ГБ/с не читал бы; PCIe на "
+    // SUBJUNCTIVE OR INDICATIVE, and the difference is not decoration. Without --gpu-experts
+    // both halves are computed by the CPU, the resident set is a bookkeeping model, and every
+    // number here is what a device path WOULD have cost. With --gpu-experts the device really
+    // computes the resident half out of its own VRAM, the promotions really are PCIe DMAs, and
+    // the same numbers are what the run DID cost.
+    //
+    // Written unconditionally in the subjunctive, this block asserted "both halves are computed
+    // by the CPU" four lines below a report headed "resident experts on GPU" that had just
+    // counted 4250 experts launched on the device. That is the same fault as the split verdict
+    // fixed one commit earlier: a line stating the conditions of the run rather than reading
+    // them.
+    printf("    ИЗ ВИДЕОПАМЯТИ вместо ОЗУ %s %.1f МБ/токен, в ОЗУ %s %.1f МБ/токен\n",
+           rep.device_half ? "идёт" : "было бы", from_vram / 1e6,
+           rep.device_half ? "осталось" : "осталось бы", from_ram / 1e6);
+    printf("      это %.2f мс/токен, которые CPU при %.1f ГБ/с %s; PCIe на "
            "подкачки просит %.1f мс — %s\n",
-           1000.0 * from_vram / (bandwidth_gbs * 1e9), bandwidth_gbs, promo_ms,
+           1000.0 * from_vram / (bandwidth_gbs * 1e9), bandwidth_gbs,
+           rep.device_half ? "не прочитал" : "не читал бы", promo_ms,
            promo_ms < 1000.0 * from_vram / (bandwidth_gbs * 1e9)
                ? "меньше, то есть подкачка сама себя оплачивает"
                : "БОЛЬШЕ, то есть подкачка съедает выигрыш");
-    printf("    (ГРАФИЧЕСКОГО ПУТИ ПОКА НЕТ — строки выше это то, чего он стоил бы; "
-           "обе половины считает CPU, поэтому сейчас это чистая бухгалтерия)\n");
+    if (rep.device_half) {
+        printf("    (графический путь ВКЛЮЧЁН: резидентную половину считало устройство, "
+               "подкачки — настоящие DMA, строки выше — цена этого прогона)\n");
+    } else {
+        printf("    (ГРАФИЧЕСКОГО ПУТИ НЕТ — строки выше это то, чего он стоил бы; "
+               "обе половины считает CPU, поэтому сейчас это чистая бухгалтерия)\n");
+    }
     if (rep.picks_checked > 0) {
         printf("    расщепление против набора на хосте: %llu слотов сверено, расхождений "
                "%llu%s\n", (unsigned long long)rep.picks_checked,
