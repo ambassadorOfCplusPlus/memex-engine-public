@@ -156,6 +156,12 @@ struct GpuExpertsStats {
     double   ms_join_wait    = 0.0; // wall time the ggml pool spent STOPPED at the join
     double   ms_cpu_half     = 0.0; // fork -> join: the work the CPU had to cover the device with
     double   ms_job          = 0.0; // device side: the worker's own dispatch, dequeue to done
+    // THE OTHER THING THE WORKER DOES. It is one thread, and it serves two masters: the
+    // per-layer dispatch the CPU is waiting for, and the promotions the refresh queued. A
+    // job that arrives while a promotion is in flight waits for that promotion's fence, and
+    // that wait is invisible in ms_job because ms_job starts after the dequeue.
+    uint64_t fork_busy       = 0;   // forks that found the worker already inside a Vulkan call
+    double   ms_promote      = 0.0; // worker time spent on promotions rather than dispatches
     // --gpu-experts-check
     uint64_t checked       = 0;   // slots compared against the CPU's own resident half
     uint64_t zero_bad      = 0;   // slots the device does not own that came back non-zero

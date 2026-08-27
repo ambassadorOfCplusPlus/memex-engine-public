@@ -7458,6 +7458,18 @@ int main(int argc, char** argv) {
                        gs.ms_join_wait / tk > 5.0
                            ? " — ЖДЁМ БОЛЬШЕ 5 мс/токен: параллельности нет, это сумма"
                            : " — ожидание мало, половины действительно параллельны");
+                // The worker serves two masters, and only one of them is timed by ms_job.
+                // A dispatch that arrives while a promotion is in flight does not start
+                // until that promotion's fence returns, and that delay appears nowhere
+                // except as join wait that the CPU/card imbalance does not explain.
+                const double imbalance = (gs.ms_job - gs.ms_cpu_half) / tk;
+                printf("      из ЖДЁМ: дисбаланс половин %.2f мс, ОСТАТОК %.2f мс; "
+                       "подкачки заняли поток карты %.2f мс/токен, форков в занятый "
+                       "поток %llu (%.1f%%)\n",
+                       imbalance > 0.0 ? imbalance : 0.0,
+                       gs.ms_join_wait / tk - (imbalance > 0.0 ? imbalance : 0.0),
+                       gs.ms_promote / tk, (unsigned long long)gs.fork_busy,
+                       100.0 * double(gs.fork_busy) / double(gs.join_waits));
             }
             printf("  где что лежит         : веса экспертов — Vulkan (%.2f ГиБ, "
                    "%zu буфер(а/ов) > 256 МиБ); вход, идентификаторы, выход половины — "

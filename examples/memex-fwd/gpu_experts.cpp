@@ -948,12 +948,17 @@ void GpuExperts::worker_loop() {
         if (slot >= 0) {
             // One promotion, but still bracketed: its three matrices then cost one fence
             // rather than three.
+            const auto t_pr = std::chrono::steady_clock::now();
             if (expert >= 0) {
                 batch_begin();
                 upload(il, slot, expert);
                 batch_end();
             }
+            const double pr_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_pr).count();
             std::lock_guard<std::mutex> lk(mu_);
+            st_.ms_promote += pr_ms;
             busy_ = false;
             cv_idle_.notify_all();
             continue;
@@ -1231,6 +1236,9 @@ void GpuExperts::do_fork(int il, const ggml_tensor* ids_res, const ggml_tensor* 
     job_done_   = false;
     fork_t_     = std::chrono::steady_clock::now();
     ++st_.layers;
+    // Did this job find the worker already inside a Vulkan call? If so it will not start
+    // until that call's fence returns, and the CPU half is overlapping with nothing.
+    if (busy_) ++st_.fork_busy;
     if (k == 0) ++st_.layers_empty;
     st_.experts += uint64_t(k);
     lk.unlock();
