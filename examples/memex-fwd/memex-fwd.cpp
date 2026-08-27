@@ -2516,7 +2516,7 @@ bool build_dense_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& 
 // with a scale tensor of its own (ffn_gate_inp.scale) - NOT the activation the experts see.
 // Feeding it the expert input instead produces a routing that is wrong in a way no shape
 // check can catch and no output obviously betrays.
-// STATE, 27 Aug 2026 - read D:/MemeX/results/gemma4_state.md before editing this function.
+// STATE, 27 Aug 2026 - read examples/memex-fwd/gemma4_state.md before editing this function.
 //
 // The attention block below is VERIFIED: against the reference run with --ref-fa, layer 0 gives
 // eleven consecutive tensors at exactly 0.0000% relative L2 with max |d| 0.00000 - attn_norm,
