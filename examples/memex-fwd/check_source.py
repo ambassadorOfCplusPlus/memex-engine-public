@@ -29,6 +29,8 @@ import os
 import sys
 
 BS = chr(92)   # a backslash, spelled this way so that no tool in the chain can mangle it
+LF = chr(10)   # and a newline, and a double quote, for the same reason
+QUOTE = chr(34)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT = os.path.join(HERE, "memex-fwd.cpp")
@@ -155,6 +157,66 @@ def check_escaped_newlines(src):
     return bad
 
 
+def check_unterminated_strings(src):
+    """A string literal broken across a real line break.
+
+    The compiler does catch this one, so it is here for the fifteen minutes it saves rather
+    than for the bug it finds. It is the third class of scripted-edit damage this file has
+    seen, and it arrives the same way the doubled backslash does - through a generator that
+    writes a real newline where C wanted the two characters backslash and n. That makes it
+    the mirror image of check number 2, and a checker that finds one and not the other is
+    half a checker. (Written after exactly this happened: a heredoc collapsed "\n\n" to a
+    newline inside a printf, and the three checks above all reported ok.)
+
+    C string literals may not contain a raw newline; only a backslash at the very end of the
+    line continues one. No raw string literals in this file, so R"(...)" is not handled.
+    """
+    bad = []
+    i, n = 0, len(src)
+    line = 1
+    while i < n:
+        ch = src[i]
+        if ch == LF:
+            line += 1
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != LF:
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and src[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (src[i] == "*" and src[i + 1] == "/"):
+                if src[i] == LF:
+                    line += 1
+                i += 1
+            i += 2
+            continue
+        if ch == QUOTE:
+            startline = line
+            i += 1
+            while i < n and src[i] != QUOTE:
+                if src[i] == BS:
+                    # A backslash at the end of a line legally continues the literal;
+                    # anything else it escapes cannot be the newline we are looking for.
+                    i += 1
+                    if i < n and src[i] == LF:
+                        line += 1
+                    i += 1
+                    continue
+                if src[i] == LF:
+                    bad.append("line %d: string literal runs past the end of the line - a "
+                               "real newline where C wanted backslash-n" % startline)
+                    line += 1
+                    break
+                i += 1
+            if i < n and src[i] == QUOTE:
+                i += 1
+            continue
+        i += 1
+    return bad
+
+
 def check_adjacent_duplicates(src):
     """Two identical adjacent non-trivial lines - the other shape of a slipped anchor."""
     skip = {"", "}", "};", "//", "#endif", "#else", "break;", "return;"}
@@ -173,6 +235,7 @@ def main(argv):
     problems = []
     for name, fn in (("brace balance", check_balance),
                      ("escaped newlines", check_escaped_newlines),
+                     ("unterminated strings", check_unterminated_strings),
                      ("adjacent duplicates", check_adjacent_duplicates)):
         found = fn(src)
         print("%-22s %s" % (name, "ok" if not found else "%d PROBLEM(S)" % len(found)))

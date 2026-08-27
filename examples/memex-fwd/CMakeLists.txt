@@ -14,8 +14,14 @@ set(MEMEX_FWD_SRC memex-fwd.cpp resident_set.cpp)
 # build tree and not of this directory: build-vk has it and build does not, and the same
 # source has to configure in both. --gpu-experts refuses at run time in the tree without it
 # rather than being quietly absent from --help.
+# The static half of the byte budget - the output head in video memory - is the same story and
+# the same gate: it needs a ggml with the Vulkan backend, so it compiles only in build-vk, and
+# --gpu-static refuses at run time in the tree without it rather than being quietly absent from
+# --help. The integration in memex-fwd.cpp is one helper function, head_matmul(), and one
+# substituted call per qwen3moe graph builder, so the CPU path is byte-for-byte the code it
+# replaced whenever the flag is off.
 if (GGML_VULKAN)
-    list(APPEND MEMEX_FWD_SRC gpu_experts.cpp)
+    list(APPEND MEMEX_FWD_SRC gpu_experts.cpp gpu_static.cpp)
 endif()
 
 if(EXISTS "${MEMEX_DIR}/src/kv_zones.cpp" AND EXISTS "${MEMEX_KV_DIR}/zoned_cache.cpp")

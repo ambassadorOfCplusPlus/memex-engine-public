@@ -123,6 +123,27 @@
 namespace memex { class GpuExperts; }
 #endif
 
+// SIXTH STAGE, and the largest single lever left in the byte budget. Of the 1714 MB a
+// generated token reads, 802 MB is STATIC - attention, the output head and the routers, the
+// same bytes on every token - and static bytes need no residency policy at all: no
+// prediction, no eviction, no churn, and a return of 1.00 bytes read per byte resident, which
+// is the highest ratio anything in the model has.
+//
+// The static set is not one lever though, it is three, and they differ by how often the
+// processor and the card have to meet. A rendezvous costs 177 us whatever it carries, so:
+//
+//     the head    1 crossing per TOKEN   243.4 MB   pays immediately
+//     attention  48 crossings per token  510.4 MB   pays, but needs the KV cache on the card
+//     the router 48 crossings per token   48.0 MB   loses alone, free once attention is there
+//
+// This stage is the head: it is the last node in the graph, so it is the one piece of the
+// static set with a single boundary in the whole token and nothing left waiting behind it.
+#ifdef MEMEX_FWD_GPU_EXPERTS
+#include "gpu_static.hpp"
+#else
+namespace memex { class GpuStatic; }
+#endif
+
 // THIRD STAGE. The zoned KV cache from examples/memex-kv, adopted as an option that is off
 // by default. Off by default is not timidity: the exact path is the only reason anything in
 // this file can be trusted, so it stays the thing every reproducibility check runs through,
@@ -273,6 +294,11 @@ struct HParams {
     float f_logit_softcap = 0.0f;
     // sqrt(n_embd) on the token embeddings, gemma only. Zero disables it.
     float f_embd_scale = 0.0f;
+    // Applied to the router's normalised input, gemma4 only. ONE means "no scaling" here
+    // rather than zero, because unlike the three above this one multiplies a value that is
+    // always present: the reference does the same multiplication to ffn_gate_inp.scale at
+    // load time (llm_scale_gate_inp_s), so a file read straight off disk is already wrong.
+    float f_router_scale = 1.0f;
     // mrope section widths. All zero for a text-only model, which is what ggml_rope_multi
     // wants; qwen35moe states {11,11,10,0} and is not text-only in its rope even though it
     // is in everything else we ask of it.
@@ -557,6 +583,9 @@ bool read_hparams(const char* path, HParams* h) {
             h->f_attn_scale    = 1.0f;
             h->f_logit_softcap = key_f32(g, a + ".final_logit_softcapping", 30.0f);
             h->f_embd_scale    = std::sqrt(float(h->n_embd));
+            // The reference does not read this from the file either - it rescales the
+            // tensor itself, once, right after loading (llama.cpp:4868 -> :3805).
+            h->f_router_scale  = 1.0f / std::sqrt(float(h->n_embd));
         }
 
         // ---- qwen35moe: attention every fourth layer, a gated delta-net in between.
@@ -678,6 +707,23 @@ ggml_tensor* norm(ggml_context* c, ggml_tensor* x, ggml_tensor* w, float eps) {
 // reference with it, and re-verifying that is a separate job from landing two architectures.
 ggml_tensor* fnorm(ggml_context* c, ggml_tensor* x, ggml_tensor* w, float eps) {
     return ggml_fused_rms_norm(c, x, w, eps);
+}
+
+// The output head, on whichever processor owns it.
+//
+// One function rather than a conditional at each site, because the two qwen3moe builders
+// (the cacheless comparison prefill and the step) must not drift: the card has to compute the
+// same quantity, from the same input, that ggml_mul_mat would have. `cur` is the already
+// normalised hidden state in both, F32 and contiguous, and the returned tensor is
+// [n_vocab, n_rows] F32 either way - so every consumer of g->logits is unchanged.
+ggml_tensor* head_matmul(ggml_context* c, ggml_tensor* out_w, ggml_tensor* cur,
+                         memex::GpuStatic* gstat) {
+#ifdef MEMEX_FWD_GPU_EXPERTS
+    if (gstat && gstat->on()) return gstat->head(c, cur);
+#else
+    (void)gstat;
+#endif
+    return ggml_mul_mat(c, out_w, cur);
 }
 
 struct Weights {
@@ -1279,7 +1325,7 @@ void set_graph_inputs(Graph& gr, const HParams& h, const llama_token* tk, int nt
 // One prefill over the whole prompt. No cache: attention runs over the prompt itself under
 // a causal mask, which is exactly what a prefill is, and it is enough to compare logits.
 bool build(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h, const Weights& w,
-           int n_tokens) {
+           int n_tokens, memex::GpuStatic* gstat = nullptr) {
     const size_t n_nodes = size_t(h.n_layer) * 64 + 256;
     ggml_init_params ip = {ggml_tensor_overhead() * (n_nodes + 512) +
                            ggml_graph_overhead_custom(n_nodes, false),
@@ -1391,7 +1437,7 @@ bool build(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h, const We
 
     cur = norm(c, cur, w.out_norm, h.rms_eps);
     g->probes.push_back({"result_norm", cur});
-    g->logits = ggml_mul_mat(c, w.out, cur);
+    g->logits = head_matmul(c, w.out, cur, gstat);
     ggml_set_output(g->logits);
     for (auto& p : g->probes) {
         ggml_set_output(p.second);      // keep them alive so they can be read back
@@ -1956,7 +2002,8 @@ bool build_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
                 int min_experts = -1, float expert_thresh = 1.0f, bool all_logits = false,
                 ZonedKvCache* zc = nullptr, bool keep_dbg = false,
                 const memex::ResidentSet* rs = nullptr,
-                memex::GpuExperts* gx = nullptr) {
+                memex::GpuExperts* gx = nullptr,
+                memex::GpuStatic* gstat = nullptr) {
 #ifndef MEMEX_FWD_ZONED
     if (zc) {
         printf("зонный кэш: эта сборка собрана без него (нет дерева MemeX/cpp)\n");
@@ -2309,7 +2356,7 @@ bool build_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
         cur = ggml_cont(c, cur);
     }
     cur = norm(c, cur, w.out_norm, h.rms_eps);
-    g->logits = ggml_mul_mat(c, w.out, cur);
+    g->logits = head_matmul(c, w.out, cur, gstat);
     ggml_set_output(g->logits);
     ggml_build_forward_expand(g->gf, g->logits);
     g->alloc = ggml_gallocr_new(buft);
@@ -2469,6 +2516,26 @@ bool build_dense_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& 
 // with a scale tensor of its own (ffn_gate_inp.scale) - NOT the activation the experts see.
 // Feeding it the expert input instead produces a routing that is wrong in a way no shape
 // check can catch and no output obviously betrays.
+// STATE, 27 Aug 2026 - read D:/MemeX/results/gemma4_state.md before editing this function.
+//
+// The attention block below is VERIFIED: against the reference run with --ref-fa, layer 0 gives
+// eleven consecutive tensors at exactly 0.0000% relative L2 with max |d| 0.00000 - attn_norm,
+// Qcur, Kcur, Vcur, both norms, both ropes, kq, the masked softmax, kqv_out and attn_out. So the
+// windowed geometry, the 1.0 attention scale, the unweighted V rms_norm, the V-from-K sharing on
+// the five full layers, the per-layer rope base and the KV cache layout are all byte-for-byte
+// the reference's, and none of them is a candidate for anything.
+//
+// --ref-fa is not a detail. With flash attention OFF the fork's own gemma4 V cache is stored
+// through ggml_transpose + a flat ggml_cpy, and gemma4 is the one architecture that hands that
+// code a 3-D V - so the reference itself is wrong in that arm, and comparing against it reported
+// 414% on the logits and 217% on kqv_out. Same binary, same prompt, flash attention on: 10.54%
+// and a matching argmax. Do not read a disagreement here as ours without checking that flag.
+//
+// What is still wrong is downstream of the attention, in this layer's feed-forward:
+// ffn_moe_combined-0 sits at 17.11% while ffn_norm_2-0 above it is exact, and the two RMS values
+// agree to six figures so it is not a missing scale. The probes that split it four ways
+// (ffn_norm_1 for the dense half, ffn_moe_weighted for the routed half under the reference's own
+// name) are in the code and have never been run.
 bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
                        const Gemma4Weights& w, Cache& kv, int n_tokens, int n_past,
                        int n_kv, bool all_logits, bool keep_probes) {
@@ -2516,7 +2583,13 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         const float kq_scale = h.f_attn_scale != 0.0f ? h.f_attn_scale
                                                       : 1.0f / std::sqrt(float(hd));
         ggml_tensor* inpSA = cur;
+        // Stage-by-stage probes, layers 0 and 1 only. Names are the reference's, so the
+        // comparison finds them; the point is to say WHICH stage of the attention block a
+        // divergence enters at, which no per-layer output can.
+        const bool inner = keep_probes && il <= 1;
+        const std::string sil = std::to_string(il);
         ggml_tensor* x = fnorm(c, cur, L.attn_norm, eps);
+        if (inner) g->probes.push_back({"attn_norm-" + sil, x});
 
         ggml_tensor* q = ggml_mul_mat(c, L.wq, x);
         ggml_tensor* k = ggml_mul_mat(c, L.wk, x);
@@ -2525,11 +2598,21 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // what `Vcur = Kcur` in the reference picks up at that point in its graph. Taking the
         // normed or roped K instead would be a different model that still runs.
         ggml_tensor* v = L.wv ? ggml_mul_mat(c, L.wv, x) : k;
+        if (inner) {
+            // The raw projections, before either norm. With attn_norm above them and
+            // Qcur_normed below, a disagreement is attributable to the weight or to the
+            // norm rather than to "somewhere in the attention block".
+            g->probes.push_back({"Qcur-" + sil, q});
+            g->probes.push_back({"Kcur-" + sil, k});
+            if (L.wv) g->probes.push_back({"Vcur-" + sil, v});
+        }
 
         q = ggml_reshape_3d(c, q, hd, G.n_head, n_tokens);
         q = fnorm(c, q, L.q_norm, eps);
+        if (inner) g->probes.push_back({"Qcur_normed-" + sil, q});
         q = ggml_rope_ext(c, q, g->positions, G.rope_freqs, G.n_rot, h.rope_type,
                           h.n_ctx_train, G.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        if (inner) g->probes.push_back({"Qcur_roped-" + sil, q});
 
         // V is rms-normed per head with NO weight, on every gemma4 layer - the ones that have
         // their own V projection included. There is no v_norm tensor in the file; the norm is
@@ -2538,8 +2621,10 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
 
         k = ggml_reshape_3d(c, k, hd, G.n_head_kv, n_tokens);
         k = fnorm(c, k, L.k_norm, eps);
+        if (inner) g->probes.push_back({"Kcur_normed-" + sil, k});
         k = ggml_rope_ext(c, k, g->positions, G.rope_freqs, G.n_rot, h.rope_type,
                           h.n_ctx_train, G.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        if (inner) g->probes.push_back({"Kcur_roped-" + sil, k});
 
         ggml_tensor* Kc = ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));
         ggml_tensor* Vc = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3));
@@ -2561,6 +2646,10 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         }
 
         ggml_tensor* Q = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));
+        // The reference calls this one "q" (llm_build_kqv), and it is a bare permute there
+        // against our permute-and-cont. Same numbers in the same order if the permute is the
+        // one we think it is, so a disagreement here would be the head layout itself.
+        if (inner) g->probes.push_back({"q-" + sil, Q});
         ggml_tensor* K = ggml_view_3d(c, kv.k[size_t(il)], hd, n_kv, G.n_head_kv,
                                       kv.k[size_t(il)]->nb[1], kv.k[size_t(il)]->nb[2], 0);
         ggml_tensor* V = ggml_view_3d(c, kv.v[size_t(il)], n_kv, hd, G.n_head_kv,
@@ -2572,9 +2661,20 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
                                                                          : g->mask;
         ggml_tensor* kq = ggml_mul_mat(c, K, Q);
         ggml_tensor* pr = ggml_soft_max_ext(c, kq, msk, kq_scale, 0.0f);
+        // The three stages of the attention core, under the reference's names. Everything
+        // above them was bit-identical and kqv_out was 218% off, so the fault is in here and
+        // these split it three ways: kq is Q against the cached K, kq_soft_max_ext adds the
+        // mask and the scale, kqv_merged_cont adds the cached V.
+        if (inner) {
+            g->probes.push_back({"kq-" + sil, kq});
+            g->probes.push_back({"kq_soft_max_ext-" + sil, pr});
+        }
         ggml_tensor* kqv = ggml_mul_mat(c, V, pr);
+        // Before the permute, so the V product and the head-merge are separate lines.
+        if (inner) g->probes.push_back({"kqv-" + sil, kqv});
         g->reads.push_back({K, V, kq, pr, msk});
         kqv = ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), G.d_q(), n_tokens);
+        if (inner) g->probes.push_back({"kqv_merged_cont-" + sil, kqv});
         if (keep_probes) {
             ggml_set_output(inpSA);
             ggml_set_output(kqv);
@@ -2583,21 +2683,53 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
 
         // Post-attention norm BEFORE the residual, which is the gemma shape and the reverse
         // of what every llama-derived block does.
-        ggml_tensor* attn = fnorm(c, ggml_mul_mat(c, L.wo, kqv), L.post_attn_norm, eps);
+        ggml_tensor* kqv_out = ggml_mul_mat(c, L.wo, kqv);
+        if (inner) g->probes.push_back({"kqv_out-" + sil, kqv_out});
+        ggml_tensor* attn = fnorm(c, kqv_out, L.post_attn_norm, eps);
+        if (inner) g->probes.push_back({"sa_normed-" + sil, attn});
         ggml_tensor* attn_out = ggml_add(c, attn, inpSA);
-        if (keep_probes) g->probes.push_back({"attn_out-" + std::to_string(il), attn_out});
+        // The reference gives the name "attn_out" to two different quantities, and which one
+        // depends on the layer. A layer that has its own wv - the 25 windowed ones - goes
+        // through build_std_attention, which does cb(cur, "attn_out", il) and only THEN adds
+        // the residual (llama-build-context.cpp:3696). A layer without wv - the five full
+        // ones - is built inline in build_gemma4, which adds the residual first and names the
+        // sum (build_gemma4.cpp:1021).
+        //
+        // Probing our post-residual value under that name on every layer therefore compared
+        // two different things on 25 layers of 30, and reported 100-500% relative L2 for it.
+        // That reads exactly like a broken attention block, which is the expensive kind of
+        // wrong: it points the search at the graph when the fault is in the comparison.
+        if (keep_probes) {
+            g->probes.push_back({"attn_out-" + std::to_string(il),
+                                 L.wv ? attn : attn_out});
+        }
 
         // ---- the dense half. gelu(gate) * up, which is what LLM_FFN_GELU + LLM_FFN_PAR
         // resolves to; ggml_fused_up_gate is the reference's own op for it.
         ggml_tensor* hd_in = fnorm(c, attn_out, L.ffn_norm, eps);
+        if (keep_probes) g->probes.push_back({"ffn_norm_1-" + sil, hd_in});
         ggml_tensor* dense = ggml_mul_mat(c, L.down,
             ggml_fused_up_gate(c, L.up, L.gate, hd_in, GGML_UNARY_OP_GELU));
 
         // ---- the routed half.
         ggml_tensor* moe_in = fnorm(c, attn_out, L.pre_ffw_norm_2, eps);
         if (keep_probes) g->probes.push_back({"ffn_norm_2-" + std::to_string(il), moe_in});
-        ggml_tensor* rlogits = ggml_mul_mat(c, L.router,
-                                            fnorm(c, attn_out, L.router_scale, eps));
+        // ffn_gate_inp.scale as it sits in the FILE is not the tensor the reference's graph
+        // sees. llm_scale_gate_inp_s (llama.cpp:3805) walks every gemma4 layer at LOAD time
+        // and multiplies that vector in place by 1/sqrt(n_embd) - 1/53.066 here. Reading the
+        // weight straight out of the gguf, as everything else in this file legitimately
+        // does, leaves the router logits 53x too large; softmax then collapses onto the top
+        // expert, top-k picks the same eight (scaling is monotone) and the renormalised
+        // weights come out near one-hot instead of a mixture. Nothing about the shapes,
+        // the tensor names or the generated text betrays it.
+        //
+        // The scale is applied to the normed activation rather than to the weight because
+        // the weight is mmapped and shared; multiplying x by s before the matmul is the same
+        // product as the reference's pre-scaled w, and it is the same magnitude going into
+        // mul_mat, which matters on the iqk path where the activation vector is quantised.
+        ggml_tensor* rnormed = fnorm(c, attn_out, L.router_scale, eps);
+        if (h.f_router_scale != 1.0f) rnormed = ggml_scale(c, rnormed, h.f_router_scale);
+        ggml_tensor* rlogits = ggml_mul_mat(c, L.router, rnormed);
         ggml_tensor* probs = ggml_soft_max(c, rlogits);
         ggml_tensor* sel = ggml_top_k(c, probs, h.n_expert_used);
         ggml_tensor* weights = ggml_get_rows(c,
@@ -2645,7 +2777,12 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
             routed->src[2] = L.down_scale;
             routed->src[3] = sel;
         }
-        if (keep_probes) g->probes.push_back({"ffn_moe_out-" + std::to_string(il), routed});
+        // The reference's own name for this, so it can be compared at all: llm_build_moe_ffn
+        // names the mul_multi_add result "ffn_moe_weighted" and only then hands it the scale
+        // through src[2], so the captured value is the routed half WITH ffn_down_exps.scale
+        // folded in - exactly what ours is. "ffn_moe_out" was our invention and matched
+        // nothing, which is why the routed half has never actually been checked.
+        if (keep_probes) g->probes.push_back({"ffn_moe_weighted-" + sil, routed});
 
         // ---- the join. Each half gets its own rms and its own weight, then they are added:
         // one op in the reference, and one op here, because splitting it into two norms and
@@ -3014,9 +3151,15 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
             // note that SIGMOID would have to be added to the fused op's supported list
             // first. So two nodes is also what llama_decode runs.
             kqv = ggml_mul(c, kqv, ggml_sigmoid(c, agate));
-            attn_out = ggml_add(c, ggml_mul_mat(c, L.wo, kqv), inpSA);
+            ggml_tensor* proj = ggml_mul_mat(c, L.wo, kqv);
+            attn_out = ggml_add(c, proj, inpSA);
+            // Pre-residual, because that is what the reference calls "attn_out" here.
+            // build_qwen35 passes add_input=true to build_std_attention, and that function
+            // names the output projection "attn_out" and adds the residual afterwards
+            // (llama-build-context.cpp:3696). Same trap as gemma4's windowed layers - see
+            // the longer note in build_gemma4_step.
             if (keep_probes) {
-                g->probes.push_back({"attn_out-" + std::to_string(il), attn_out});
+                g->probes.push_back({"attn_out-" + std::to_string(il), proj});
             }
         }
 
@@ -3093,6 +3236,9 @@ struct Generator {
     // otherwise reuse - and on for --decode-check, where comparing a layer at a time is the
     // entire point.
     bool want_probes = false;
+    // The output head on the card, when it is on. Borrowed, not owned: main owns it, because
+    // it has to exist before the first graph is built and outlive the last one.
+    memex::GpuStatic* gstat = nullptr;
 
     bool dense() const { return dw != nullptr; }
 
@@ -3141,7 +3287,8 @@ struct Generator {
                                      all_logits, want_probes);
         }
         return build_step(g, buft, *h, *w, kv, n_tokens, n_past, n_kv_max, min_experts,
-                          expert_thresh, all_logits);
+                          expert_thresh, all_logits, /*zc=*/nullptr, /*keep_dbg=*/false,
+                          /*rs=*/nullptr, /*gx=*/nullptr, gstat);
     }
 
     // The mask is -inf everywhere and zero only where a query at position past+i may see key
@@ -3324,18 +3471,53 @@ int probe_cb(ggml_tensor* t, bool ask, void* user_data) {
         // different places in the block - before the residual on the twenty-five layers that
         // take build_std_attention, and after it on the five that do not. l_out is
         // unambiguous everywhere and is the one to trust.
-        const bool useful = n.rfind("l_out-", 0) == 0 ||
+        // Inside-the-attention names, and only for layers 0 and 1. When a divergence starts
+        // at layer 0 there is nothing upstream to bisect against, so the bisection has to
+        // happen INSIDE the block, and these are the reference's own names for its stages:
+        // attn_norm -> Qcur_normed/Kcur_normed -> Qcur_roped/Kcur_roped -> kqv_out ->
+        // sa_normed. Two layers rather than thirty because Qcur alone is 4096 wide and the
+        // 1100-token arm would otherwise hold about five gigabytes of captured tensors.
+        const bool head_two = n.size() > 2 && (n.compare(n.size() - 2, 2, "-0") == 0 ||
+                                               n.compare(n.size() - 2, 2, "-1") == 0);
+        const bool inner = head_two && (n.rfind("attn_norm-", 0) == 0 ||
+                                        n.rfind("q-", 0) == 0 ||
+                                        n.rfind("kq-", 0) == 0 ||
+                                        n.rfind("kq_soft_max_ext-", 0) == 0 ||
+                                        n.rfind("kqv-", 0) == 0 ||
+                                        n.rfind("kqv_merged_cont-", 0) == 0 ||
+                                        n.rfind("Qcur-", 0) == 0 ||
+                                        n.rfind("Kcur-", 0) == 0 ||
+                                        n.rfind("Vcur-", 0) == 0 ||
+                                        n.rfind("Qcur_normed-", 0) == 0 ||
+                                        n.rfind("Kcur_normed-", 0) == 0 ||
+                                        n.rfind("Qcur_roped-", 0) == 0 ||
+                                        n.rfind("Kcur_roped-", 0) == 0 ||
+                                        n.rfind("kqv_out-", 0) == 0 ||
+                                        n.rfind("sa_normed-", 0) == 0);
+        const bool useful = inner ||
+                            n.rfind("l_out-", 0) == 0 ||
                             n.rfind("ffn_inp_normed-", 0) == 0 ||
                             n.rfind("attn_out-", 0) == 0 ||
                             n.rfind("ffn_moe_out-", 0) == 0 ||
+                            n.rfind("ffn_moe_weighted-", 0) == 0 ||
+                            n.rfind("ffn_norm_1-", 0) == 0 ||
                             n.rfind("ffn_moe_combined-", 0) == 0 ||
                             n.rfind("ffn_norm_2-", 0) == 0 ||
                             n.rfind("ssm_output-", 0) == 0 ||
                             n == "result_norm";
+        // Contiguity is not a detail here, it is the difference between a comparison and a
+        // fabrication. The capture below is a flat memcpy of ggml_nbytes, so a PERMUTED VIEW
+        // - which shares its source's memory and differs only in strides - is copied in the
+        // SOURCE's order and then compared, element by element, against our permuted values.
+        // The result is a large disagreement with no bug behind it. The reference names one
+        // such node "q" (llm_build_kqv permutes without a cont), so this is not hypothetical.
+        // Skipping is right rather than transposing on the fly: a node we cannot read
+        // faithfully should produce no line, not a line that has to be discounted.
+        const bool readable = ggml_is_contiguous(t);
         if (ask) {
-            return useful && t->type == GGML_TYPE_F32 ? 1 : 0;
+            return useful && readable && t->type == GGML_TYPE_F32 ? 1 : 0;
         }
-        if (!useful || t->type != GGML_TYPE_F32 || p->get(n)) {
+        if (!useful || !readable || t->type != GGML_TYPE_F32 || p->get(n)) {
             return 1;
         }
         std::vector<float> d;
@@ -3378,15 +3560,25 @@ void report(const char* what, const std::vector<float>& ours,
         return;
     }
     const size_t n = ours.size();
-    double num = 0.0, den = 0.0, worst = 0.0;
+    double num = 0.0, den = 0.0, worst = 0.0, mine = 0.0;
     for (size_t i = 0; i < n; ++i) {
         const double d = double(ours[i]) - double(ref[i]);
         num += d * d;
         den += double(ref[i]) * double(ref[i]);
+        mine += double(ours[i]) * double(ours[i]);
         worst = std::max(worst, std::abs(d));
     }
-    printf("  %-22s %8zu значений, L2 %8.4f%%, макс |d| %.5f\n", what, n,
-           den > 0.0 ? 100.0 * std::sqrt(num / den) : -1.0, worst);
+    // Both RMS values, always, next to the relative error. METHODS 11 asked for this
+    // after a comparison returned "identical" for two zero tensors; it earns its keep
+    // again on any disagreement, because a ratio near 1.0 with a large L2 means the
+    // two answers are the same size and point elsewhere, while a ratio far from 1.0
+    // names a missing scale or a missing normalisation on one side. Those are
+    // different bugs and the L2 alone does not tell them apart.
+    const double rms_o = n ? std::sqrt(mine / double(n)) : 0.0;
+    const double rms_r = n ? std::sqrt(den / double(n)) : 0.0;
+    printf("  %-22s %8zu, L2 %8.4f%%, max |d| %.5f, rms %.5f / %.5f\n",
+           what, n, den > 0.0 ? 100.0 * std::sqrt(num / den) : -1.0, worst,
+           rms_o, rms_r);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -3667,6 +3859,19 @@ struct ResidentOpt {
 // ---------------------------------------------------------------------------------------
 // The GPU half, as an option
 // ---------------------------------------------------------------------------------------
+
+// The static head on the card. A separate option from --gpu-experts and, for now, mutually
+// exclusive with it: ggml_vk_get_device caches its devices (ggml-vulkan.cpp:3067-3073), so two
+// ggml_backend_vk_init(0) calls share one vk_device - one queue, one command pool, one staging
+// buffer - and GpuExperts' worker thread uploads whenever it has a promotion pending, which
+// includes the moment the head is running. Refused rather than raced.
+struct GpuStaticOpt {
+    bool on       = false;   // --gpu-static
+    bool verify   = false;   // --gpu-static-verify, byte compare after the upload
+    bool selftest = false;   // --gpu-static-selftest, no model needed
+    int  rows     = 8;       // --gpu-static-rows, widest block of logit rows per dispatch
+    int  reserve_mib = 384;  // --gpu-static-reserve
+};
 
 // Off by default, and it stays off until it is MEASURED faster - not until it looks right.
 // The measurement is not taken here: a timing taken while anything else is running on this
@@ -4759,6 +4964,20 @@ int main(int argc, char** argv) {
     bool chat = false;
     std::string system_prompt;
     int n_ctx_req = 0;             // 0 means "size it from the prompt and --gen"
+    // The reference's micro-batch. 512 is llama.cpp's default and is what every number
+    // in this file has been measured against, so it stays the default. It is exposed
+    // because a prompt longer than it makes llama_decode run several micro-batches, and
+    // that is a second explanation for any disagreement at length - one that looks
+    // exactly like a windowing fault, because both only appear once the prompt is long.
+    // Setting this to the prompt length collapses the reference to a single micro-batch
+    // and tells the two apart in one run.
+    int ref_ubatch = 512;
+    // Whether the REFERENCE runs flash attention. Ours never does, and false was the obvious
+    // choice: the plain path is the one our graph mirrors node for node. It is also, for
+    // gemma4, the path in which the reference stores its V cache incorrectly - see the note
+    // at the flag's use - so this exists to compare against the arm the fork actually works
+    // in rather than the arm we happen to imitate.
+    bool ref_fa = false;
     int n_predict = 256;           // chat mode's own budget; --gen drives the harness path
     bool want_ref = true;
     std::string draft_path;
@@ -4768,6 +4987,7 @@ int main(int argc, char** argv) {
     ZonedOpt zopt;
     ResidentOpt ropt;
     GpuExpertOpt gopt;
+    GpuStaticOpt sopt;
     bool bad_arg = false;
 
     auto want_val = [&](int i, const char* what) {
@@ -4870,6 +5090,15 @@ int main(int argc, char** argv) {
 "  --gpu-experts-selftest   проверить весь механизм на синтетических весах, без модели\n"
 "  --gpu-experts-reserve N  запас видеопамяти в МиБ, который не занимать (%d)\n"
 "\n"
+"staticheskie vesa v videopamjati, VYKLJUCHENY po umolchaniju\n"
+"  --gpu-static         schitat vyhodnuju golovu (output.weight) na Vulkan. Eto 243.4 MB\n"
+"                       iz 1714 MB, kotorye tokjen chitaet, i edinstvennaja chast statiki\n"
+"                       s ODNIM peresecheniem granicy za tokjen, a ne odnim na sloj\n"
+"  --gpu-static-verify  posle zalivki sverit kazhdyj bajt golovy s modelju\n"
+"  --gpu-static-selftest    proverit ves mehanizm na sinteticheskoj golove, bez modeli\n"
+"  --gpu-static-rows N  shirina bloka logitov za odin dispatch (%d)\n"
+"  --gpu-static-reserve N   zapas videopamjati v MiB, kotoryj ne zanimat (%d)\n"
+"\n"
 "диагностика\n"
 "  --probe ИМЯ          сверить промежуточный тензор; \"all\" — все, \"list\" — перечислить\n"
 "  --bandwidth F        ГБ/с для байтового бюджета (%.1f)\n"
@@ -4882,6 +5111,7 @@ int main(int argc, char** argv) {
                 zopt.tail_q8 ? "q8_0" : "f16", zopt.rotate_keys ? "on" : "off",
                 ropt.capacity, ropt.window, ropt.period, ropt.budget, ropt.policy_name(),
                 gopt.reserve_mib,
+                sopt.rows, sopt.reserve_mib,
                 bandwidth_gbs);
             return 0;
         }
@@ -4904,6 +5134,9 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(a, "-t")) { if (want_val(i, a)) threads = atoi(argv[++i]); }
         else if (!strcmp(a, "-c") || !strcmp(a, "--ctx")) { if (want_val(i, a)) n_ctx_req = atoi(argv[++i]); }
+        else if (!strcmp(a, "--ref-ubatch")) { if (want_val(i, a)) ref_ubatch = atoi(argv[++i]); }
+        else if (!strcmp(a, "--ref-fa")) ref_fa = true;
+        else if (!strcmp(a, "--no-ref-fa")) ref_fa = false;
         else if (!strcmp(a, "--tokens")) { if (want_val(i, a)) max_tokens = atoi(argv[++i]); }
         else if (!strcmp(a, "--probe")) { if (want_val(i, a)) probe_name = argv[++i]; }
         else if (!strcmp(a, "--gen")) { if (want_val(i, a)) n_gen = atoi(argv[++i]); }
@@ -4982,6 +5215,15 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        else if (!strcmp(a, "--gpu-static")) { sopt.on = true; }
+        else if (!strcmp(a, "--gpu-static-verify")) { sopt.on = true; sopt.verify = true; }
+        else if (!strcmp(a, "--gpu-static-selftest")) { sopt.selftest = true; }
+        else if (!strcmp(a, "--gpu-static-rows")) {
+            if (want_val(i, a)) sopt.rows = atoi(argv[++i]);
+        }
+        else if (!strcmp(a, "--gpu-static-reserve")) {
+            if (want_val(i, a)) sopt.reserve_mib = atoi(argv[++i]);
+        }
         else {
             printf("неизвестный флаг: %s (--help перечислит все)\n", a);
             bad_arg = true;
@@ -4991,6 +5233,14 @@ int main(int argc, char** argv) {
     // Before anything is loaded, because it loads nothing: the self-test builds its own
     // synthetic experts and runs in half a gigabyte, which is what makes it usable on a
     // machine that has a 30B model resident in the next process.
+    if (sopt.selftest) {
+#ifdef MEMEX_FWD_GPU_EXPERTS
+        return memex::gpu_static_selftest(threads);
+#else
+        printf("--gpu-static-selftest: eta sborka sobrana bez Vulkan\n");
+        return 1;
+#endif
+    }
     if (gopt.selftest) {
 #ifdef MEMEX_FWD_GPU_EXPERTS
         return memex::gpu_experts_selftest(threads);
@@ -5041,6 +5291,23 @@ int main(int argc, char** argv) {
                    "помечать позиции (keep_exact всегда ложь), так что блокнот останется "
                    "пустым, а путь его загрузки — непройденным\n", zopt.notebook);
         }
+    }
+#ifndef MEMEX_FWD_GPU_EXPERTS
+    if (sopt.on) {
+        printf("--gpu-static: eta sborka sobrana bez Vulkan (nuzhno derevo build-vk, "
+               "GGML_VULKAN=ON)\n");
+        return 1;
+    }
+#endif
+    if (sopt.on && gopt.on) {
+        printf("--gpu-static vmeste s --gpu-experts poka ne podderzhan: oba berut "
+               "ggml_backend_vk_init(0), a ggml keshiruet ustrojstva, tak chto oni podelili "
+               "by odnu ochered i odin staging-bufer mezhdu dvuh potokov\n");
+        return 1;
+    }
+    if (sopt.on && (sopt.rows < 1 || sopt.rows > 64)) {
+        printf("--gpu-static-rows %d vne diapazona 1..64\n", sopt.rows);
+        return 1;
     }
 #ifndef MEMEX_FWD_GPU_EXPERTS
     if (gopt.on) {
@@ -5127,7 +5394,7 @@ int main(int argc, char** argv) {
     // not fail - it produces confident nonsense, because the tensor names happen to overlap
     // and the shapes happen to be plausible. So anything else is refused by name.
     if (!arch_q3 && !arch_g4 && !arch_q35) {
-        printf("архитектура \\"%s\\" не поддерживается этим движком.\n", h.arch.c_str());
+        printf("архитектура \"%s\" не поддерживается этим движком.\n", h.arch.c_str());
         printf("  поддерживаются как целевые: qwen3moe, gemma4, qwen35moe\n");
         printf("  и qwen3 — но только как модель-черновик через -md\n");
         printf("  граф написан под конкретные архитектуры; на другой он выдаст не ошибку, "
@@ -5181,6 +5448,10 @@ int main(int argc, char** argv) {
                    h.f_logit_softcap);
         }
         if (h.f_embd_scale > 0.0f) printf("  вложения масштабируются на %g\n", h.f_embd_scale);
+        if (h.f_router_scale != 1.0f) {
+            printf("  vhod marshrutizatora umnozhaetsja na %g -- etalon delaet to zhe samoe\n", h.f_router_scale);
+            printf("  s samim ffn_gate_inp.scale pri zagruzke (llm_scale_gate_inp_s)\n");
+        }
     }
 
     // The optional modules were all written against one geometry, and every one of them
@@ -5473,10 +5744,40 @@ int main(int argc, char** argv) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 2048;
     cp.n_batch = 2048;
-    cp.n_ubatch = 512;
+    cp.n_ubatch = ref_ubatch > 0 ? ref_ubatch : 512;
     cp.n_threads = threads;
     cp.n_threads_batch = threads;
-    cp.flash_attn = false;   // the plain path, which is what our graph mirrors
+    // The plain path is what our graph mirrors node for node, so false is the default and it
+    // is what every comparison in this file has used. For gemma4 it is ALSO the path in which
+    // the reference is itself wrong, and that took a whole bisection to see:
+    //
+    //   flash_attn off  =>  kv_self.v_trans is TRUE, and llm_build_kv_store takes the
+    //   transposed branch: `v_cur = ggml_transpose(ctx, v_cur)` followed by a ggml_cpy into a
+    //   [n_tokens, n_embd_v_gqa] strided view. That is correct for every other architecture,
+    //   because every other architecture hands it a 2-D V of [n_embd_v_gqa, n_tokens].
+    //   gemma4 does not: its unweighted V rms_norm needs the per-head shape, so V arrives
+    //   3-D as [n_embd_head_v, n_head_kv, n_tokens]. ggml_transpose swaps ne0 and ne1 ONLY,
+    //   giving [n_head_kv, n_embd_head_v, n_tokens] - and ggml_cpy between mismatched shapes
+    //   is a FLAT copy (ggml_compute_forward_dup's dst-counter loop), so the element order
+    //   the store writes is not the order the read view expects. The cache ends up permuted.
+    //
+    //   flash_attn on   =>  v_trans is FALSE, the store is a flat view_1d, and the FA read is
+    //   [n_embd_head_v, n_kv, n_head_kv] with matching strides. Store and read agree.
+    //
+    // Which is why our own numbers looked like a bug in our attention: attn_norm, Qcur, Kcur,
+    // Vcur, both norms, both ropes, kq and even kq_soft_max_ext all came out BIT-identical at
+    // layer 0, and the first divergence was kqv - the one node that reads the V cache.
+    // METHODS 16 in one line: before hunting a fault in your own code, check the reference is
+    // right in the configuration you are comparing against.
+    cp.flash_attn = ref_fa;
+    if (ref_fa) {
+        printf("etalon schitaet vnimanie slitoj operaciej (--ref-fa): ego V-kesh ne transponirovan\n");
+    }
+    if (n > int(cp.n_ubatch)) {
+        // Said out loud, because it is invisible otherwise and it changes what the
+        // reference computes over: several micro-batches instead of one.
+        printf("эталон разобьёт %d токенов на микропачки по %d\n", n, int(cp.n_ubatch));
+    }
     Probe probe;
     probe.want = probe_name;
     probe.catch_all = probe_name == "all";
@@ -5565,6 +5866,44 @@ int main(int argc, char** argv) {
         if (!uniform) printf("  ВНИМАНИЕ: слои различаются по типам, строка выше — только слой 0\n");
     }
 
+    // The static head on the card, before any graph is built: every graph that uses it
+    // captures the pointer at build time.
+    memex::GpuStatic* gsp = nullptr;
+#ifdef MEMEX_FWD_GPU_EXPERTS
+    std::unique_ptr<memex::GpuStatic> gstat;
+    if (sopt.on) {
+        if (!arch_q3) {
+            printf("--gpu-static: poka tolko qwen3moe - drugie arhitektury stroit golovu "
+                   "svoim putjom (fnorm, softcap), i podmena tam ne proverena\n");
+            return 1;
+        }
+        memex::GpuStaticConfig sc;
+        sc.n_embd  = h.n_embd;
+        sc.n_vocab = h.n_vocab;
+        sc.max_rows = sopt.rows;
+        sc.reserve = std::size_t(sopt.reserve_mib) << 20;
+        sc.verify  = sopt.verify;
+        gstat.reset(new memex::GpuStatic());
+        std::string serr;
+        if (!gstat->init(sc, w.out, &serr)) {
+            printf("--gpu-static: %s\n", serr.c_str());
+            return 1;
+        }
+        gsp = gstat.get();
+        printf("\nstaticheskaja golova na karte: %s\n", gsp->device_name().c_str());
+        printf("  output.weight %s, %.1f MiB v videopamjati, blok do %d strok\n",
+               gsp->head_type_name(), double(gsp->vram_bytes()) / 1048576.0, sopt.rows);
+        for (const memex::GpuStaticBuffer& b : gsp->buffers()) {
+            printf("  bufer: %-24s %8.2f MiB (nabivki %.2f MiB)  %s\n", b.what.c_str(),
+                   double(b.bytes) / 1048576.0, double(b.padding) / 1048576.0,
+                   b.over_bar ? "> 256 MiB - ne BAR"
+                              : "<= 256 MiB - MOG SEST V BAR");
+        }
+    }
+#else
+    (void)sopt;
+#endif
+
     ggml_backend_t be = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(be, threads);
     ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
@@ -5588,7 +5927,7 @@ int main(int argc, char** argv) {
     std::vector<float> mask;
 
     if (arch_q3) {
-        if (!build(&g, buft, h, w, n)) {
+        if (!build(&g, buft, h, w, n, gsp)) {
             printf("наш граф не собрался\n");
             return 1;
         }
@@ -5735,6 +6074,7 @@ int main(int argc, char** argv) {
         }
         Generator gen;
         gen.want_probes = (probe_name == "all");
+        gen.gstat = gsp;
         if (!gen.init(be, buft, &h, arch_q3 ? &w : nullptr, nullptr, n_kv_max, min_experts,
                       expert_thresh, arch_g4 ? &w4 : nullptr,
                       arch_q35 ? &w35 : nullptr)) {
@@ -5988,7 +6328,7 @@ int main(int argc, char** argv) {
         Graph pre;
         if (!build_step(&pre, buft, h, w, kv, n, 0, n_kv_max, min_experts, expert_thresh,
                         /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/false,
-                        rset.get())) {
+                        rset.get(), /*gx=*/nullptr, gsp)) {
             printf("граф префилла не собрался\n");
             return 1;
         }
@@ -6119,7 +6459,8 @@ int main(int argc, char** argv) {
             const auto t_b = Clock::now();
             if (!build_step(&dec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
                             /*all_logits=*/false, /*zc=*/nullptr,
-                            /*keep_dbg=*/zopt.check || rset != nullptr)) {
+                            /*keep_dbg=*/zopt.check || rset != nullptr,
+                            /*rs=*/nullptr, /*gx=*/nullptr, gsp)) {
                 printf("граф декода не собрался\n");
                 return 1;
             }
@@ -6139,7 +6480,7 @@ int main(int argc, char** argv) {
             const auto t_rb = Clock::now();
             if (!build_step(&rdec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
                             /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/true,
-                            rset.get(), gxp)) {
+                            rset.get(), gxp, gsp)) {
                 printf("расщеплённый граф декода не собрался\n");
                 return 1;
             }
@@ -6219,7 +6560,7 @@ int main(int argc, char** argv) {
             const auto t_zb = Clock::now();
             if (!build_step(&zdec, buft, h, w, kv, 1, n, n_kv_max, min_experts,
                             expert_thresh, /*all_logits=*/false, zkv.c,
-                            /*keep_dbg=*/zopt.check)) {
+                            /*keep_dbg=*/zopt.check, /*rs=*/nullptr, /*gx=*/nullptr, gsp)) {
                 printf("зонный граф декода не собрался\n");
                 return 1;
             }
@@ -6697,6 +7038,45 @@ int main(int argc, char** argv) {
         printf("\n");
         printf("\nскорость генерации: наш %.2f ток/с, эталон %.2f ток/с\n",
                1000.0 * n_gen / gen_ms, 1000.0 * n_gen / ref_gen_ms);
+#ifdef MEMEX_FWD_GPU_EXPERTS
+        if (gsp) {
+            const memex::GpuStaticStats& ss = gsp->stats();
+            const double calls = double(ss.calls > 0 ? ss.calls : 1);
+            printf("staticheskaja golova na karte: %llu uzlov, %llu strok, %llu dispatchej\n",
+                   (unsigned long long)ss.calls, (unsigned long long)ss.rows,
+                   (unsigned long long)ss.blocks);
+            printf("  na odin uzel: vsego %.3f ms = podjom %.3f + ustrojstvo %.3f + "
+                   "zabor %.3f\n",
+                   ss.ms_total / calls, ss.ms_upload / calls, ss.ms_device / calls,
+                   ss.ms_readback / calls);
+            printf("  zabrano s karty %.2f MB za progon\n",
+                   double(ss.readback_bytes) / 1e6);
+            if (!gsp->failure().empty()) {
+                printf("  USTROJSTVO OTKAZALO: %s - logity nizhe nedejstvitelny\n",
+                       gsp->failure().c_str());
+            }
+        }
+#endif
+        // One machine-readable line, ASCII, always printed.
+        //
+        // Not decoration: the line above is the only place the speed appears and it is in
+        // Cyrillic, so a harness has to match it through whatever code page the redirect
+        // happened to use - which is a way for an A/B to lose replicates silently, and this
+        // project has lost two evenings to exactly that class of fault. ref_tok_s is on the
+        // line on purpose and is the CONTROL: llama_decode does not know the card exists, so
+        // if it moves between two arms of the same A/B then the machine moved, not the arm.
+        {
+            double head_ms = 0.0;
+#ifdef MEMEX_FWD_GPU_EXPERTS
+            if (gsp && gsp->stats().calls > 0) {
+                head_ms = gsp->stats().ms_total / double(gsp->stats().calls);
+            }
+#endif
+            printf("STATIC_AB our_tok_s %.4f ref_tok_s %.4f gen_ms %.1f n_gen %d "
+                   "head_ms %.4f static %d\n",
+                   1000.0 * n_gen / gen_ms, 1000.0 * n_gen / ref_gen_ms, gen_ms, n_gen,
+                   head_ms, gsp ? 1 : 0);
+        }
 
         // The byte budget, here rather than only in run_chat - which has no caller, so until
         // now the single most useful diagnostic in this project was unreachable from the
