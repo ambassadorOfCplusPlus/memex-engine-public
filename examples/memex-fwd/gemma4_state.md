@@ -66,7 +66,7 @@ which is what localised the fault to the single node that reads the V cache.
   llama-build-context.cpp:3696) and post-residual on the five built inline in `build_gemma4`
   (build_gemma4.cpp:1021). Probing our post-residual value under that name compared two different
   things on 25 layers of 30 and reported 100-500% of pure artefact. Our probe now switches on
-  `L.wv`. See METHODS 56.
+  `L.wv`. See METHODS 61.
 - **The tied output head and the 30.0 logit softcap** - both downstream, and the prefill logits
   now agree to 10.54% with a matching argmax.
 
