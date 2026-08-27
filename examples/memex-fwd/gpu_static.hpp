@@ -166,6 +166,13 @@ struct GpuStaticStats {
     double   layer_ms_upload = 0.0;
     double   layer_ms_device = 0.0;
     double   layer_ms_readback = 0.0;
+    // Readbacks served by a memcpy through a host-visible mapping cost no fence; the fenced
+    // ones cost a submit each. Which one a layer gets is a property of where the graph
+    // allocator put its output buffer, so it is counted rather than assumed.
+    uint64_t layer_readback_mapped = 0;
+    uint64_t layer_readback_fenced = 0;
+    uint64_t kv_uploads   = 0;   // whole-cache uploads: one per prompt, not per token
+    double   kv_upload_ms = 0.0;
 };
 
 // One allocated device buffer and the single fact that decides whether it is fast.
@@ -190,8 +197,19 @@ class GpuStatic {
     // wrong answer. The engine's repack selection defaults to experts only, which is exactly
     // why this works without reading the GGUF back off disk the way GpuExperts has to.
     // `layers` is read only when cfg.layers is set and must then hold cfg.n_layer entries.
-    bool init(const GpuStaticConfig& cfg, ggml_tensor* out, const GpuStaticLayer* layers,
-              std::string* err);
+    bool init(const GpuStaticConfig& cfg, ggml_tensor* out, std::string* err);
+
+    // The layer half of the residency, and it is a SECOND call rather than an argument to the
+    // first for a reason that is not arbitrary: the cache length is not known when the head is
+    // placed. n_kv_max comes from the mode - pad32(n_ctx) in chat, pad32(prompt + gen) in the
+    // harness - and every one of those is decided after the model has loaded, while the head
+    // has to exist before the first graph is built because every graph captures it.
+    //
+    // `layers` must hold cfg.n_layer entries and its tensors must be host-readable and not
+    // repacked. Between the two calls layers_on() is false and the engine keeps the CPU
+    // attention block, which is the right answer to "not placed yet" rather than a half state.
+    bool init_layers(const GpuStaticLayer* layers, int n_kv_max, std::string* err);
+
     void shutdown();
 
     bool on() const { return be_ != nullptr; }
@@ -251,6 +269,20 @@ class GpuStatic {
     // previous aim still stands: reading the whole allocation is slow and right.
     bool set_step(int n_past, int n_kv);
 
+    // The prompt is computed on the host - a prefill is a different graph shape and is
+    // compute-bound rather than bandwidth-bound, so moving it buys nothing - which leaves the
+    // card's cache empty at the first generated token. This copies the host cache into it,
+    // tensor for tensor: same shape, same F16 type, no repacking on the way. Once per prompt.
+    //
+    // It is the one piece of state that has to cross in that direction, and getting it wrong
+    // is invisible: an empty device cache still produces fluent text, because attention over
+    // zeros is attention over something. So the shapes are compared rather than assumed.
+    bool upload_kv(ggml_tensor* const* k, ggml_tensor* const* v, int n_layer,
+                   std::string* err);
+
+    int  n_kv_max() const { return cfg_.n_kv_max; }
+    bool layers_on() const { return on() && cfg_.layers && !lg_.empty(); }
+
     // Every byte of the head in video memory, against the host tensor it was copied from.
     // Waits for nothing - there is no worker - but it is still only valid between graph
     // computations, because it borrows the readback staging.
@@ -286,10 +318,14 @@ class GpuStatic {
         ggml_tensor*   out = nullptr;    // the concatenated [2*n_embd + n_expert, 1] result
         ggml_tensor*   kdst = nullptr;   // the write view, aimed at n_past
         ggml_tensor*   vdst = nullptr;
+        ggml_tensor*   kcpy = nullptr;   // and the copy node that carries the same offset
+        ggml_tensor*   vcpy = nullptr;
         ggml_tensor*   K = nullptr;      // the read views, aimed at n_kv
         ggml_tensor*   V = nullptr;
         ggml_tensor*   kq = nullptr;
         ggml_tensor*   probs = nullptr;
+        const float*   mapped = nullptr; // the output's host mapping, when the driver gave one
+        bool           mapped_probed = false;
     };
 
     GpuStaticConfig cfg_;
@@ -340,13 +376,13 @@ class GpuStatic {
     // grouping is what keeps each buffer clear of the 256 MiB BAR window and the two groups
     // have very different sizes: attention is 511 MiB across forty-eight layers, the head plus
     // the routers is 291 MiB. Two buffers, both over the ceiling, no padding needed for either.
-    ggml_context*         ctx_l_ = nullptr;
-    ggml_backend_buffer_t buf_l_ = nullptr;
+    std::vector<ggml_context*>         ctxs_l_;
+    std::vector<ggml_backend_buffer_t> bufs_l_;
     std::vector<GpuStaticLayer> lw_;      // the device tensors, same field names as the host's
 
-    // The KV cache, on the device, in its own buffer for the same reason.
-    ggml_context*         ctx_kv_ = nullptr;
-    ggml_backend_buffer_t buf_kv_ = nullptr;
+    // The KV cache, on the device, in the SAME buffers as the attention weights. Keeping it
+    // apart would leave 201 MB at a 2048 context - under the 256 MiB BAR window, hence backed
+    // by system memory at 3.1 GB/s while every report still called it device-local.
     std::vector<ggml_tensor*> kv_k_, kv_v_;
     ggml_tensor*          kv_pad_ = nullptr;   // clears the BAR ceiling at short contexts
 

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -60,6 +61,32 @@ inline uint32_t xrand(uint32_t& s) {
 
 inline float xuni(uint32_t& s, float scale) {
     return scale * (float(xrand(s) & 0xffffu) / 32768.0f - 1.0f);
+}
+
+// One submit per device graph. Set before the device is created, because ggml reads these
+// once at device init (ggml-vulkan.cpp:3905). Not overwritten if the environment already
+// carries a value: a sweep over the divisor has to be able to say so.
+void prefer_one_submit_per_graph() {
+#ifdef _WIN32
+    if (!getenv("GGML_VK_SUBMIT_DIVISOR")) _putenv_s("GGML_VK_SUBMIT_DIVISOR", "1");
+    if (!getenv("GGML_VK_SUBMIT_TAIL"))    _putenv_s("GGML_VK_SUBMIT_TAIL", "0");
+#else
+    if (!getenv("GGML_VK_SUBMIT_DIVISOR")) setenv("GGML_VK_SUBMIT_DIVISOR", "1", 0);
+    if (!getenv("GGML_VK_SUBMIT_TAIL"))    setenv("GGML_VK_SUBMIT_TAIL", "0", 0);
+#endif
+}
+
+// The nine weights of one layer, always in this order, so that a group's byte estimate and its
+// actual allocation cannot drift apart. Nine parallel arrays is how a wq gets uploaded where a
+// wk belongs, with no shape error anywhere to catch it.
+void layer_slots(const GpuStaticLayer& L, ggml_tensor** out9) {
+    out9[0] = L.attn_norm; out9[1] = L.wq; out9[2] = L.wk; out9[3] = L.wv; out9[4] = L.wo;
+    out9[5] = L.q_norm;    out9[6] = L.k_norm; out9[7] = L.ffn_norm; out9[8] = L.router;
+}
+
+void layer_unslot(GpuStaticLayer& L, ggml_tensor* const* in9) {
+    L.attn_norm = in9[0]; L.wq = in9[1]; L.wk = in9[2]; L.wv = in9[3]; L.wo = in9[4];
+    L.q_norm    = in9[5]; L.k_norm = in9[6]; L.ffn_norm = in9[7]; L.router = in9[8];
 }
 
 }  // namespace
@@ -216,6 +243,16 @@ bool GpuStatic::init(const GpuStaticConfig& cfg, ggml_tensor* out, std::string* 
     }
     src_out_ = out;
 
+    if (cfg_.layers) {
+        if (cfg_.n_layer <= 0 || cfg_.n_head <= 0 || cfg_.n_head_kv <= 0 ||
+            cfg_.head_dim <= 0 || cfg_.n_expert <= 0) {
+            *err = "sloi na kartu: geometrija ne zapolnena";
+            return false;
+        }
+        // Before the device exists, because ggml reads the submit knobs once at device init.
+        prefer_one_submit_per_graph();
+    }
+
     be_ = ggml_backend_vk_init(0);
     if (!be_) { *err = "ggml_backend_vk_init(0) ne udalsja"; return false; }
     buft_ = ggml_backend_vk_buffer_type(0);
@@ -262,7 +299,6 @@ bool GpuStatic::init(const GpuStaticConfig& cfg, ggml_tensor* out, std::string* 
         }
         st_ = GpuStaticStats();
     }
-
     GpuExperts::print_heaps("posle razmeshchenija staticheskoj golovy");
     printf("  --- kuda bufer OBJAZAN byl lech (pravilo find_properties) ---\n");
     for (const GpuStaticBuffer& b : bufs_info_) {
@@ -287,6 +323,31 @@ bool GpuStatic::init(const GpuStaticConfig& cfg, ggml_tensor* out, std::string* 
 }
 
 void GpuStatic::shutdown() {
+    for (LayerGraph& G : lg_) {
+        if (G.ga) ggml_gallocr_free(G.ga);
+    }
+    lg_.clear();
+    sites_.clear();
+    if (ctx_lg_) { ggml_free(ctx_lg_); ctx_lg_ = nullptr; }
+    if (buf_lin_) { ggml_backend_buffer_free(buf_lin_); buf_lin_ = nullptr; }
+    if (ctx_lin_) { ggml_free(ctx_lin_); ctx_lin_ = nullptr; }
+    t_lx_ = nullptr; t_pos_ = nullptr; t_mask_ = nullptr;
+    for (ggml_backend_buffer_t b : bufs_l_) {
+        if (b) ggml_backend_buffer_free(b);
+    }
+    bufs_l_.clear();
+    for (ggml_context* cx : ctxs_l_) {
+        if (cx) ggml_free(cx);
+    }
+    ctxs_l_.clear();
+    lw_.clear();
+    kv_k_.clear();
+    kv_v_.clear();
+    kv_pad_ = nullptr;
+    step_past_ = -1;
+    step_nkv_ = 0;
+    step_mask_sent_ = false;
+
     for (ggml_gallocr_t g : ga_) {
         if (g) ggml_gallocr_free(g);
     }
@@ -458,6 +519,597 @@ bool GpuStatic::verify_head(std::string* err) {
         }
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------------------
+// The layer path: attention, the residual, the FFN norm and the router, on the device
+//
+// 510.4 MB of attention weights plus 48.0 MB of routers against the head's 243.4 - the bigger
+// two thirds of the static half. What makes it a different piece of engineering from the head
+// is not the bytes, it is the CUTS: the head is one boundary per token and this is one per
+// LAYER, so everything here is arranged around making a crossing cheap rather than around
+// making a matmul fast.
+//
+// WHAT THE HEAD MEASUREMENT SAYS ABOUT THAT, because it corrects the plan this file was
+// written against. Per crossing, measured on the real model:
+//
+//     podjom       0.011 ms      the hidden state, 8 KiB, into a host-visible buffer
+//     ustrojstvo   4.833 ms      the matmul itself: 243 MB at about 50 GB/s
+//     zabor        0.852 ms      594 KiB per row, and the prefill blocks are eight rows
+//     -----------------------------------
+//     vsego        6.202 ms
+//
+// The 6.343 ms head cost was read as "the handoff costs more than reading the tensor". It does
+// not: 78% of it is the device kernel, and the fixed part of a crossing is well under a
+// millisecond. That is the number this stage lives or dies by, and it is far friendlier than
+// the 177 us x 48 = 8.5 ms the plan budgeted - that figure is the CONDVAR rendezvous
+// GpuExperts pays to hand work to a worker thread, and this path has no worker and no condvar.
+//
+// WHAT IS ON THE DEVICE AND WHY IT IS EVERYTHING, NOT ONLY THE MATMULS. Of the ~20 nodes in a
+// decode layer, only seven read a weight. The other thirteen - two norms, two ropes, the
+// softmax, the permutes and the copies into the cache - move almost nothing. They are here
+// anyway, because leaving them on the host would put the boundary between them: about twenty
+// crossings a layer instead of one. Cheap in bytes is not cheap in place.
+//
+// SUBMITS, WHICH ARE THE OTHER HALF OF THE CROSSING'S COST. ggml's Vulkan backend picks submit
+// points by mul_mat_bytes >= total_mat_mul_bytes / divisor, doubling the threshold for the
+// first three, so a graph with seven matmuls submits five or six times - each one a queue
+// submit at a measured 24.1 us. On a per-layer graph that is 120-145 us of pure submit, 6-7 ms
+// a token, which is a third of what this stage is trying to save. So the divisor is set to 1
+// here: one submit for the whole layer graph. That is safe precisely because the graph is
+// small - the reason upstream submits early is to bound how long one submission runs against
+// the two-second kernel timeout on Windows, and a 10 MB layer cannot approach it.
+//
+// THE KV CACHE COMES TOO, AND IT IS NOT OPTIONAL. Attention on the card with the cache on the
+// host would put the KQ product on one side and the projections on the other: three crossings
+// a layer instead of one, which is more than the whole stage is worth. So the cache is
+// allocated here, written here one position per step, and read here - and the prefill's
+// cache, which is computed on the host, is uploaded once before the first generated token.
+
+
+// The layer half of the residency, deferred to its own call for one reason that is not
+// arbitrary: the cache length is not known when the head is placed. n_kv_max comes from the
+// mode - pad32(n_ctx) in chat, pad32(prompt + gen) in the harness, pad32(prompt + steps + 1)
+// under --decode-check - and every one of those is decided after the model has loaded, while
+// the head has to exist before the first graph is built because every graph captures it.
+//
+// So: init() takes the head and sets the submit knobs (which ggml reads once, at device
+// init); this takes the attention weights, the routers and the cache, at the length the run
+// actually asked for. Between the two calls layers_on() is false and build_step keeps the CPU
+// attention block, which is the correct answer to "not placed yet" rather than a half state.
+bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::string* err) {
+    if (!on()) { *err = "ustrojstvo ne podnjato"; return false; }
+    if (!cfg_.layers) { *err = "sloi na kartu ne zaprosheny"; return false; }
+    if (!layers) { *err = "sloi na kartu bez tenzorov sloev"; return false; }
+    if (!lg_.empty()) { *err = "sloi na kartu uzhe razmeshcheny"; return false; }
+    if (n_kv_max <= 0 || n_kv_max % 32 != 0) {
+        *err = "sloi na kartu: dlina kesha objazana byt polozhitelnoj i kratnoj 32 - eto "
+               "dlina svjortki F16-umnozhenija, i pri nekratnoj ono molcha neverno";
+        return false;
+    }
+    cfg_.n_kv_max = n_kv_max;
+    if (!alloc_layers(layers, err)) return false;
+    if (!build_layer_graphs(err)) return false;
+    // The same for every layer graph, and for the same three reasons: the pipelines for the
+    // attention types are compiled here rather than inside the first generated token, the
+    // allocator has already run, and a backend that has no pipeline for one of these types
+    // aborts rather than returning an error - so it must abort at init, not at token one.
+    if (cfg_.layers) {
+        std::vector<float> zx(std::size_t(cfg_.n_embd), 0.0f);
+        // A one-position step against a 32-position window: the smallest aim that is legal.
+        if (!set_step(0, 32)) {
+            *err = "sloi na kartu: probnyj shag ne nacelilsja";
+            shutdown();
+            return false;
+        }
+        std::vector<float> zmask(32, 0.0f);
+        ggml_backend_tensor_set(t_mask_, zmask.data(), 0, 32 * sizeof(float));
+        step_mask_sent_ = true;
+        for (int il = 0; il < cfg_.n_layer; ++il) {
+            try {
+                ggml_backend_tensor_set(t_lx_, zx.data(), 0,
+                                        std::size_t(cfg_.n_embd) * sizeof(float));
+                ggml_backend_graph_compute(be_, lg_[std::size_t(il)].gf);
+            } catch (const std::exception& e) {
+                *err = std::string("probnyj prohod sloja ") + std::to_string(il) + ": " +
+                       e.what();
+                shutdown();
+                return false;
+            }
+        }
+        step_past_ = -1;
+        step_nkv_  = 0;
+        st_ = GpuStaticStats();
+    }
+    for (const GpuStaticBuffer& b : bufs_info_) {
+        GpuExperts::print_placement(b.what.c_str(), b.bytes);
+    }
+    return true;
+}
+
+bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
+    const int nl = cfg_.n_layer;
+    const int hd = cfg_.head_dim;
+    const int nkv_heads = cfg_.n_head_kv;
+    const std::size_t align = ggml_backend_buft_get_alignment(buft_);
+    const std::size_t max_buf = ggml_backend_buft_get_max_size(buft_);
+    auto padded = [&](std::size_t n) { return (n + align - 1) / align * align; };
+
+    // Per-layer bytes: nine weights plus the two halves of that layer's cache. Weights and
+    // cache share a buffer deliberately - keeping them apart would leave the cache at 201 MB
+    // for a 2048 context, which is UNDER the 256 MiB BAR window and would therefore be backed
+    // by system memory at 3.1 GB/s while every report still called it device-local.
+    std::vector<std::size_t> per_layer(std::size_t(nl), 0);
+    std::size_t total = 0;
+    const std::size_t kv_one = padded(std::size_t(ggml_type_size(GGML_TYPE_F16)) *
+                                      std::size_t(hd) * std::size_t(cfg_.n_kv_max) *
+                                      std::size_t(nkv_heads));
+    for (int il = 0; il < nl; ++il) {
+        ggml_tensor* s[9];
+        layer_slots(src[std::size_t(il)], s);
+        std::size_t b = 0;
+        for (int i = 0; i < 9; ++i) {
+            if (!s[i]) {
+                char m[160];
+                snprintf(m, sizeof(m), "sloj %d: ne hvataet tenzora vnimanija #%d", il, i);
+                *err = m;
+                return false;
+            }
+            if (type_is_interleaved(s[i]->type)) {
+                char m[240];
+                snprintf(m, sizeof(m),
+                         "sloj %d: tenzor vnimanija perepakovan v %s, a formy _R* Vulkan ne "
+                         "chitaet ni odnoj operaciej", il, ggml_type_name(s[i]->type));
+                *err = m;
+                return false;
+            }
+            if (!s[i]->data) {
+                *err = "tenzor vnimanija nedostupen hostu - zalivat neotkuda";
+                return false;
+            }
+            b += padded(ggml_nbytes(s[i]));
+        }
+        b += 2 * kv_one;
+        per_layer[std::size_t(il)] = b;
+        total += b;
+    }
+
+    // Grouping, and the whole rule is: every buffer must come out STRICTLY larger than the BAR
+    // window. find_properties accepts a memory type only if heap.size >= the buffer size, so a
+    // buffer that fits the 256 MiB window is put in it, and once the window is committed the
+    // driver backs the rest from system memory - a 40x penalty that measures as a working
+    // feature. A buffer larger than the window cannot be typed onto that heap at all.
+    const std::size_t min_group = kBarHeapCeiling + kOverBarMargin;
+    std::size_t n_groups = 1;
+    if (max_buf > 0 && total > max_buf) n_groups = (total + max_buf - 1) / max_buf;
+    const std::size_t cap_groups = total / min_group;
+    if (cap_groups == 0) {
+        n_groups = 1;   // one buffer, padded past the ceiling below
+    } else if (n_groups > cap_groups) {
+        char m[280];
+        snprintf(m, sizeof(m),
+                 "vnimanie i kesh %.1f MiB ne razlozhit: predel bekenda %.1f MiB trebuet %llu "
+                 "buferov, a bolshe %llu iz nih vyjdut <= 256 MiB i sjadut v BAR-kuchu",
+                 double(total) / 1048576.0, double(max_buf) / 1048576.0,
+                 (unsigned long long)n_groups, (unsigned long long)cap_groups);
+        *err = m;
+        return false;
+    }
+
+    // Layers per group, balanced, so the last group is never the small one - a 100 MiB
+    // remainder in the BAR heap is the exact failure this arrangement exists to avoid, and
+    // ggml's own max-size split has no reason to know that.
+    std::vector<int> first(n_groups + 1, 0);
+    for (std::size_t gi = 0; gi <= n_groups; ++gi) {
+        first[gi] = int((std::size_t(nl) * gi) / n_groups);
+    }
+    first[n_groups] = nl;
+
+    ctxs_l_.assign(n_groups, nullptr);
+    bufs_l_.assign(n_groups, nullptr);
+    lw_.assign(std::size_t(nl), GpuStaticLayer());
+    kv_k_.assign(std::size_t(nl), nullptr);
+    kv_v_.assign(std::size_t(nl), nullptr);
+
+    for (std::size_t gi = 0; gi < n_groups; ++gi) {
+        const int l0 = first[gi], l1 = first[gi + 1];
+        std::size_t gbytes = 0;
+        for (int il = l0; il < l1; ++il) gbytes += per_layer[std::size_t(il)];
+        std::size_t pad = 0;
+        if (gbytes <= min_group) pad = min_group - gbytes + align;
+
+        const std::size_t n_t = std::size_t(l1 - l0) * 11 + 4;
+        ggml_init_params ip = {ggml_tensor_overhead() * n_t + 4096, nullptr, true};
+        ggml_context* cx = ggml_init(ip);
+        if (!cx) { *err = "ggml_init dlja vesov sloev ne udalsja"; return false; }
+        ctxs_l_[gi] = cx;
+
+        for (int il = l0; il < l1; ++il) {
+            ggml_tensor* ss[9];
+            ggml_tensor* dd[9];
+            layer_slots(src[std::size_t(il)], ss);
+            for (int i = 0; i < 9; ++i) {
+                dd[i] = ggml_new_tensor(cx, ss[i]->type, GGML_MAX_DIMS, ss[i]->ne);
+                char nm[64];
+                snprintf(nm, sizeof(nm), "vk.blk%d.w%d", il, i);
+                ggml_set_name(dd[i], nm);
+                if (ggml_nbytes(dd[i]) != ggml_nbytes(ss[i])) {
+                    *err = "razmer tenzora vnimanija v videopamjati ne sovpal s modelju";
+                    return false;
+                }
+            }
+            layer_unslot(lw_[std::size_t(il)], dd);
+            // The cache, in exactly the host cache's layout: keys [head_dim, n_kv, heads] and
+            // values transposed within each head. Same shape and same type is what lets the
+            // prefill's cache be uploaded tensor for tensor rather than repacked on the way.
+            kv_k_[std::size_t(il)] = ggml_new_tensor_3d(cx, GGML_TYPE_F16, hd,
+                                                        cfg_.n_kv_max, nkv_heads);
+            kv_v_[std::size_t(il)] = ggml_new_tensor_3d(cx, GGML_TYPE_F16, cfg_.n_kv_max,
+                                                        hd, nkv_heads);
+        }
+        if (pad > 0) {
+            ggml_tensor* p = ggml_new_tensor_1d(cx, GGML_TYPE_F32,
+                                                int64_t(pad / sizeof(float)));
+            ggml_set_name(p, "vk.bar.padding.layers");
+            if (!kv_pad_) kv_pad_ = p;
+        }
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(cx, buft_);
+        if (!buf) {
+            char m[200];
+            snprintf(m, sizeof(m), "ne vydelilos %.1f MiB pod sloi %d..%d",
+                     double(gbytes + pad) / 1048576.0, l0, l1 - 1);
+            *err = m;
+            return false;
+        }
+        bufs_l_[gi] = buf;
+        const std::size_t sz = ggml_backend_buffer_get_size(buf);
+        vram_bytes_ += sz;
+        GpuStaticBuffer bi;
+        {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "vnimanie+kesh sloi %d..%d", l0, l1 - 1);
+            bi.what = nm;
+        }
+        bi.bytes = sz;
+        bi.padding = pad;
+        bi.over_bar = sz > kBarHeapCeiling;
+        bufs_info_.push_back(bi);
+        if (!bi.over_bar) {
+            *err = "bufer sloev <= 256 MiB - on sjadet v BAR-kuchu i chtenija shejdera "
+                   "upadut v sorok raz";
+            return false;
+        }
+
+        // In pieces, so the driver is never asked for a staging buffer the size of a tensor.
+        for (int il = l0; il < l1; ++il) {
+            ggml_tensor* ss[9];
+            ggml_tensor* dd[9];
+            layer_slots(src[std::size_t(il)], ss);
+            layer_slots(lw_[std::size_t(il)], dd);
+            for (int i = 0; i < 9; ++i) {
+                const std::size_t need = ggml_nbytes(ss[i]);
+                const char* sp = (const char*)ss[i]->data;
+                for (std::size_t off = 0; off < need; off += kUploadChunk) {
+                    const std::size_t n = std::min(kUploadChunk, need - off);
+                    ggml_backend_tensor_set(dd[i], sp + off, off, n);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool GpuStatic::build_layer_graphs(std::string* err) {
+    const int nl = cfg_.n_layer;
+    const int hd = cfg_.head_dim;
+    const int ne = cfg_.n_embd;
+    const int nh = cfg_.n_head;
+    const int nkvh = cfg_.n_head_kv;
+    const int dq = nh * hd;
+    const float kq_scale = 1.0f / std::sqrt(float(hd));
+    int sections[GGML_MROPE_SECTIONS] = {0};
+
+    // The per-step inputs. Small, so they land in the BAR window, which is exactly where a
+    // host-written input wants to be: ggml_vk_buffer_write takes the plain memcpy branch when
+    // the buffer is HOST_VISIBLE and pays a staging hop when it is not.
+    {
+        ggml_init_params ip = {ggml_tensor_overhead() * 8 + 4096, nullptr, true};
+        ctx_lin_ = ggml_init(ip);
+        if (!ctx_lin_) { *err = "ggml_init dlja vhodov sloja ne udalsja"; return false; }
+        t_lx_   = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, ne, 1);
+        t_pos_  = ggml_new_tensor_1d(ctx_lin_, GGML_TYPE_I32, 1);
+        t_mask_ = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, cfg_.n_kv_max, 1);
+        ggml_set_name(t_lx_, "vk.layer.x");
+        ggml_set_name(t_pos_, "vk.layer.pos");
+        ggml_set_name(t_mask_, "vk.layer.mask");
+        buf_lin_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_lin_, buft_);
+        if (!buf_lin_) { *err = "vhodnoj bufer sloja ne vydelilsja"; return false; }
+    }
+
+    const std::size_t nodes = 48;
+    ggml_init_params ip = {
+        (ggml_tensor_overhead() * (nodes + 24) + ggml_graph_overhead_custom(nodes, false))
+            * std::size_t(nl) + 8192,
+        nullptr, true};
+    ctx_lg_ = ggml_init(ip);
+    if (!ctx_lg_) { *err = "ggml_init dlja grafov sloev ne udalsja"; return false; }
+    ggml_context* c = ctx_lg_;
+    lg_.assign(std::size_t(nl), LayerGraph());
+    sites_.assign(std::size_t(nl), Site());
+
+    for (int il = 0; il < nl; ++il) {
+        LayerGraph& G = lg_[std::size_t(il)];
+        GpuStaticLayer& L = lw_[std::size_t(il)];
+        sites_[std::size_t(il)].self = this;
+        sites_[std::size_t(il)].il = il;
+
+        // Node for node the host's own qwen3moe decode block, in the host's own order. The
+        // point of this path is that the card computes the SAME quantity, not a rearranged
+        // one: this project has already lost days to a reassociation that produced correct
+        // tokens and 3-6% on the logits.
+        ggml_tensor* cur = t_lx_;
+        ggml_tensor* x = ggml_mul(c, ggml_rms_norm(c, cur, cfg_.rms_eps), L.attn_norm);
+
+        ggml_tensor* q = ggml_mul_mat(c, L.wq, x);
+        ggml_tensor* k = ggml_mul_mat(c, L.wk, x);
+        ggml_tensor* v = ggml_mul_mat(c, L.wv, x);
+
+        q = ggml_reshape_3d(c, q, hd, nh, 1);
+        q = ggml_mul(c, ggml_rms_norm(c, q, cfg_.rms_eps), L.q_norm);
+        q = ggml_rope_multi(c, q, t_pos_, nullptr, hd, sections, cfg_.rope_type,
+                            cfg_.n_ctx_train, cfg_.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        k = ggml_reshape_3d(c, k, hd, nkvh, 1);
+        k = ggml_mul(c, ggml_rms_norm(c, k, cfg_.rms_eps), L.k_norm);
+        k = ggml_rope_multi(c, k, t_pos_, nullptr, hd, sections, cfg_.rope_type,
+                            cfg_.n_ctx_train, cfg_.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+        ggml_tensor* Kc = ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));
+        ggml_tensor* Vc = ggml_cont(c, ggml_permute(
+            c, ggml_reshape_3d(c, v, hd, nkvh, 1), 1, 2, 0, 3));
+        ggml_tensor* kcache = kv_k_[std::size_t(il)];
+        ggml_tensor* vcache = kv_v_[std::size_t(il)];
+        ggml_tensor* kdst = ggml_view_3d(c, kcache, hd, 1, nkvh,
+                                         kcache->nb[1], kcache->nb[2], 0);
+        ggml_tensor* vdst = ggml_view_3d(c, vcache, 1, hd, nkvh,
+                                         vcache->nb[1], vcache->nb[2], 0);
+        ggml_tensor* kcpy = ggml_cpy(c, Kc, kdst);
+        ggml_tensor* vcpy = ggml_cpy(c, Vc, vdst);
+
+        ggml_tensor* Q = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));
+        ggml_tensor* K = ggml_view_3d(c, kcache, hd, cfg_.n_kv_max, nkvh,
+                                      kcache->nb[1], kcache->nb[2], 0);
+        ggml_tensor* V = ggml_view_3d(c, vcache, cfg_.n_kv_max, hd, nkvh,
+                                      vcache->nb[1], vcache->nb[2], 0);
+        ggml_tensor* kq = ggml_mul_mat(c, K, Q);
+        ggml_tensor* p = ggml_soft_max_ext(c, kq, t_mask_, kq_scale, 0.0f);
+        ggml_tensor* kqv = ggml_mul_mat(c, V, p);
+        kqv = ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), dq, 1);
+
+        ggml_tensor* ffn_inp = ggml_add(c, ggml_mul_mat(c, L.wo, kqv), cur);
+        ggml_tensor* xf = ggml_mul(c, ggml_rms_norm(c, ffn_inp, cfg_.rms_eps), L.ffn_norm);
+        ggml_tensor* rl = ggml_mul_mat(c, L.router, xf);
+
+        // One readback rather than three. Each ggml_backend_tensor_get on a device buffer the
+        // driver did not host-map is a submit and a fence; three of them per layer would treble
+        // the very item this stage exists to keep small. The router's logits go back RAW: the
+        // host's softmax and top-k stay the same ops in the same order they were before the
+        // card existed, so the routing decision does not move.
+        ggml_tensor* out = ggml_concat(c, ggml_concat(c, ffn_inp, xf, 0), rl, 0);
+        ggml_set_output(out);
+
+        ggml_cgraph* gf = ggml_new_graph_custom(c, nodes, false);
+        // The two cache writes go in first, exactly as the host graph orders them: the read
+        // views below are views of the same buffer rather than descendants of the copies, so
+        // nothing but insertion order puts the write before the read.
+        ggml_build_forward_expand(gf, kcpy);
+        ggml_build_forward_expand(gf, vcpy);
+        ggml_build_forward_expand(gf, out);
+
+        ggml_gallocr_t ga = ggml_gallocr_new(buft_);
+        if (!ga || !ggml_gallocr_reserve(ga, gf) || !ggml_gallocr_alloc_graph(ga, gf)) {
+            if (ga) ggml_gallocr_free(ga);
+            *err = "graf sloja ne razmestilsja";
+            return false;
+        }
+        // Every node, asked of the backend that is going to run it. A type with no pipeline
+        // aborts inside the backend rather than returning an error, so it has to be refused
+        // here - at init, before any token.
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor* node = ggml_graph_node(gf, i);
+            if (ggml_backend_supports_op(be_, node)) continue;
+            char b[256];
+            snprintf(b, sizeof(b),
+                     "bekend Vulkan ne podderzhivaet %s nad %s na sloe %d - vnimanie na kartu "
+                     "polozhit nelzja", ggml_op_name(node->op),
+                     node->src[0] ? ggml_type_name(node->src[0]->type) : "?", il);
+            ggml_gallocr_free(ga);
+            *err = b;
+            return false;
+        }
+        G.gf = gf;  G.ga = ga;  G.out = out;
+        G.kdst = kdst; G.vdst = vdst; G.kcpy = kcpy; G.vcpy = vcpy;
+        G.K = K; G.V = V; G.kq = kq; G.probs = p;
+        G.mapped = nullptr;
+        G.mapped_probed = false;
+    }
+    return true;
+}
+
+bool GpuStatic::set_step(int n_past, int n_kv) {
+    if (!cfg_.layers || lg_.empty()) return false;
+    // The multiple of 32 is not decoration: n_kv is the reduction length of the V*probs
+    // matmul, and this fork's F16 matmul is silently wrong when it is not a multiple of four.
+    // The padding positions are read and multiplied by the zero the -inf mask puts into probs,
+    // so they cost bytes and never correctness. Everything is validated before anything is
+    // patched, so a refusal leaves the graphs reading the whole allocation - slow and right.
+    if (n_kv <= 0 || n_kv % 32 != 0 || n_kv > cfg_.n_kv_max) return false;
+    if (n_past < 0 || n_past >= n_kv) return false;
+
+    auto restride = [](ggml_tensor* t, int64_t n0) {
+        t->ne[0] = n0;
+        t->nb[1] = t->nb[0] * std::size_t(t->ne[0]);
+        t->nb[2] = t->nb[1] * std::size_t(t->ne[1]);
+        t->nb[3] = t->nb[2] * std::size_t(t->ne[2]);
+    };
+    if (int(t_mask_->ne[0]) != n_kv) restride(t_mask_, n_kv);
+    for (LayerGraph& G : lg_) {
+        G.K->ne[1] = n_kv;    // strides belong to the cache, so only the extent moves
+        G.V->ne[0] = n_kv;
+        restride(G.kq, n_kv);
+        restride(G.probs, n_kv);
+    }
+    if (step_past_ != n_past) {
+        for (std::size_t il = 0; il < lg_.size(); ++il) {
+            LayerGraph& G = lg_[il];
+            ggml_tensor* kc = kv_k_[il];
+            ggml_tensor* vc = kv_v_[il];
+            const std::size_t ko = std::size_t(n_past) * kc->nb[1];
+            const std::size_t vo = std::size_t(n_past) * ggml_element_size(vc);
+            G.kdst->view_offs = ko;
+            G.kdst->data = (char*)kc->data + ko;
+            G.kcpy->view_offs = ko;
+            G.kcpy->data = G.kdst->data;
+            G.vdst->view_offs = vo;
+            G.vdst->data = (char*)vc->data + vo;
+            G.vcpy->view_offs = vo;
+            G.vcpy->data = G.vdst->data;
+        }
+        const int32_t pos = int32_t(n_past);
+        ggml_backend_tensor_set(t_pos_, &pos, 0, sizeof(int32_t));
+    }
+    step_past_ = n_past;
+    step_nkv_  = n_kv;
+    step_mask_sent_ = false;
+    return true;
+}
+
+bool GpuStatic::upload_kv(ggml_tensor* const* k, ggml_tensor* const* v, int n_layer,
+                          std::string* err) {
+    if (!cfg_.layers || lg_.empty()) { *err = "sloi ne na karte"; return false; }
+    if (n_layer != cfg_.n_layer) { *err = "chislo sloev ne sovpadaet"; return false; }
+    auto t0 = std::chrono::steady_clock::now();
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor* sk = k[std::size_t(il)];
+        ggml_tensor* sv = v[std::size_t(il)];
+        ggml_tensor* dk = kv_k_[std::size_t(il)];
+        ggml_tensor* dv = kv_v_[std::size_t(il)];
+        if (!sk || !sv || !dk || !dv) { *err = "kesh sloja otsutstvuet"; return false; }
+        if (ggml_nbytes(sk) != ggml_nbytes(dk) || ggml_nbytes(sv) != ggml_nbytes(dv) ||
+            sk->type != dk->type || sv->type != dv->type) {
+            char m[240];
+            snprintf(m, sizeof(m),
+                     "sloj %d: kesh hosta %.2f/%.2f MiB ne sovpal s keshem karty %.2f/%.2f "
+                     "MiB - n_kv_max karty i dlina kesha dvizhka objazany sovpadat", il,
+                     double(ggml_nbytes(sk)) / 1048576.0, double(ggml_nbytes(sv)) / 1048576.0,
+                     double(ggml_nbytes(dk)) / 1048576.0, double(ggml_nbytes(dv)) / 1048576.0);
+            *err = m;
+            return false;
+        }
+        for (int kind = 0; kind < 2; ++kind) {
+            ggml_tensor* s = kind == 0 ? sk : sv;
+            ggml_tensor* d = kind == 0 ? dk : dv;
+            const std::size_t total = ggml_nbytes(s);
+            const char* sp = (const char*)s->data;
+            for (std::size_t off = 0; off < total; off += kUploadChunk) {
+                const std::size_t n = std::min(kUploadChunk, total - off);
+                ggml_backend_tensor_set(d, sp + off, off, n);
+            }
+        }
+    }
+    ++st_.kv_uploads;
+    st_.kv_upload_ms += ms_since(t0);
+    return true;
+}
+
+void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
+                         const ggml_tensor* mask) {
+    auto t0 = std::chrono::steady_clock::now();
+    ++st_.layer_calls;
+    const std::size_t out_floats = std::size_t(2 * cfg_.n_embd + cfg_.n_expert);
+
+    if (!fail_msg_.empty()) { std::memset(dst->data, 0, ggml_nbytes(dst)); return; }
+    if (step_nkv_ <= 0) {
+        fail_msg_ = "set_step ne byl vyzvan pered grafom - shag ne naceljon";
+        std::memset(dst->data, 0, ggml_nbytes(dst));
+        return;
+    }
+    if (cur->type != GGML_TYPE_F32 || !ggml_is_contiguous(cur) ||
+        cur->ne[0] != cfg_.n_embd || ggml_nelements(cur) != cfg_.n_embd) {
+        fail_msg_ = "vhod sloja ne nepreryvnyj F32 [n_embd, 1]";
+        std::memset(dst->data, 0, ggml_nbytes(dst));
+        return;
+    }
+    if (std::size_t(ggml_nelements(dst)) != out_floats || !ggml_is_contiguous(dst)) {
+        fail_msg_ = "vyhod sloja ne [2*n_embd + n_expert, 1]";
+        std::memset(dst->data, 0, ggml_nbytes(dst));
+        return;
+    }
+
+    LayerGraph& G = lg_[std::size_t(il)];
+    try {
+        auto ta = std::chrono::steady_clock::now();
+        // The mask changes once per token, not once per layer. Uploading it on the first layer
+        // and not on the other forty-seven removes 47/48 of that transfer, and at long context
+        // the mask is the largest of the three inputs.
+        if (!step_mask_sent_) {
+            if (!mask || mask->type != GGML_TYPE_F32 || mask->ne[0] < step_nkv_) {
+                fail_msg_ = "maska vnimanija uzhe, chem naceleno pozicij";
+                std::memset(dst->data, 0, ggml_nbytes(dst));
+                return;
+            }
+            ggml_backend_tensor_set(t_mask_, mask->data, 0,
+                                    std::size_t(step_nkv_) * sizeof(float));
+            step_mask_sent_ = true;
+        }
+        ggml_backend_tensor_set(t_lx_, cur->data, 0,
+                                std::size_t(cfg_.n_embd) * sizeof(float));
+        auto tb = std::chrono::steady_clock::now();
+        ggml_backend_graph_compute(be_, G.gf);
+        auto tc = std::chrono::steady_clock::now();
+        // A small output lands in host-visible coherent memory on this driver, and the
+        // readback is then a memcpy through the mapping rather than a submit and a fence.
+        // Probed once, after the allocator has run, because the answer is a property of where
+        // the allocator put the buffer.
+        if (!G.mapped_probed) {
+            G.mapped_probed = true;
+            G.mapped = (const float*)ggml_backend_vk_tensor_mapped_ptr(G.out);
+        }
+        if (G.mapped) {
+            std::memcpy(dst->data, G.mapped, out_floats * sizeof(float));
+            ++st_.layer_readback_mapped;
+        } else {
+            ggml_backend_tensor_get(G.out, dst->data, 0, out_floats * sizeof(float));
+            ++st_.layer_readback_fenced;
+        }
+        auto td = std::chrono::steady_clock::now();
+        st_.layer_ms_upload += std::chrono::duration<double, std::milli>(tb - ta).count();
+        st_.layer_ms_device += std::chrono::duration<double, std::milli>(tc - tb).count();
+        st_.layer_ms_readback += std::chrono::duration<double, std::milli>(td - tc).count();
+    } catch (const std::exception& e) {
+        fail_msg_ = std::string("iskljuchenie na ustrojstve v sloe: ") + e.what();
+    } catch (...) {
+        fail_msg_ = "neizvestnoe iskljuchenie na ustrojstve v sloe";
+    }
+    if (!fail_msg_.empty()) std::memset(dst->data, 0, ggml_nbytes(dst));
+    st_.layer_ms_total += ms_since(t0);
+}
+
+void GpuStatic::layer_op(ggml_tensor* dst, const ggml_tensor* /*proto*/,
+                         const ggml_tensor* cur, const ggml_tensor* mask,
+                         int ith, int /*nth*/, void* ud) {
+    if (ith != 0) return;
+    Site* s = (Site*)ud;
+    s->self->do_layer(s->il, dst, cur, mask);
+}
+
+ggml_tensor* GpuStatic::layer(ggml_context* c, int il, ggml_tensor* cur, ggml_tensor* mask) {
+    // ggml_map_custom3's destination is a duplicate of its FIRST source, so the shape has to
+    // arrive as a tensor. proto is never read; it exists to say [2*n_embd + n_expert, 1].
+    ggml_tensor* proto = ggml_new_tensor_2d(c, GGML_TYPE_F32,
+                                            2 * cfg_.n_embd + cfg_.n_expert, 1);
+    return ggml_map_custom3(c, proto, cur, mask, layer_op, /*n_tasks=*/1,
+                            &sites_[std::size_t(il)]);
 }
 
 // ---------------------------------------------------------------------------------------

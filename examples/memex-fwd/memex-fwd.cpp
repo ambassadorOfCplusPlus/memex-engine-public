@@ -1207,7 +1207,16 @@ struct Graph {
         return true;
     }
 
-    bool aim_cache_writes(int n_past) { return aim_writes(writes, n_past); }
+    // True when the card owns the whole attention block, so this graph has no cache writes
+    // of its own to re-aim: GpuStatic::set_step aims the device graphs' write views instead.
+    // Kept here rather than at each call site because there are six of them and the failure
+    // of forgetting one is a refusal that reads like a bug in the cache arithmetic.
+    bool on_card = false;
+
+    bool aim_cache_writes(int n_past) {
+        if (on_card) return true;
+        return aim_writes(writes, n_past);
+    }
     // The slot append_live handed back, not a position. Same patch, different number, and
     // the distinction is the whole reason there are two lists.
     bool aim_zoned_writes(int slot) { return aim_writes(zwrites, slot); }
@@ -2058,11 +2067,54 @@ bool build_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
     const float kq_scale = 1.0f / std::sqrt(float(hd));
     int sections[GGML_MROPE_SECTIONS] = {0};
 
+    // The card takes the whole attention block, the residual, the FFN norm and the router -
+    // everything above the expert dispatch - as ONE node per layer. Not because the norms and
+    // the ropes are worth moving on their own (they move almost no bytes) but because leaving
+    // them behind would put the boundary between them: about twenty crossings a layer instead
+    // of one, and a crossing is priced in host coordination rather than in bytes. Cheap in
+    // bytes is not cheap in place.
+    //
+    // Decode only. A prefill is a different graph shape and is compute-bound rather than
+    // bandwidth-bound - measured monotonically worse on the card, 26.87 -> 12.34 -> 7.73 at
+    // ngl 0/8/16 - so the prompt stays on the host and its cache is uploaded once afterwards.
+    const bool card_layers =
+#ifdef MEMEX_FWD_GPU_EXPERTS
+        gstat && gstat->layers_on() && n_tokens == 1 && !zc;
+#else
+        false;
+#endif
+
+    g->on_card = card_layers;
+
     ggml_tensor* cur = ggml_get_rows(c, w.tok_embd, g->tokens);
     for (int il = 0; il < h.n_layer; ++il) {
         const Weights::Layer& L = w.layers[size_t(il)];
+        // The three quantities the feed-forward needs, wherever attention was computed: the
+        // attention output plus the residual, the FFN-normed hidden state, and the router's
+        // pre-softmax logits. Everything below this point is identical on both paths, which
+        // is the property that makes the card path checkable against the CPU one.
+        ggml_tensor* ffn_inp  = nullptr;
+        ggml_tensor* x        = nullptr;
+        ggml_tensor* logits_e = nullptr;
+#ifdef MEMEX_FWD_GPU_EXPERTS
+        if (card_layers) {
+            // [ffn_inp | ffn-normed hidden | router logits], three quantities in one readback
+            // because each readback is a submit and a fence. The logits come back PRE-softmax
+            // so the host's softmax and top-k are the same ops in the same order they were
+            // before the card existed: the routing decision does not move.
+            ggml_tensor* lay = gstat->layer(c, il, cur, g->mask);
+            ffn_inp  = ggml_reshape_2d(c, ggml_view_1d(c, lay, h.n_embd, 0), h.n_embd, 1);
+            x        = ggml_reshape_2d(c,
+                ggml_view_1d(c, lay, h.n_embd, size_t(h.n_embd) * sizeof(float)),
+                h.n_embd, 1);
+            logits_e = ggml_reshape_2d(c,
+                ggml_view_1d(c, lay, h.n_expert, size_t(2 * h.n_embd) * sizeof(float)),
+                h.n_expert, 1);
+        } else
+#endif
+        {
         ggml_tensor* inpSA = cur;
-        ggml_tensor* x = norm(c, cur, L.attn_norm, h.rms_eps);
+        x = norm(c, cur, L.attn_norm, h.rms_eps);
 
         ggml_tensor* q = ggml_mul_mat(c, L.wq, x);
         ggml_tensor* k = ggml_mul_mat(c, L.wk, x);
@@ -2174,10 +2226,11 @@ bool build_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
         }
         cur = ggml_add(c, ggml_mul_mat(c, L.wo, kqv), inpSA);
 
-        ggml_tensor* ffn_inp = cur;
+        ffn_inp = cur;
         x = norm(c, ffn_inp, L.ffn_norm, h.rms_eps);
+        logits_e = ggml_mul_mat(c, L.router, x);
+        }
 
-        ggml_tensor* logits_e = ggml_mul_mat(c, L.router, x);
         ggml_tensor* probs = ggml_soft_max(c, logits_e);
         // Expert reduction. The kernel already supports it: mul_mat_id skips an id of -1
         // and zeroes that output slice ("This is needed for SER", says the comment in
@@ -3305,6 +3358,15 @@ struct Generator {
                    "выделенных\n", want, n_kv_max);
         }
         set_graph_inputs(gr, *h, tk, nt, past, &ps, &mk);
+#ifdef MEMEX_FWD_GPU_EXPERTS
+        // The device graphs carry the same two numbers and have to be aimed by the same call,
+        // in the same place: a step aimed on one side and not the other reads the cache at one
+        // length and the mask at another, which is a wrong answer rather than an error.
+        if (gr.on_card && gstat && !gstat->set_step(past, want) && !aim_warned) {
+            aim_warned = true;
+            printf("не удалось нацелить шаг на карте: past %d, n_kv %d\n", past, want);
+        }
+#endif
     }
 
     // One graph per prompt length, which is why it is built here and thrown away: a chat turn
@@ -3334,6 +3396,18 @@ struct Generator {
         ggml_backend_tensor_get(pre.logits, out->data(), 0,
                                 sizeof(float) * size_t(h->n_vocab));
         pre.free_all();
+#ifdef MEMEX_FWD_GPU_EXPERTS
+        // The prompt ran on the host, so the card's cache is empty - and an empty cache still
+        // produces fluent text, because attention over zeros is attention over something. So
+        // it is copied rather than assumed, once per prompt, and the failure is fatal.
+        if (gstat && gstat->layers_on()) {
+            std::string uerr;
+            if (!gstat->upload_kv(kv.k.data(), kv.v.data(), h->n_layer, &uerr)) {
+                printf("кэш промпта не уехал на карту: %s\n", uerr.c_str());
+                return false;
+            }
+        }
+#endif
         return true;
     }
 
@@ -3871,6 +3945,10 @@ struct GpuStaticOpt {
     bool selftest = false;   // --gpu-static-selftest, no model needed
     int  rows     = 8;       // --gpu-static-rows, widest block of logit rows per dispatch
     int  reserve_mib = 384;  // --gpu-static-reserve
+    // --gpu-static-layers: the other two thirds of the static half. Attention is 510.4 MB and
+    // the routers another 48.0, against the head's 243.4 - but the head is one crossing per
+    // token and this is one per LAYER, so it is a different bet and it gets its own flag.
+    bool layers   = false;
 };
 
 // Off by default, and it stays off until it is MEASURED faster - not until it looks right.
@@ -4787,6 +4865,9 @@ int run_chat(llama_model* model, const std::string& model_path, const HParams& h
         }
     }
 
+    // No card here. run_chat takes neither the module nor the placement lambda, and it has no
+    // caller (see the byte-budget note in main), so wiring the card into it would be untested
+    // code reached by nothing. The card path lives in main's harness, which is what measures.
     const int n_kv_max = pad32(n_ctx);
     Generator gen;
     if (!gen.init(be, buft, &h, &w, nullptr, n_kv_max, min_experts, expert_thresh)) return 1;
@@ -5095,6 +5176,9 @@ int main(int argc, char** argv) {
 "                       iz 1714 MB, kotorye tokjen chitaet, i edinstvennaja chast statiki\n"
 "                       s ODNIM peresecheniem granicy za tokjen, a ne odnim na sloj\n"
 "  --gpu-static-verify  posle zalivki sverit kazhdyj bajt golovy s modelju\n"
+"  --gpu-static-layers  krome golovy - vsjo vnimanie (510.4 MB), marshrutizatory (48.0)\n"
+"                       i KV-kesh na kartu. Odin razrez na sloj: karta schitaet blok\n"
+"                       vnimanija, ostatok i normu FFN, host - ekspertov\n"
 "  --gpu-static-selftest    proverit ves mehanizm na sinteticheskoj golove, bez modeli\n"
 "  --gpu-static-rows N  shirina bloka logitov za odin dispatch (%d)\n"
 "  --gpu-static-reserve N   zapas videopamjati v MiB, kotoryj ne zanimat (%d)\n"
@@ -5217,6 +5301,17 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(a, "--gpu-static")) { sopt.on = true; }
         else if (!strcmp(a, "--gpu-static-verify")) { sopt.on = true; sopt.verify = true; }
+        else if (!strcmp(a, "--gpu-static-layers")) { sopt.on = true; sopt.layers = true; }
+        // Answered here, and it does nothing but exit zero. It is the queue's startability
+        // probe (bench/build_safe.ps1, Test-Startable): a binary that fails to load its DLLs
+        // dies before printing anything, with -1073741511 or -1073741515, and every log then
+        // reads like "the run produced no data" rather than "the run never happened". This
+        // engine used to answer it with "unknown flag" and exit 1, so the probe called every
+        // build broken and paid for a ten-minute clean rebuild to fix nothing.
+        else if (!strcmp(a, "--version")) {
+            printf("llama-memex-fwd (MemeX)\n");
+            return 0;
+        }
         else if (!strcmp(a, "--gpu-static-selftest")) { sopt.selftest = true; }
         else if (!strcmp(a, "--gpu-static-rows")) {
             if (want_val(i, a)) sopt.rows = atoi(argv[++i]);
@@ -5354,6 +5449,22 @@ int main(int argc, char** argv) {
     }
     if (bandwidth_gbs <= 0.0) {
         printf("--bandwidth должен быть положительным, получено %g\n", bandwidth_gbs);
+        return 1;
+    }
+    // Speculation verifies several drafted positions in one graph, which is a MULTI-token
+    // graph and therefore the host attention block - so it writes the host cache while the
+    // card's stays where the last single-token step left it. Copying the cache across per
+    // draft round is 200 MB a round and would cost more than the speculation is worth, and
+    // speculation is closed by measurement anyway (best arm 13.78 against a 14.04 baseline).
+    // Refused rather than left to produce a plausible wrong answer.
+    if (sopt.layers && (!draft_path.empty() || draft_max > 0)) {
+        printf("--gpu-static-layers vmeste so spekuljaciej nelzja: graf proverki chernovika "
+               "mnogotokennyj, on pishet kesh hosta, a shag chitaet kesh karty\n");
+        return 1;
+    }
+    if (sopt.layers && zopt.on) {
+        printf("--gpu-static-layers vmeste s --zoned nelzja: zonnyj kesh stroit svoj "
+               "podgraf vnimanija na hoste\n");
         return 1;
     }
 
@@ -5883,6 +5994,16 @@ int main(int argc, char** argv) {
         sc.max_rows = sopt.rows;
         sc.reserve = std::size_t(sopt.reserve_mib) << 20;
         sc.verify  = sopt.verify;
+        sc.layers  = sopt.layers;
+        sc.n_layer = h.n_layer;
+        sc.n_head  = h.n_head;
+        sc.n_head_kv = h.n_head_kv;
+        sc.head_dim  = h.head_dim;
+        sc.n_expert  = h.n_expert;
+        sc.n_ctx_train = h.n_ctx_train;
+        sc.rope_type = h.rope_type;
+        sc.rope_base = h.rope_base;
+        sc.rms_eps   = h.rms_eps;
         gstat.reset(new memex::GpuStatic());
         std::string serr;
         if (!gstat->init(sc, w.out, &serr)) {
@@ -5902,6 +6023,46 @@ int main(int argc, char** argv) {
     }
 #else
     (void)sopt;
+#endif
+
+#ifdef MEMEX_FWD_GPU_EXPERTS
+    // The nine attention tensors per layer, in the module's own struct. Named fields rather
+    // than nine parallel arrays because nine parallel arrays is how a wq gets uploaded where a
+    // wk belongs, with no shape error anywhere to catch it. Filled here, before any graph, and
+    // handed to init_layers once the run's cache length is known.
+    std::vector<memex::GpuStaticLayer> slayers;
+    if (gsp && gsp->config().layers) {
+        slayers.resize(std::size_t(h.n_layer));
+        for (int il = 0; il < h.n_layer; ++il) {
+            const Weights::Layer& L = w.layers[std::size_t(il)];
+            memex::GpuStaticLayer& S = slayers[std::size_t(il)];
+            S.attn_norm = L.attn_norm; S.wq = L.wq; S.wk = L.wk; S.wv = L.wv; S.wo = L.wo;
+            S.q_norm = L.q_norm; S.k_norm = L.k_norm; S.ffn_norm = L.ffn_norm;
+            S.router = L.router;
+        }
+    }
+    // Placing the attention weights needs the cache length, which every mode decides for
+    // itself, so this is a lambda called from each of them rather than a line here.
+    auto place_layers = [&](int n_kv_max) -> bool {
+        if (!gsp || !gsp->config().layers || gsp->layers_on()) return true;
+        std::string lerr;
+        const auto t_l = Clock::now();
+        if (!gsp->init_layers(slayers.data(), n_kv_max, &lerr)) {
+            printf("--gpu-static-layers: %s\n", lerr.c_str());
+            return false;
+        }
+        printf("\nvnimanie, marshrutizatory i KV-kesh na karte: %d sloev, kesh %d pozicij, "
+               "vsego %.1f MiB v videopamjati, za %.0f ms\n", h.n_layer, n_kv_max,
+               double(gsp->vram_bytes()) / 1048576.0, ms_since(t_l));
+        for (const memex::GpuStaticBuffer& b : gsp->buffers()) {
+            printf("  bufer: %-28s %8.2f MiB (nabivki %.2f MiB)  %s\n", b.what.c_str(),
+                   double(b.bytes) / 1048576.0, double(b.padding) / 1048576.0,
+                   b.over_bar ? "> 256 MiB - ne BAR" : "<= 256 MiB - MOG SEST V BAR");
+        }
+        return true;
+    };
+#else
+    auto place_layers = [&](int) { return true; };
 #endif
 
     ggml_backend_t be = ggml_backend_cpu_init();
@@ -6072,6 +6233,7 @@ int main(int argc, char** argv) {
                    "контекста\n", decode_check, n);
             return 1;
         }
+        if (!place_layers(n_kv_max)) return 1;
         Generator gen;
         gen.want_probes = (probe_name == "all");
         gen.gstat = gsp;
@@ -6185,6 +6347,7 @@ int main(int argc, char** argv) {
         // exist when the context is longer than the exact zones, so a run that wants to see
         // a tail has to be able to ask for one.
         const int n_kv_max = std::max(pad32(n + n_gen), pad32(n_ctx_req));
+        if (!place_layers(n_kv_max)) return 1;
         Cache kv;
         if (!kv.init(buft, h, n_kv_max)) {
             printf("кэш не выделился\n");
@@ -6373,6 +6536,15 @@ int main(int argc, char** argv) {
             ggml_backend_tensor_set(gr.positions, ps.data(), 0,
                                     sizeof(int32_t) * size_t(nt));
             ggml_backend_tensor_set(gr.mask, mk.data(), 0, ggml_nbytes(gr.mask));
+#ifdef MEMEX_FWD_GPU_EXPERTS
+            // The device graphs carry the same two numbers and are aimed by the same call, in
+            // the same place. A step aimed on one side only reads the cache at one length and
+            // the mask at another, which is a wrong answer rather than an error.
+            if (gr.on_card && gsp && !gsp->set_step(past, want) && !aim_warned) {
+                aim_warned = true;
+                printf("не удалось нацелить шаг на карте: past %d, n_kv %d\n", past, want);
+            }
+#endif
         };
         auto argmax_of = [&](const std::vector<float>& v) {
             return llama_token(std::max_element(v.begin(), v.end()) - v.begin());
@@ -6396,6 +6568,21 @@ int main(int argc, char** argv) {
         ggml_backend_graph_compute(be, pre.gf);
         ggml_backend_synchronize(be);
         ggml_backend_tensor_get(pre.logits, lg.data(), 0, sizeof(float) * size_t(h.n_vocab));
+#ifdef MEMEX_FWD_GPU_EXPERTS
+        // The prompt ran on the host, so the card's cache is empty - and an empty cache still
+        // produces fluent text, because attention over zeros is attention over something. So
+        // it is copied rather than assumed, once per prompt, and the failure is fatal.
+        if (gsp && gsp->layers_on()) {
+            std::string uerr;
+            const auto t_kv = Clock::now();
+            if (!gsp->upload_kv(kv.k.data(), kv.v.data(), h.n_layer, &uerr)) {
+                printf("кэш промпта не уехал на карту: %s\n", uerr.c_str());
+                return 1;
+            }
+            printf("  кэш промпта уехал на карту за %.0f мс (%.1f МБ)\n", ms_since(t_kv),
+                   double(kv.bytes(h)) / 1e6);
+        }
+#endif
 
         // Scratch for the resident set, allocated once: the residency mask the graph reads and
         // the two id lists it writes back. Sized here so no step allocates.
@@ -7051,6 +7238,22 @@ int main(int argc, char** argv) {
                    ss.ms_readback / calls);
             printf("  zabrano s karty %.2f MB za progon\n",
                    double(ss.readback_bytes) / 1e6);
+            if (ss.layer_calls > 0) {
+                const double lc = double(ss.layer_calls);
+                const double tk = double(n_gen > 0 ? n_gen : 1);
+                printf("vnimanie i marshrutizator na karte: %llu peresechenij, %.1f na "
+                       "tokjen\n", (unsigned long long)ss.layer_calls, lc / tk);
+                printf("  na odno peresechenie: vsego %.3f ms = podjom %.3f + ustrojstvo "
+                       "%.3f + zabor %.3f\n", ss.layer_ms_total / lc,
+                       ss.layer_ms_upload / lc, ss.layer_ms_device / lc,
+                       ss.layer_ms_readback / lc);
+                printf("  na tokjen %.2f ms; zaborov cherez otobrazhenie %llu, cherez "
+                       "zabor s zaborom %llu\n", ss.layer_ms_total / tk,
+                       (unsigned long long)ss.layer_readback_mapped,
+                       (unsigned long long)ss.layer_readback_fenced);
+                printf("  kesh prompta uehal na kartu %llu raz za %.0f ms\n",
+                       (unsigned long long)ss.kv_uploads, ss.kv_upload_ms);
+            }
             if (!gsp->failure().empty()) {
                 printf("  USTROJSTVO OTKAZALO: %s - logity nizhe nedejstvitelny\n",
                        gsp->failure().c_str());
