@@ -173,6 +173,93 @@ void GpuExperts::print_heaps(const char* when) {
 #endif
 }
 
+void GpuExperts::print_queues() {
+#ifdef MEMEX_FWD_VULKAN
+    VkApplicationInfo app{};
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.pApplicationName = "memex-fwd";
+    app.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ici.pApplicationInfo = &app;
+    VkInstance inst = VK_NULL_HANDLE;
+    if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) {
+        printf("  очереди устройства: экземпляр Vulkan не создался — НЕ ИЗМЕРЕНО\n");
+        return;
+    }
+    uint32_t n = 0;
+    vkEnumeratePhysicalDevices(inst, &n, nullptr);
+    if (n == 0) {
+        printf("  очереди устройства: ни одного физического устройства — НЕ ИЗМЕРЕНО\n");
+        vkDestroyInstance(inst, nullptr);
+        return;
+    }
+    std::vector<VkPhysicalDevice> devs(std::size_t(n));
+    vkEnumeratePhysicalDevices(inst, &n, devs.data());
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(devs[0], &nq, nullptr);
+    std::vector<VkQueueFamilyProperties> qfp(std::size_t(nq));
+    vkGetPhysicalDeviceQueueFamilyProperties(devs[0], &nq, qfp.data());
+
+    printf("  семейств очередей: %u\n", unsigned(nq));
+    for (uint32_t i = 0; i < nq; ++i) {
+        const VkQueueFlags f = qfp[std::size_t(i)].queueFlags;
+        char fl[128];
+        snprintf(fl, sizeof(fl), "%s%s%s%s%s",
+                 (f & VK_QUEUE_GRAPHICS_BIT)       ? "GRAPHICS "  : "",
+                 (f & VK_QUEUE_COMPUTE_BIT)        ? "COMPUTE "   : "",
+                 (f & VK_QUEUE_TRANSFER_BIT)       ? "TRANSFER "  : "",
+                 (f & VK_QUEUE_SPARSE_BINDING_BIT) ? "SPARSE "    : "",
+                 (f & VK_QUEUE_PROTECTED_BIT)      ? "PROTECTED " : "");
+        printf("    семейство %u: очередей %u, флаги 0x%02x = %s| метки времени %u бит, "
+               "гранулярность передачи %ux%ux%u%s\n",
+               unsigned(i), unsigned(qfp[std::size_t(i)].queueCount), unsigned(f), fl,
+               unsigned(qfp[std::size_t(i)].timestampValidBits),
+               unsigned(qfp[std::size_t(i)].minImageTransferGranularity.width),
+               unsigned(qfp[std::size_t(i)].minImageTransferGranularity.height),
+               unsigned(qfp[std::size_t(i)].minImageTransferGranularity.depth),
+               ((f & VK_QUEUE_TRANSFER_BIT) &&
+                !(f & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)))
+                   ? "  <-- ТОЛЬКО ПЕРЕДАЧА (DMA)" : "");
+    }
+
+    // ggml's own selection rule, reproduced rather than guessed at
+    // (ggml_vk_find_queue_family_index, ggml-vulkan.cpp:1585). Written as the same four
+    // fallbacks in the same order, because the answer that matters is not "does a DMA family
+    // exist" but "does OUR upload get submitted on it", and that is decided by this rule.
+    auto find_family = [&](VkQueueFlags required, VkQueueFlags avoid, int compute_index,
+                           uint32_t min_queues) -> int {
+        for (uint32_t i = 0; i < nq; ++i) {
+            if (qfp[i].queueCount >= min_queues && (compute_index < 0 || int(i) != compute_index)
+                && (qfp[i].queueFlags & required) && !(qfp[i].queueFlags & avoid)) return int(i);
+        }
+        for (uint32_t i = 0; i < nq; ++i) {
+            if (qfp[i].queueCount >= min_queues && (compute_index < 0 || int(i) != compute_index)
+                && (qfp[i].queueFlags & required)) return int(i);
+        }
+        for (uint32_t i = 0; i < nq; ++i) {
+            if (qfp[i].queueCount >= min_queues && (qfp[i].queueFlags & required)) return int(i);
+        }
+        for (uint32_t i = 0; i < nq; ++i) {
+            if (qfp[i].queueFlags & required) return int(i);
+        }
+        return compute_index;
+    };
+    const int cq = find_family(VK_QUEUE_COMPUTE_BIT, VK_QUEUE_GRAPHICS_BIT, -1, 1);
+    const int tq = find_family(VK_QUEUE_TRANSFER_BIT,
+                               VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT, cq, 1);
+    const bool separate = (cq >= 0 && tq >= 0 && cq != tq);
+    printf("    выбор ggml: счёт — семейство %d, передача — семейство %d — %s\n", cq, tq,
+           separate
+               ? "РАЗНЫЕ ОЧЕРЕДИ: подкачка идёт на своей, а не в порядке с диспатчами"
+               : "ОДНА И ТА ЖЕ: transfer_queue.copyFrom(compute_queue), подкачка стоит в "
+                 "той же очереди, что и счёт");
+    vkDestroyInstance(inst, nullptr);
+#else
+    printf("  очереди устройства: собрано без заголовков Vulkan — НЕ ИЗМЕРЕНО\n");
+#endif
+}
+
 void GpuExperts::print_placement(const char* what, std::size_t bytes) {
 #ifdef MEMEX_FWD_VULKAN
     VkApplicationInfo app{};
@@ -605,6 +692,9 @@ bool GpuExperts::init(const GpuExpertsConfig& cfg, ggml_tensor* const* up,
     }
 
     print_heaps("до размещения резидентных экспертов");
+    // Printed here, before any allocation, because it is a property of the device and not of
+    // this run: whether the prefetch CAN be asynchronous rather than take turns with compute.
+    print_queues();
     // A retry rather than a refusal: heapBudget is the driver's opinion at one instant and
     // the desktop can take a few tens of megabytes between the query and the allocation.
     std::string aerr;

@@ -7656,11 +7656,16 @@ int main(int argc, char** argv) {
                 const double gbs = promo_ms_gen > 0.0
                                        ? double(promo_by_gen) / 1e9 / (promo_ms_gen / 1000.0)
                                        : 0.0;
-                printf("PROMO_AB drain %d ring %d pinned %d promo %llu batches %llu "
-                       "per_batch %.4f promo_ms_tok %.4f ms_per_promo %.4f gbs %.4f "
-                       "mb_tok %.4f join_wait_tok %.4f job_tok %.4f cpu_tok %.4f "
+                // `match` rides along on purpose: a speed number from an arm whose arithmetic
+                // is broken is worse than no number (the barrier arm measured a 10% faster
+                // layer and 0 of 192 correct tokens), so the harness must be able to gate on
+                // correctness from the same line it reads the timings off.
+                printf("PROMO_AB drain %d ring %d pinned %d match %d of %d promo %llu "
+                       "batches %llu per_batch %.4f promo_ms_tok %.4f ms_per_promo %.4f "
+                       "gbs %.4f mb_tok %.4f join_wait_tok %.4f job_tok %.4f cpu_tok %.4f "
                        "fill_ms %.1f fill_promo %llu\n",
                        gxp->promo_drain(), gxp->stage_slots(), gxp->stage_pinned() ? 1 : 0,
+                       same, n_gen,
                        (unsigned long long)promo_n_gen, (unsigned long long)promo_b_gen,
                        promo_b_gen ? double(promo_n_gen) / double(promo_b_gen) : 0.0,
                        promo_ms_gen / tk2,

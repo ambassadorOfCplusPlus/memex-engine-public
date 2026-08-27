@@ -283,6 +283,24 @@ class GpuExperts {
     // is what has misled this project before.
     static void print_placement(const char* what, std::size_t bytes);
 
+    // EVERY QUEUE FAMILY THE DEVICE OFFERS, and which one a promotion is submitted on.
+    //
+    // The question this answers is whether the prefetch can be made asynchronous at all. Our
+    // promotions occupy the worker thread for milliseconds per token, and the worker is the
+    // thread the CPU joins on; a transfer-only queue family, backed by a DMA engine, copies
+    // WHILE the compute queue runs instead of taking turns with it. Whether this card has one
+    // is a fact about the hardware, and this project has been wrong four times in one day on
+    // exactly that class of assumption - the flagship case being "mul_mat_id is unavailable",
+    // which was false and cost half a day. So it is enumerated and printed, not assumed.
+    //
+    // The second half of the line is ggml's own choice, reproduced from
+    // ggml_vk_find_queue_family_index (ggml-vulkan.cpp:1585): the compute family is the first
+    // with COMPUTE preferring one without GRAPHICS, and the transfer family is the first with
+    // TRANSFER preferring one without COMPUTE or GRAPHICS and different from the compute
+    // family. It matters because ctx->transfer_cmd_pool is built on device->transfer_queue
+    // (ggml-vulkan.cpp:4162), so our batched uploads already go wherever that rule points.
+    static void print_queues();
+
   private:
     struct Site { GpuExperts* self = nullptr; int il = 0; };
 
