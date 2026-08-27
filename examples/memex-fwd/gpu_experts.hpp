@@ -162,6 +162,22 @@ struct GpuExpertsStats {
     // that wait is invisible in ms_job because ms_job starts after the dequeue.
     uint64_t fork_busy       = 0;   // forks that found the worker already inside a Vulkan call
     double   ms_promote      = 0.0; // worker time spent on promotions rather than dispatches
+    // WHAT THE 1.30 ms OF A PROMOTION IS MADE OF. Three of the four terms were priced rather
+    // than measured, and one of the three was priced wrong: the staging read was charged at
+    // 0.10 ms by dividing 2.51 MB by the machine's AGGREGATE 24.8 GB/s, which is neither one
+    // core's share nor a copy's two-sided traffic. 0.45 ms of 1.30 had no owner at all, and it
+    // is the only term that was never measured (rule 76 - a per-token figure whose parts come
+    // from different derivations is not an accounting).
+    //
+    // Cost of the instrument: six steady_clock::now() per promotion at ~25 ns, about 1 us per
+    // token against 8.98 ms. The check that this is really free is that period 3 is the arm
+    // the budget sweep already measured, so promo_ms_tok must come back at 8.99 (rule 69).
+    double   ms_read         = 0.0; // read_plain: mmap or GGUF -> pinned staging
+    double   ms_record       = 0.0; // recording the copy: batch_set_tensor or tensor_set
+    double   ms_fence        = 0.0; // batch_end: submit and wait on the fence
+    uint64_t n_read          = 0;   // read_plain calls: three per promotion
+    uint64_t read_bytes      = 0;   // bytes those calls moved
+    uint64_t n_fence_calls   = 0;   // batch_end calls that had anything recorded
     // --gpu-experts-check
     uint64_t checked       = 0;   // slots compared against the CPU's own resident half
     uint64_t zero_bad      = 0;   // slots the device does not own that came back non-zero

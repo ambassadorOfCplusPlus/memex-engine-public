@@ -3957,6 +3957,19 @@ struct ResidentOpt {
     // the device layer faster and the token slower - the candidate mechanism being that the
     // prefetch and the CPU's expert half compete for host memory bandwidth.
     bool freeze  = false;  // --resident-freeze
+    // --resident-trace N: print the hit rate of every N-token segment instead of only the
+    // whole-run average. An average cannot answer the question the refresh period exists for
+    // - does the set still ADAPT - because a set that never adapts and a set that adapts
+    // instantly have the same mean on a homogeneous prompt. What separates them is a prompt
+    // that changes domain partway and a hit rate resolved in time: the dip at the switch and
+    // how many periods it takes to come back.
+    //
+    // It traces the PROMPT WARM-UP as well as generation, and that is where the switch is
+    // expressible: generation is greedy self-feeding, so its domain is whatever the prompt
+    // left it in, while the prompt is ours to write. The warm-up walks the prefill's real
+    // router selections token by token through observe/end_token, i.e. exactly the same code
+    // path the generated tokens take.
+    int  trace   = 0;      // --resident-trace, tokens per segment; 0 = off
 
     bool on() const { return capacity > 0; }
     const char* policy_name() const { return lfu ? "lfu" : "lru"; }
@@ -5301,6 +5314,8 @@ int main(int argc, char** argv) {
 "  --resident-period N  обновлять набор каждые N токенов (%d)\n"
 "  --resident-budget N  максимум подкачек за обновление (%d; 0 — без ограничения)\n"
 "  --resident-policy P  lfu или lru (%s; lru — контроль, он проигрывает по подкачкам)\n"
+"  --resident-trace N   доля попаданий по отрезкам из N токенов, отдельно на промпте\n"
+"                       и на генерации: средняя не отличает адаптивный набор от замершего\n"
 "  --resident-freeze    после прогрева набор больше не меняется: ноль подкачек\n"
 "  --gpu-experts        считать резидентную половину на Vulkan ОДНОВРЕМЕННО с CPU\n"
 "                       (ВЫКЛЮЧЕНО по умолчанию; --resident без него оставляет обе\n"
@@ -5412,6 +5427,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--resident-period")) { if (want_val(i, a)) ropt.period = atoi(argv[++i]); }
         else if (!strcmp(a, "--resident-budget")) { if (want_val(i, a)) ropt.budget = atoi(argv[++i]); }
         else if (!strcmp(a, "--resident-freeze")) { ropt.freeze = true; }
+        else if (!strcmp(a, "--resident-trace")) { if (want_val(i, a)) ropt.trace = atoi(argv[++i]); }
         else if (!strcmp(a, "--gpu-experts")) { gopt.on = true; }
         else if (!strcmp(a, "--gpu-experts-check")) { gopt.on = true; gopt.check = true; }
         else if (!strcmp(a, "--gpu-experts-selftest")) { gopt.selftest = true; }
@@ -6691,6 +6707,13 @@ int main(int argc, char** argv) {
             printf("\nрезидентные эксперты: %d из %d на слой, окно %d токенов, обновление "
                    "каждые %d, бюджет %d, политика %s\n", ropt.capacity, h.n_expert,
                    ropt.window, ropt.period, ropt.budget, ropt.policy_name());
+            // ASCII, for the same reason PROMO_AB is ASCII, and it exists for rule 68: an
+            // arm whose setting is not confirmed from the run own output is not an arm.
+            // The capacity is here too because with --gpu-experts it is chosen by the
+            // device rather than by the flag.
+            printf("RSET_CFG period %d capacity %d window %d budget %d policy %s frozen %d\n",
+                   ropt.period, ropt.capacity, ropt.window, ropt.budget,
+                   ropt.policy_name(), ropt.freeze ? 1 : 0);
             printf("  один эксперт %.2f МБ, весь резидентный набор %.2f ГБ на %d слоёв\n",
                    expert_bytes_one(w, h) / 1e6,
                    expert_bytes_one(w, h) * double(ropt.capacity) * double(h.n_layer) / 1e9,
@@ -6827,6 +6850,12 @@ int main(int argc, char** argv) {
                     rsel.data() + size_t(il) * size_t(h.n_expert_used) * size_t(n), 0,
                     ggml_nbytes(t));
             }
+            // The segment trace, if asked. One ASCII line per segment for the same reason the
+            // PROMO_AB line is ASCII: a bench script on this machine cannot carry a Cyrillic
+            // match pattern. `phase warm` because the same trace runs over generation below,
+            // and the two are different populations - the warm-up walks a prompt we wrote, the
+            // generation walks the model's own continuation of it.
+            memex::ResidentStats seg_base = rset->stats();
             for (int t = 0; t < n; ++t) {
                 for (int il = 0; il < h.n_layer; ++il) {
                     rset->observe(il, rsel.data() +
@@ -6835,12 +6864,31 @@ int main(int argc, char** argv) {
                                   h.n_expert_used);
                 }
                 rset->end_token();
+                if (ropt.trace > 0 && (t + 1) % ropt.trace == 0) {
+                    const memex::ResidentStats sg = rset->stats().since(seg_base);
+                    printf("RSET_SEG phase warm tok %d hits %.4f promo %llu evict %llu "
+                           "refresh %llu\n",
+                           t + 1, 100.0 * sg.hit_rate(),
+                           (unsigned long long)sg.promotions,
+                           (unsigned long long)sg.evictions,
+                           (unsigned long long)sg.refreshes);
+                    seg_base = rset->stats();
+                }
             }
             rrep.warm = rset->stats();
             printf("  прогрев на промпте: %d токенов, попаданий %.1f%%, "
                    "в наборе слоя 0 теперь %d из %d\n", n, 100.0 * rrep.warm.hit_rate(),
                    rset->n_resident(0), ropt.capacity);
+            printf("RSET_WARM tokens %d hits %.4f resident %d promo %llu refresh %llu\n",
+                   n, 100.0 * rrep.warm.hit_rate(), rset->n_resident(0),
+                   (unsigned long long)rrep.warm.promotions,
+                   (unsigned long long)rrep.warm.refreshes);
         }
+
+        // Segment baseline for --resident-trace over the generated tokens. Taken here, after
+        // the warm-up, so the first generated segment is not contaminated by the prompt's.
+        memex::ResidentStats gen_seg_base;
+        if (rset) gen_seg_base = rset->stats();
 
         llama_token next = argmax_of(lg);
         gaps.push_back(top2_gap(lg));
@@ -7321,6 +7369,16 @@ int main(int argc, char** argv) {
                     rset->observe(il, rmerged.data(), h.n_expert_used);
                 }
                 rset->end_token();
+                if (ropt.trace > 0 && (i + 1) % ropt.trace == 0) {
+                    const memex::ResidentStats sg = rset->stats().since(gen_seg_base);
+                    printf("RSET_SEG phase gen tok %d hits %.4f promo %llu evict %llu "
+                           "refresh %llu\n",
+                           i + 1, 100.0 * sg.hit_rate(),
+                           (unsigned long long)sg.promotions,
+                           (unsigned long long)sg.evictions,
+                           (unsigned long long)sg.refreshes);
+                    gen_seg_base = rset->stats();
+                }
 
                 // The proof that the split is bookkeeping: the unsplit graph on the same
                 // token at the same position, and its logits. Only the first few steps,
@@ -7608,6 +7666,12 @@ int main(int argc, char** argv) {
             // per-promotion figure taken from it (13.07 / 6.9 = 1.89 ms) divided a total that
             // includes the fill by a rate that excludes it. Both are subtracted here.
             const double   promo_ms_gen = gs.ms_promote  - gx_fill_base.ms_promote;
+            // The decomposition of that time, generation only. Same subtraction, same reason:
+            // the first fill uploaded 576 experts and no generated token paid for it.
+            const double   promo_rd_gen  = gs.ms_read   - gx_fill_base.ms_read;
+            const double   promo_rec_gen = gs.ms_record - gx_fill_base.ms_record;
+            const double   promo_fe_gen  = gs.ms_fence  - gx_fill_base.ms_fence;
+            const uint64_t promo_rdby_gen = gs.read_bytes - gx_fill_base.read_bytes;
             const uint64_t promo_n_gen  = gs.promotions  - gx_fill_base.promotions;
             const uint64_t promo_by_gen = gs.promo_bytes - gx_fill_base.promo_bytes;
             const uint64_t promo_b_gen  = (gs.batch_fences + gs.upload_fences_unbatched)
@@ -7689,6 +7753,34 @@ int main(int argc, char** argv) {
                        promo_b_gen ? double(promo_n_gen) / double(promo_b_gen) : 0.0,
                        promo_n_gen ? promo_ms_gen / double(promo_n_gen) : 0.0,
                        promo_ms_gen / tk, gx_fill_base.ms_promote);
+                // WHERE THOSE MILLISECONDS GO, measured rather than priced. Until this line
+                // existed the 1.30 ms of a promotion was accounted as 0.10 (staging read,
+                // PRICED as 2.51 MB / 24.8 GB/s) + 0.64 (PCIe, priced) + 0.10 (submit+fence,
+                // measured indirectly by the drain), leaving 0.45 ms with no owner - the only
+                // term in the whole card path that had never been measured at all.
+                //
+                // Note what the read is: with the experts unrepacked it is a plain host memcpy
+                // from the mapping into the pinned staging ring, with no Vulkan in it at all.
+                // If it is the missing term, then a third of the prefetch's hold on the card
+                // thread can be moved off that thread with no fence and no queue-family
+                // ownership transfer whatsoever.
+                if (promo_n_gen > 0) {
+                    const double pn = double(promo_n_gen);
+                    const double rest = promo_ms_gen - promo_rd_gen - promo_rec_gen
+                                      - promo_fe_gen;
+                    printf("      из чего состоит подкачка (мс на подкачку): чтение %.3f, "
+                           "запись копии %.3f, submit+забор %.3f, ОСТАТОК %.3f; "
+                           "всего %.3f\n",
+                           promo_rd_gen / pn, promo_rec_gen / pn, promo_fe_gen / pn,
+                           rest / pn, promo_ms_gen / pn);
+                    printf("        чтение: %llu вызовов, %.2f МБ, %.2f ГБ/с — это memcpy из "
+                           "отображения в закреплённую память, Vulkan в нём нет\n",
+                           (unsigned long long)(gs.n_read - gx_fill_base.n_read),
+                           double(promo_rdby_gen) / 1e6,
+                           promo_rd_gen > 0.0
+                               ? double(promo_rdby_gen) / 1e9 / (promo_rd_gen / 1000.0)
+                               : 0.0);
+                }
             }
             // One ASCII line for the bench harness. Everything above is in Cyrillic, and
             // PowerShell on this machine reads an unmarked script file as ANSI, so a bench
@@ -7708,7 +7800,9 @@ int main(int argc, char** argv) {
                 printf("PROMO_AB drain %d yield %d ring %d pinned %d match %d of %d promo %llu "
                        "batches %llu per_batch %.4f promo_ms_tok %.4f ms_per_promo %.4f "
                        "gbs %.4f mb_tok %.4f join_wait_tok %.4f job_tok %.4f cpu_tok %.4f "
-                       "fill_ms %.1f fill_promo %llu budget %d frozen %d hits %.4f\n",
+                       "fill_ms %.1f fill_promo %llu budget %d frozen %d hits %.4f "
+                       "period %d capacity %d rd_promo %.4f rec_promo %.4f "
+                       "fe_promo %.4f rest_promo %.4f rd_gbs %.4f\n",
                        gxp->promo_drain(), gxp->promo_yield() ? 1 : 0, gxp->stage_slots(),
                        gxp->stage_pinned() ? 1 : 0,
                        same, n_gen,
@@ -7720,7 +7814,15 @@ int main(int argc, char** argv) {
                        gs.ms_join_wait / tk2, gs.ms_job / tk2, gs.ms_cpu_half / tk2,
                        gx_fill_base.ms_promote,
                        (unsigned long long)gx_fill_base.promotions,
-                       ropt.budget, ropt.freeze ? 1 : 0, 100.0 * rrep.gen.hit_rate());
+                       ropt.budget, ropt.freeze ? 1 : 0, 100.0 * rrep.gen.hit_rate(),
+                       ropt.period, ropt.capacity,
+                       promo_n_gen ? promo_rd_gen  / double(promo_n_gen) : 0.0,
+                       promo_n_gen ? promo_rec_gen / double(promo_n_gen) : 0.0,
+                       promo_n_gen ? promo_fe_gen  / double(promo_n_gen) : 0.0,
+                       promo_n_gen ? (promo_ms_gen - promo_rd_gen - promo_rec_gen -
+                                      promo_fe_gen) / double(promo_n_gen) : 0.0,
+                       promo_rd_gen > 0.0
+                           ? double(promo_rdby_gen) / 1e9 / (promo_rd_gen / 1000.0) : 0.0);
             }
             printf("  где что лежит         : веса экспертов — Vulkan (%.2f ГиБ, "
                    "%zu буфер(а/ов) > 256 МиБ); вход, идентификаторы, выход половины — "

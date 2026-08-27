@@ -1233,6 +1233,11 @@ bool GpuExperts::upload(int il, int slot, int expert) {
 
     std::size_t o = 0;
     bool all_batched = batching_;
+    // Accumulated locally and folded in under mu_ at the end, so the timing costs no extra
+    // lock and cannot itself become the thing being measured.
+    double rd_ms = 0.0, rec_ms = 0.0;
+    std::size_t rd_bytes = 0;
+    int rd_calls = 0;
     for (int i = 0; i < 3; ++i) {
         const std::size_t n = desc(il, i).slab;
         char* sp = base + o;
@@ -1240,7 +1245,13 @@ bool GpuExperts::upload(int il, int slot, int expert) {
         // stage_ belongs to this thread: upload() is reached only from worker_loop and
         // flush_layer, both of which run on the worker.
         std::string rerr;
-        if (!read_plain(il, i, expert, sp, &rerr)) {
+        const auto t_rd = std::chrono::steady_clock::now();
+        const bool rd_ok = read_plain(il, i, expert, sp, &rerr);
+        rd_ms += std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - t_rd).count();
+        rd_bytes += n;
+        ++rd_calls;
+        if (!rd_ok) {
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 failed_   = true;
@@ -1257,6 +1268,7 @@ bool GpuExperts::upload(int il, int slot, int expert) {
         // just not cheap. A refused record closes the batch first, so a synchronous write is
         // never interleaved with copies already recorded into an open command buffer.
         bool recorded = false;
+        const auto t_rec = std::chrono::steady_clock::now();
         if (batching_) {
             recorded = ggml_backend_vk_batch_set_tensor(be_, d[i], sp, std::size_t(slot) * n, n);
             if (!recorded) batch_end();
@@ -1265,6 +1277,8 @@ bool GpuExperts::upload(int il, int slot, int expert) {
             all_batched = false;
             ggml_backend_tensor_set(d[i], sp, std::size_t(slot) * n, n);
         }
+        rec_ms += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t_rec).count();
     }
     const uint32_t tag = (uint32_t(il) << 16) | uint32_t(expert & 0xffff);
     if (all_batched) {
@@ -1275,6 +1289,10 @@ bool GpuExperts::upload(int il, int slot, int expert) {
     std::lock_guard<std::mutex> lk(mu_);
     ++st_.promotions;
     st_.promo_bytes += bpe_;
+    st_.ms_read   += rd_ms;
+    st_.ms_record += rec_ms;
+    st_.n_read    += uint64_t(rd_calls);
+    st_.read_bytes += uint64_t(rd_bytes);
     if (!all_batched) {
         ++st_.upload_fences_unbatched;
         // ggml_backend_tensor_set is synchronous on this backend, so by here the bytes are in
@@ -1323,14 +1341,21 @@ void GpuExperts::batch_begin() {
 void GpuExperts::batch_end() {
     if (!batching_) return;
     const bool had_work = batch_used_ > 0;
+    const auto t_fe = std::chrono::steady_clock::now();
     ggml_backend_vk_batch_end(be_);
+    const double fe_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - t_fe).count();
     batching_   = false;
     batch_used_ = 0;
     // batch_end waits on the fence, so everything this batch recorded is now in device memory.
     // That, and only that, is what a landing confirmation means.
     if (had_work || !batch_landed_.empty()) {
         std::lock_guard<std::mutex> lk(mu_);
-        if (had_work) ++st_.batch_fences;
+        if (had_work) {
+            ++st_.batch_fences;
+            st_.ms_fence += fe_ms;
+            ++st_.n_fence_calls;
+        }
         landed_.insert(landed_.end(), batch_landed_.begin(), batch_landed_.end());
     }
     batch_landed_.clear();
