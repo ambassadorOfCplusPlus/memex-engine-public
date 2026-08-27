@@ -220,6 +220,11 @@ int ResidentSet::choose_lru(const Layer& L, int cap) {
 }
 
 void ResidentSet::refresh_layer(Layer& L) {
+    // Frozen: the set is whatever the warm-up left. Returning here rather than clipping the
+    // budget to zero keeps the eviction side still too, so the arm is a genuinely STATIC set
+    // rather than one that shrinks - a shrinking set would confound "fewer promotions" with
+    // "fewer resident experts", and those are the two things this arm exists to separate.
+    if (frozen_) return;
     // Never more than the window has actually seen. Filling the rest of the capacity with
     // experts of count zero would look like a warm set and would charge a promotion for every
     // one of them, so early promotions per token would be reported far above what the policy

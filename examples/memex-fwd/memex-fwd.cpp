@@ -3952,6 +3952,11 @@ struct ResidentOpt {
     int period   = 3;      // --resident-period, tokens
     int budget   = 8;      // --resident-budget, promotions per refresh
     bool lfu     = true;   // --resident-policy lfu | lru
+    // --resident-freeze: after the warm-up the set stops changing. Zero promotions is the
+    // extreme end of the budget sweep, and the sweep exists because two changes in a row made
+    // the device layer faster and the token slower - the candidate mechanism being that the
+    // prefetch and the CPU's expert half compete for host memory bandwidth.
+    bool freeze  = false;  // --resident-freeze
 
     bool on() const { return capacity > 0; }
     const char* policy_name() const { return lfu ? "lfu" : "lru"; }
@@ -5296,6 +5301,7 @@ int main(int argc, char** argv) {
 "  --resident-period N  обновлять набор каждые N токенов (%d)\n"
 "  --resident-budget N  максимум подкачек за обновление (%d; 0 — без ограничения)\n"
 "  --resident-policy P  lfu или lru (%s; lru — контроль, он проигрывает по подкачкам)\n"
+"  --resident-freeze    после прогрева набор больше не меняется: ноль подкачек\n"
 "  --gpu-experts        считать резидентную половину на Vulkan ОДНОВРЕМЕННО с CPU\n"
 "                       (ВЫКЛЮЧЕНО по умолчанию; --resident без него оставляет обе\n"
 "                        половины на CPU. Без --resident N ёмкость выбирается по\n"
@@ -5405,6 +5411,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--resident-window")) { if (want_val(i, a)) ropt.window = atoi(argv[++i]); }
         else if (!strcmp(a, "--resident-period")) { if (want_val(i, a)) ropt.period = atoi(argv[++i]); }
         else if (!strcmp(a, "--resident-budget")) { if (want_val(i, a)) ropt.budget = atoi(argv[++i]); }
+        else if (!strcmp(a, "--resident-freeze")) { ropt.freeze = true; }
         else if (!strcmp(a, "--gpu-experts")) { gopt.on = true; }
         else if (!strcmp(a, "--gpu-experts-check")) { gopt.on = true; gopt.check = true; }
         else if (!strcmp(a, "--gpu-experts-selftest")) { gopt.selftest = true; }
@@ -6924,6 +6931,16 @@ int main(int argc, char** argv) {
                 // uploader during the warm-up, and a set that could never activate would warm
                 // to nothing.
                 rset->set_deferred(true);
+                // Frozen from here on, if asked: the set is exactly what the prompt built,
+                // and generation spends nothing on the link. Switched on at the same point
+                // as deferred activation and for the same reason - the warm-up has to have
+                // happened, or the arm measures an empty cache instead of a static one.
+                if (ropt.freeze) {
+                    rset->set_frozen(true);
+                    printf("  НАБОР ЗАМОРОЖЕН (--resident-freeze): за генерацию ноль "
+                           "подкачек и ноль вытеснений; попадания падают, и это плечо "
+                           "проверяет, покупает ли это время\n");
+                }
                 printf("  отложенная активация: ВКЛЮЧЕНА — промоушен считается резидентным "
                        "только после подтверждения байтов в видеопамяти; до тех пор эксперт "
                        "считается на CPU и слой его не ждёт\n");
@@ -7691,7 +7708,7 @@ int main(int argc, char** argv) {
                 printf("PROMO_AB drain %d yield %d ring %d pinned %d match %d of %d promo %llu "
                        "batches %llu per_batch %.4f promo_ms_tok %.4f ms_per_promo %.4f "
                        "gbs %.4f mb_tok %.4f join_wait_tok %.4f job_tok %.4f cpu_tok %.4f "
-                       "fill_ms %.1f fill_promo %llu\n",
+                       "fill_ms %.1f fill_promo %llu budget %d frozen %d hits %.4f\n",
                        gxp->promo_drain(), gxp->promo_yield() ? 1 : 0, gxp->stage_slots(),
                        gxp->stage_pinned() ? 1 : 0,
                        same, n_gen,
@@ -7702,7 +7719,8 @@ int main(int argc, char** argv) {
                        gbs, double(promo_by_gen) / tk2 / 1e6,
                        gs.ms_join_wait / tk2, gs.ms_job / tk2, gs.ms_cpu_half / tk2,
                        gx_fill_base.ms_promote,
-                       (unsigned long long)gx_fill_base.promotions);
+                       (unsigned long long)gx_fill_base.promotions,
+                       ropt.budget, ropt.freeze ? 1 : 0, 100.0 * rrep.gen.hit_rate());
             }
             printf("  где что лежит         : веса экспертов — Vulkan (%.2f ГиБ, "
                    "%zu буфер(а/ов) > 256 МиБ); вход, идентификаторы, выход половины — "

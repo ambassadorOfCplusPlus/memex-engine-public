@@ -173,6 +173,23 @@ class ResidentSet {
     void set_deferred(bool on) { deferred_ = on; }
     bool deferred() const { return deferred_; }
 
+    // FROZEN: the set stops changing. No promotions, no evictions, the window keeps counting
+    // (so the hit rate stays comparable), and refresh() becomes bookkeeping only.
+    //
+    // This is an instrument, and the question it answers is not "is churn good" but where the
+    // card's win comes from. Two changes in a row made the DEVICE layer faster and the TOKEN
+    // slower - batching the prefetch (-7.7% layer, -2.1% token) and removing the barriers
+    // (-10.0% / -2.4%) - and the candidate mechanism is that the card and the CPU share host
+    // memory bandwidth: the prefetch reads host RAM (mmap, then the pinned staging buffer)
+    // and so does the CPU's half of the experts, which is bandwidth-bound. If that is right,
+    // spending FEWER promotions makes the token faster while the hit rate gets worse, which
+    // nothing else in this design would explain. Frozen is the extreme of that sweep.
+    //
+    // Set after the warm-up, not at construction: the set has to be built from the prompt
+    // first, or the arm measures an empty cache rather than a static one.
+    void set_frozen(bool on) { frozen_ = on; }
+    bool frozen() const { return frozen_; }
+
     bool is_pending(int layer, int expert) const {
         const uint64_t* b = layers_[std::size_t(layer)].pend.data();
         return (b[unsigned(expert) >> 6] >> (unsigned(expert) & 63)) & 1u;
@@ -262,6 +279,7 @@ class ResidentSet {
     // exactly as it did before this existed - which is what keeps --gpu-experts-selftest and
     // the CPU-only bookkeeping arm unchanged.
     bool deferred_ = false;
+    bool frozen_   = false;
 
     // Scratch, so a refresh allocates nothing. It runs 48 times every three tokens.
     std::vector<int16_t>  rank_;        // n_experts, permuted by the ranking

@@ -857,7 +857,14 @@ bool GpuExperts::init(const GpuExpertsConfig& cfg, ggml_tensor* const* up,
     // mode (batch_begin/batch_end are no-ops and every matrix keeps its own fence), so a drain
     // would only make an arriving dispatch queue behind several synchronous writes.
     {
-        promo_drain_ = stage_pinned_ ? stage_slots_ : 1;
+        // DEFAULT ONE, i.e. the pre-drain behaviour, because the drain was MEASURED at -2.1%
+        // on the token (three rounds, spreads 0.5% and 0.8%). The mechanism works exactly as
+        // designed - 6.77 promotions per fence instead of 1.00, prefetch 8.96 -> 8.26 ms/token,
+        // device layer 29.63 -> 27.36 ms - and the token still got slower, so it does not go in
+        // the default path. It stays behind the switch rather than being deleted because it may
+        // net positive combined with a smaller promotion budget, and rebuilding it to find out
+        // would cost more than keeping it.
+        promo_drain_ = 1;
         if (const char* e = getenv("MEMEX_PROMO_DRAIN")) {
             const int v = atoi(e);
             if (v >= 1) promo_drain_ = v;
