@@ -1195,6 +1195,27 @@ static bool vk_submit_tail    = true;
 // ---------------------------------------------------------------------------------------
 static bool vk_no_sync = false;
 
+// ---------------------------------------------------------------------------------------
+// MemeX: GGML_VK_NARROW_SYNC=1 drops the TRANSFER access bits from the barrier on the compute
+// queue, leaving eShaderRead | eShaderWrite.
+//
+// Also an instrument, and for the same reason as vk_no_sync: it is the ceiling of a correct
+// change, not the change. The correct version has to know whether a transfer command was
+// recorded into this context since the last barrier - a shader reading a buffer that
+// vkCmdCopyBuffer has just written genuinely needs eTransferWrite -> eShaderRead - and that
+// means a flag maintained at every transfer recording site. Worth writing only if narrowing
+// recovers a useful share of the 2.59 us that removing the barrier entirely recovers.
+//
+// Why this is the shape of the follow-up rather than the conditional barrier the task asked
+// for. Measured: turning the barrier off saves 2.59 us per dispatch and does NOT let anything
+// overlap (chain/fan stays 1.00x either way). So the cost is the barrier itself, not what it
+// forbids - and on AMD a barrier carrying eTransferRead | eTransferWrite asks for a level-two
+// cache writeback and invalidate that a shader-to-shader dependency does not need. A
+// CONDITIONAL barrier could be dropped at four of the layer's nineteen dispatches; a NARROWER
+// one applies to all nineteen. Same measured cost, five times the reach.
+// ---------------------------------------------------------------------------------------
+static bool vk_narrow_sync = false;
+
 // GGML_VK_SUBMIT_STATS=1 prints, at backend teardown, how many graphs went through
 // graph_compute, how many nodes and how many submits they contained, and how long the host spent
 // inside graph_compute in total.
@@ -1823,14 +1844,21 @@ static void ggml_vk_sync_buffers(vk_context& ctx) {
 
     const bool transfer_queue = ctx->p->q->transfer_only;
 
+    // MemeX: see vk_narrow_sync. On the compute queue the shader-to-shader dependency needs
+    // only the shader bits; the transfer bits are what make this a cache flush.
+    const vk::AccessFlags acc =
+        transfer_queue
+            ? (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite)
+            : (vk_narrow_sync
+                   ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite)
+                   : (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+                      vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite));
+
     ctx->s->buffer.pipelineBarrier(
         ctx->p->q->stage_flags,
         ctx->p->q->stage_flags,
         {},
-        { {
-          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) },
-          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) }
-        } },
+        { { { acc }, { acc } } },
         {},
         {}
     );
@@ -3950,6 +3978,7 @@ static void ggml_vk_instance_init() {
     vk_submit_tail    = ggml_vk_env_int("GGML_VK_SUBMIT_TAIL",    1) != 0;
     vk_submit_stats   = ggml_vk_env_int("GGML_VK_SUBMIT_STATS",   0) != 0;
     vk_no_sync        = ggml_vk_env_int("GGML_VK_NO_SYNC",        0) != 0;
+    vk_narrow_sync    = ggml_vk_env_int("GGML_VK_NARROW_SYNC",    0) != 0;
     if (vk_submit_nodes < 1) {
         vk_submit_nodes = 1;
     }
@@ -10154,11 +10183,12 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
         // Whether GGML_VK_NO_SYNC took. An unapplied setting and a useless one look identical
         // from tok/s, and telling them apart is the whole reason rule 68 exists.
         fprintf(stderr,
-                "ggml_vulkan barjery: vydano %llu, propushcheno %llu (GGML_VK_NO_SYNC %s)
-",
+                "ggml_vulkan barjery: vydano %llu, propushcheno %llu (GGML_VK_NO_SYNC %s)\n",
                 (unsigned long long) vk_stat_sync_issued,
                 (unsigned long long) vk_stat_sync_skipped,
-                vk_no_sync ? "PRIMENJON" : "vykljuchen");
+                vk_no_sync ? "PRIMENJON" :
+                    (vk_narrow_sync ? "vykljuchen, no NARROW_SYNC PRIMENJON"
+                                    : "vykljuchen"));
         // The shape of the carve-up, largest splits first, so the per-layer piece is at the top.
         // Ten lines is enough: if there are more than ten distinct shapes the interesting ones are
         // still the big frequent ones, and the tail is one-offs at the graph's ends.
