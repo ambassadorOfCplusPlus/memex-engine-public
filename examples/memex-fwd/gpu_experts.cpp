@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -751,6 +752,24 @@ bool GpuExperts::init(const GpuExpertsConfig& cfg, ggml_tensor* const* up,
         }
     }
 
+    // How many queued promotions one batch may hold. The ring depth is the hard ceiling - a
+    // staging slot cannot be rewritten while a recorded copy still points into it - so taking
+    // the ring size is taking the largest batch that costs exactly one fence. Draining past it
+    // buys nothing: upload() would close and reopen the batch every stage_slots_ promotions,
+    // which is the same fence count with a longer wait for any dispatch that arrives meanwhile.
+    //
+    // Unpinned staging leaves this at 1 on purpose. There is no batching to fold into in that
+    // mode (batch_begin/batch_end are no-ops and every matrix keeps its own fence), so a drain
+    // would only make an arriving dispatch queue behind several synchronous writes.
+    {
+        promo_drain_ = stage_pinned_ ? stage_slots_ : 1;
+        if (const char* e = getenv("MEMEX_PROMO_DRAIN")) {
+            const int v = atoi(e);
+            if (v >= 1) promo_drain_ = v;
+        }
+        if (promo_drain_ < 1) promo_drain_ = 1;
+    }
+
     slot_of_.assign(std::size_t(cfg_.n_layers) * std::size_t(cfg_.n_experts), int16_t(-1));
     expert_at_.assign(std::size_t(cfg_.n_layers) * std::size_t(cfg_.capacity), int16_t(-1));
     dirty_.assign(std::size_t(cfg_.n_layers) * std::size_t(cfg_.capacity), 0);
@@ -912,7 +931,8 @@ std::string GpuExperts::failure() {
 
 void GpuExperts::worker_loop() {
     for (;;) {
-        int il = -1, k = 0, slot = -1, expert = -1;
+        int il = -1, k = 0;
+        bool drained = false;
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_job_.wait(lk, [&] { return quit_ || job_active_ || pending_total_ > 0; });
@@ -922,38 +942,73 @@ void GpuExperts::worker_loop() {
                 k  = job_k_;
             } else {
                 // Idle: get ahead on the uploads this refresh asked for, lowest layer first,
-                // one expert at a time so a job arriving mid-prefetch waits for one slice
-                // rather than for the whole refresh.
-                for (int i = 0; i < cfg_.n_layers && slot < 0; ++i) {
+                // and take up to promo_drain_ of them in one pass so that ONE submit and ONE
+                // fence cover the lot.
+                //
+                // This used to take exactly one, on the reasoning that a job arriving
+                // mid-prefetch should wait for one slice rather than for the whole refresh.
+                // The counter refuted the reasoning: 1902 promotions produced 1902 batches, so
+                // every promotion paid its own submit and its own fence, and the promotions
+                // together held the worker - the very thread the CPU joins on - for 13.04 ms
+                // per token while moving 17.3 MB, which is 1.33 GB/s over a 3.94 GB/s link.
+                // A shorter wait per arrival is worth less than not spending the 8.6 ms of
+                // excess in the first place.
+                //
+                // What does NOT change, and must not: how many promotions there are. The
+                // budget lives in ResidentSet::refresh (resident_set.cpp:245,350) and clips
+                // the request per layer per refresh before anything reaches this queue.
+                // Draining changes the fence count, never the byte count.
+                dr_il_.clear();
+                dr_slot_.clear();
+                dr_expert_.clear();
+                const int want = promo_drain_;
+                for (int i = 0; i < cfg_.n_layers && int(dr_slot_.size()) < want; ++i) {
                     if (pending_[std::size_t(i)] == 0) continue;
                     const std::size_t sb = std::size_t(i) * std::size_t(cfg_.capacity);
-                    for (int s = 0; s < cfg_.capacity; ++s) {
+                    for (int s = 0; s < cfg_.capacity && int(dr_slot_.size()) < want; ++s) {
                         if (!dirty_[sb + std::size_t(s)]) continue;
                         dirty_[sb + std::size_t(s)] = 0;
                         --pending_[std::size_t(i)];
                         --pending_total_;
-                        il = i; slot = s;
-                        expert = expert_at_[sb + std::size_t(s)];
-                        break;
+                        dr_il_.push_back(i);
+                        dr_slot_.push_back(s);
+                        dr_expert_.push_back(expert_at_[sb + std::size_t(s)]);
                     }
                 }
                 // pending_total_ said there was work and the map says there is not. Clearing
                 // it rather than looping on it: a spin here would be a live hang with no
                 // symptom but a hot core.
-                if (slot < 0) { pending_total_ = 0; continue; }
+                if (dr_slot_.empty()) { pending_total_ = 0; continue; }
+                drained = true;
             }
             busy_ = true;
         }
 
-        if (slot >= 0) {
-            // One promotion, but still bracketed: its three matrices then cost one fence
-            // rather than three.
+        if (drained) {
+            // One batch for all of them: batch_begin, every upload, one batch_end. The three
+            // matrices of one promotion were already bracketed together; now the promotions
+            // are too.
+            //
+            // Deferred activation survives unchanged, and it is batch_end that makes it so.
+            // upload() records into batch_landed_, which is worker-thread-local; batch_end
+            // waits on the fence and only then moves the tags into landed_, where take_landed
+            // picks them up and the host flips the mask. So "landed" now means the whole batch
+            // landed, and no expert in the batch is claimed as resident one moment earlier
+            // than the last byte of the batch. A slot being written meanwhile belongs to a
+            // PENDING expert, which the mask does not name, so no dispatch can read it - the
+            // same invariant as before, just held for longer.
+            //
+            // A partly-drained queue is consistent by construction: every slot taken here had
+            // its dirty_ bit cleared and pending_ decremented under the lock, so the slots
+            // still in the queue are exactly those not in this batch, and sync_slots keeps its
+            // hands off all of them because is_claimed() covers pending as well as resident.
             const auto t_pr = std::chrono::steady_clock::now();
-            if (expert >= 0) {
-                batch_begin();
-                upload(il, slot, expert);
-                batch_end();
+            batch_begin();
+            for (std::size_t j = 0; j < dr_slot_.size(); ++j) {
+                if (dr_expert_[j] < 0) continue;
+                if (!upload(dr_il_[j], dr_slot_[j], dr_expert_[j])) break;
             }
+            batch_end();
             const double pr_ms =
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t_pr).count();
@@ -1027,11 +1082,11 @@ void GpuExperts::flush_layer(int il) {
         }
         // Outside the lock: batch_end takes mu_ for its own accounting.
         if (done) { batch_end(); return; }
-        if (expert >= 0) upload(il, slot, expert);
+        if (expert >= 0 && !upload(il, slot, expert)) return;
     }
 }
 
-void GpuExperts::upload(int il, int slot, int expert) {
+bool GpuExperts::upload(int il, int slot, int expert) {
     ggml_tensor* d[3] = {up_[std::size_t(il)], gate_[std::size_t(il)], down_[std::size_t(il)]};
 
     // A staging slot cannot be rewritten while a recorded copy still points into it, so a full
@@ -1061,7 +1116,7 @@ void GpuExperts::upload(int il, int slot, int expert) {
             // this promotion are incomplete.
             batch_landed_.clear();
             batch_end();   // outside the lock; drops whatever was recorded, run is over anyway
-            return;
+            return false;
         }
         // Batched when it can be: one submit and one fence will cover this and its neighbours.
         // The fallback is the old behaviour - a submit and fence per matrix - and is correct,
@@ -1092,6 +1147,7 @@ void GpuExperts::upload(int il, int slot, int expert) {
         // device memory already.
         landed_.push_back(tag);
     }
+    return true;
 }
 
 void GpuExperts::take_landed(std::vector<uint32_t>* out) {

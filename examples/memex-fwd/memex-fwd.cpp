@@ -4003,6 +4003,22 @@ struct ResidentReport {
     // Who computed the resident half. The verdict on a non-zero logit difference depends on
     // it entirely: two CPU halves must agree to the bit, a CPU half and a device half must not.
     bool device_half = false;
+    // WHAT THE PROMOTIONS ACTUALLY COST, as opposed to what the link says they should.
+    //
+    // This report has printed "17.3 MB over PCIe at 3.94 GB/s = 4.4 ms/token" since the
+    // beginning, and the device path prints "promotions occupied the card thread 13.04
+    // ms/token" twenty lines lower. Both numbers were on screen together for a day, the
+    // self-financing verdict below was computed from the theoretical one, and nobody noticed
+    // that the two disagree by 3x. So the measured figure now stands on the same line as the
+    // theoretical one and the verdict reads the measured one when there is one.
+    //
+    // -1 ms means no device path ran: the promotions were bookkeeping, and there is nothing to
+    // measure rather than something that measured zero.
+    double   promo_ms_meas    = -1.0;  // ms the worker spent inside promotions, whole run
+    uint64_t promo_bytes_meas = 0;     // bytes those promotions moved
+    uint64_t promo_count_meas = 0;
+    uint64_t promo_batches    = 0;     // submit+fence pairs they cost
+    int      promo_tokens     = 0;     // generated tokens the two are divided by
     int set_size     = 0;           // resident experts in layer 0 when the run ended
     int win_distinct = 0;           // distinct experts the window held, layer 0
     int pending_end  = 0;           // promotions still in flight in layer 0 at the end
@@ -4043,9 +4059,41 @@ void print_resident(const ResidentOpt& r, const ResidentReport& rep, const HPara
     const double promo_bytes = promo_per_tok * bytes_per_expert;
     const double promo_ms = 1000.0 * promo_bytes / (kPcieGbs * 1e9);
     printf("    подкачек %.1f на токен = %.1f МБ по PCIe при %.2f ГБ/с = %.1f мс/токен "
-           "(обновлений %llu, бюджет ограничил %llu из них)\n", promo_per_tok,
+           "ТЕОРЕТИЧЕСКИ (обновлений %llu, бюджет ограничил %llu из них)\n", promo_per_tok,
            promo_bytes / 1e6, kPcieGbs, promo_ms, (unsigned long long)g.refreshes,
            (unsigned long long)g.budget_bound);
+    // The same quantity, measured, on the line below the theoretical one - because when the
+    // two lived twenty lines apart they disagreed by a factor of three for a day and the
+    // conclusion was drawn from the wrong one.
+    const double meas_ms_per_tok = (rep.promo_ms_meas >= 0.0 && rep.promo_tokens > 0)
+                                      ? rep.promo_ms_meas / double(rep.promo_tokens)
+                                      : -1.0;
+    double meas_gbs = -1.0;
+    if (meas_ms_per_tok >= 0.0 && rep.promo_ms_meas > 0.0) {
+        meas_gbs = double(rep.promo_bytes_meas) / 1e9 / (rep.promo_ms_meas / 1000.0);
+    }
+    if (meas_ms_per_tok >= 0.0) {
+        printf("    ИЗМЕРЕНО на потоке карты: %.1f мс/токен, %.1f МБ/токен, то есть %.2f ГБ/с "
+               "— %.2f от канала %.2f ГБ/с%s\n",
+               meas_ms_per_tok,
+               rep.promo_tokens ? double(rep.promo_bytes_meas) / double(rep.promo_tokens) / 1e6
+                                : 0.0,
+               meas_gbs, meas_gbs > 0.0 ? meas_gbs / kPcieGbs : 0.0, kPcieGbs,
+               (meas_gbs > 0.0 && meas_gbs < 0.75 * kPcieGbs)
+                   ? " — МЕДЛЕННЕЕ КАНАЛА: разница ниже, и она лежит на потоке, которого CPU "
+                     "ждёт на джойне"
+                   : "");
+        printf("      избыток над каналом %.1f мс/токен; пакетов %llu на %llu подкачек = "
+               "%.2f подкачки на пакет%s\n",
+               meas_ms_per_tok - promo_ms, (unsigned long long)rep.promo_batches,
+               (unsigned long long)rep.promo_count_meas,
+               rep.promo_batches ? double(rep.promo_count_meas) / double(rep.promo_batches)
+                                 : 0.0,
+               (rep.promo_batches && rep.promo_count_meas &&
+                double(rep.promo_count_meas) / double(rep.promo_batches) < 1.05)
+                   ? " — РАЗМЕР ПАКЕТА ЕДИНИЦА: каждая подкачка платит свой submit и свой fence"
+                   : "");
+    }
     // Requested against activated, separately. They are different quantities the moment
     // activation is deferred, and averaging or reporting only one of them would hide exactly
     // the thing this mechanism exists to make visible.
@@ -4081,13 +4129,30 @@ void print_resident(const ResidentOpt& r, const ResidentReport& rep, const HPara
     printf("    ИЗ ВИДЕОПАМЯТИ вместо ОЗУ %s %.1f МБ/токен, в ОЗУ %s %.1f МБ/токен\n",
            rep.device_half ? "идёт" : "было бы", from_vram / 1e6,
            rep.device_half ? "осталось" : "осталось бы", from_ram / 1e6);
-    printf("      это %.2f мс/токен, которые CPU при %.1f ГБ/с %s; PCIe на "
-           "подкачки просит %.1f мс — %s\n",
-           1000.0 * from_vram / (bandwidth_gbs * 1e9), bandwidth_gbs,
-           rep.device_half ? "не прочитал" : "не читал бы", promo_ms,
-           promo_ms < 1000.0 * from_vram / (bandwidth_gbs * 1e9)
+    // THE VERDICT READS THE MEASURED COST WHEN THERE IS ONE, and says which it read.
+    //
+    // It used to be computed from the theoretical PCIe time unconditionally: 4.4 ms against
+    // 26 ms saved, "the prefetch pays for itself". The measured cost of the same promotions
+    // was 13.04 ms/token, printed by the same run, and the verdict never saw it. This is the
+    // rule-67 fault in our own output - a counter placed beside a technique confirms the
+    // quantity it counts - and rule 70's as well: a verdict written for one configuration
+    // (no device path, where the theoretical figure is all there is) lied confidently in the
+    // other.
+    const double cpu_saved_ms = 1000.0 * from_vram / (bandwidth_gbs * 1e9);
+    const bool   have_meas    = meas_ms_per_tok >= 0.0;
+    const double verdict_ms   = have_meas ? meas_ms_per_tok : promo_ms;
+    printf("      это %.2f мс/токен, которые CPU при %.1f ГБ/с %s; подкачки стоят %.1f мс "
+           "(%s) — %s\n",
+           cpu_saved_ms, bandwidth_gbs,
+           rep.device_half ? "не прочитал" : "не читал бы", verdict_ms,
+           have_meas ? "ИЗМЕРЕНО" : "по каналу, теоретически: графического пути не было",
+           verdict_ms < cpu_saved_ms
                ? "меньше, то есть подкачка сама себя оплачивает"
                : "БОЛЬШЕ, то есть подкачка съедает выигрыш");
+    if (have_meas && promo_ms < cpu_saved_ms && meas_ms_per_tok >= cpu_saved_ms) {
+        printf("        (по каналу вышло бы %.1f мс и приём выглядел бы выгодным; приговор "
+               "вынесен по измеренному)\n", promo_ms);
+    }
     if (rep.device_half) {
         printf("    (графический путь ВКЛЮЧЁН: резидентную половину считало устройство, "
                "подкачки — настоящие DMA, строки выше — цена этого прогона)\n");
@@ -6548,6 +6613,21 @@ int main(int argc, char** argv) {
                        ? " — подкачка идёт одним submit на пакет"
                        : " — ПАКЕТИРОВАНИЕ ВЫКЛЮЧЕНО: закрепить не удалось, каждая матрица "
                          "снова стоит submit+fence и требует общий sync_staging");
+            // The batch size, printed rather than assumed. It is the setting the fence
+            // accounting is a function of, and a setting that did not apply is
+            // indistinguishable from one that did not help unless the run says which it was
+            // (rule 68). MEMEX_PROMO_DRAIN=1 is the pre-drain behaviour - one fence per
+            // promotion - kept reachable so both arms live in one binary.
+            printf("  дренаж очереди подкачек: до %d промоушенов в ОДНОМ пакете "
+                   "(кольцо %d, MEMEX_PROMO_DRAIN=%s)%s\n",
+                   gx->promo_drain(), gx->stage_slots(),
+                   getenv("MEMEX_PROMO_DRAIN") ? getenv("MEMEX_PROMO_DRAIN") : "не задан",
+                   gx->promo_drain() > gx->stage_slots()
+                       ? " — ВЫШЕ КОЛЬЦА: upload закроет и откроет пакет внутри дренажа, "
+                         "то есть fence на каждые stage_slots подкачек"
+                       : (gx->promo_drain() == 1
+                              ? " — ПО ОДНОЙ: каждая подкачка платит свой submit и свой fence"
+                              : ""));
             printf("  %d экспертов на слой, %.2f МиБ каждый, %.2f ГиБ в видеопамяти\n",
                    gx->capacity(), double(gx->bytes_per_expert()) / 1048576.0,
                    double(gx->vram_bytes()) / 1073741824.0);
@@ -6575,6 +6655,16 @@ int main(int argc, char** argv) {
         std::unique_ptr<memex::ResidentSet> rset;
         ResidentReport rrep;
         rrep.device_half = (gxp != nullptr);
+#ifdef MEMEX_FWD_GPU_EXPERTS
+        // The counters as they stood when the first fill of video memory finished. Everything
+        // below divides by n_gen, and the fill is not one of the generated tokens: it uploads
+        // the whole resident set - 576 experts, 1.44 GB, 789 ms in the run this was found on -
+        // before the clock starts. Charged into a per-token average it inflated "the prefetch
+        // occupied the card thread" from 8.96 to 13.07 ms/token, and the per-promotion figure
+        // derived from it (13.07 / 6.9 = 1.89 ms) divided a total that includes the fill by a
+        // rate that excludes it. Snapshot here, subtract at print time.
+        memex::GpuExpertsStats gx_fill_base;
+#endif
         if (ropt.on()) {
             memex::ResidentParams rp;
             rp.n_layers  = h.n_layer;
@@ -6810,9 +6900,18 @@ int main(int argc, char** argv) {
                            gfail.c_str());
                     return 1;
                 }
-                printf("  первичная заливка видеопамяти: %llu экспертов, %.2f ГБ, %.0f мс\n",
+                printf("  первичная заливка видеопамяти: %llu экспертов, %.2f ГБ, %.0f мс "
+                       "(пакетов %llu, %.2f мс на промоушен) — НЕ входит в per-token цифры "
+                       "ниже\n",
                        (unsigned long long)gxp->stats().promotions,
-                       double(gxp->stats().promo_bytes) / 1e9, ms_since(t_fill));
+                       double(gxp->stats().promo_bytes) / 1e9, ms_since(t_fill),
+                       (unsigned long long)(gxp->stats().batch_fences +
+                                            gxp->stats().upload_fences_unbatched),
+                       gxp->stats().promotions
+                           ? gxp->stats().ms_promote / double(gxp->stats().promotions)
+                           : 0.0);
+                // The baseline every per-token promotion figure is measured from.
+                gx_fill_base = gxp->stats();
                 // Everything the first fill uploaded is already resident in the set (the
                 // prompt's refreshes ran before deferred activation was switched on), so these
                 // confirmations are no-ops. Drained anyway, so the queue starts empty and the
@@ -7425,6 +7524,22 @@ int main(int argc, char** argv) {
             const int n_kv_occ  = std::min(n + n_gen, n_kv_max);
             const int n_kv_read = std::min(pad32(n_kv_occ), n_kv_max);
             const Budget bb = byte_budget(w, h, n_kv_read, double(h.n_expert_used));
+            // The measured promotion cost, handed to the report so its PCIe line can print
+            // what the link WOULD have taken and what the card thread DID take side by side.
+#ifdef MEMEX_FWD_GPU_EXPERTS
+            if (gxp) {
+                // Generated tokens only: the first fill is subtracted, because n_gen is the
+                // denominator and the fill is not one of those tokens.
+                const memex::GpuExpertsStats& pgs = gxp->stats();
+                rrep.promo_ms_meas    = pgs.ms_promote  - gx_fill_base.ms_promote;
+                rrep.promo_bytes_meas = pgs.promo_bytes - gx_fill_base.promo_bytes;
+                rrep.promo_count_meas = pgs.promotions  - gx_fill_base.promotions;
+                rrep.promo_batches    = (pgs.batch_fences + pgs.upload_fences_unbatched)
+                                      - (gx_fill_base.batch_fences +
+                                         gx_fill_base.upload_fences_unbatched);
+                rrep.promo_tokens     = n_gen;
+            }
+#endif
             // The measured-milliseconds line is suppressed under --zoned-check: that run
             // computes two decode graphs per token, so the implied bandwidth would describe
             // a workload nobody is proposing to run.
@@ -7440,6 +7555,19 @@ int main(int argc, char** argv) {
 #ifdef MEMEX_FWD_GPU_EXPERTS
         if (gxp) {
             const memex::GpuExpertsStats& gs = gxp->stats();
+            // GENERATION ONLY, and this is the denominator fix rather than a convenience.
+            // Everything per-token divides by n_gen, and the run begins with the initial fill
+            // of every slot - 576 experts, 1.44 GB, 789 ms in the run this was found on -
+            // which no generated token paid for. Charged in, it read "the prefetch occupied
+            // the card thread 13.07 ms/token" where the generated tokens cost 8.96, and the
+            // per-promotion figure taken from it (13.07 / 6.9 = 1.89 ms) divided a total that
+            // includes the fill by a rate that excludes it. Both are subtracted here.
+            const double   promo_ms_gen = gs.ms_promote  - gx_fill_base.ms_promote;
+            const uint64_t promo_n_gen  = gs.promotions  - gx_fill_base.promotions;
+            const uint64_t promo_by_gen = gs.promo_bytes - gx_fill_base.promo_bytes;
+            const uint64_t promo_b_gen  = (gs.batch_fences + gs.upload_fences_unbatched)
+                                        - (gx_fill_base.batch_fences +
+                                           gx_fill_base.upload_fences_unbatched);
             printf("\nрезидентные эксперты на GPU\n");
             printf("  устройство            : %s\n", gxp->device_name().c_str());
             printf("  слоёв на устройстве   : %llu, из них без единой резидентной "
@@ -7507,8 +7635,40 @@ int main(int argc, char** argv) {
                        "поток %llu (%.1f%%)\n",
                        imbalance > 0.0 ? imbalance : 0.0,
                        gs.ms_join_wait / tk - (imbalance > 0.0 ? imbalance : 0.0),
-                       gs.ms_promote / tk, (unsigned long long)gs.fork_busy,
+                       promo_ms_gen / tk, (unsigned long long)gs.fork_busy,
                        100.0 * double(gs.fork_busy) / double(gs.join_waits));
+                printf("      подкачки на генерации: %llu штук в %llu пакетах = %.2f на "
+                       "пакет, %.2f мс на подкачку, %.2f мс/токен (заливка %.0f мс "
+                       "исключена)\n",
+                       (unsigned long long)promo_n_gen, (unsigned long long)promo_b_gen,
+                       promo_b_gen ? double(promo_n_gen) / double(promo_b_gen) : 0.0,
+                       promo_n_gen ? promo_ms_gen / double(promo_n_gen) : 0.0,
+                       promo_ms_gen / tk, gx_fill_base.ms_promote);
+            }
+            // One ASCII line for the bench harness. Everything above is in Cyrillic, and
+            // PowerShell on this machine reads an unmarked script file as ANSI, so a bench
+            // script cannot carry a Cyrillic match pattern - which is why every script in
+            // bench/ is written in latin. Reading these numbers off a printed line beats
+            // re-deriving them in the harness, and it puts the two low-spread quantities the
+            // drain acts on directly (promo_ms_tok and per_batch) in one place.
+            {
+                const double tk2 = double(n_gen > 0 ? n_gen : 1);
+                const double gbs = promo_ms_gen > 0.0
+                                       ? double(promo_by_gen) / 1e9 / (promo_ms_gen / 1000.0)
+                                       : 0.0;
+                printf("PROMO_AB drain %d ring %d pinned %d promo %llu batches %llu "
+                       "per_batch %.4f promo_ms_tok %.4f ms_per_promo %.4f gbs %.4f "
+                       "mb_tok %.4f join_wait_tok %.4f job_tok %.4f cpu_tok %.4f "
+                       "fill_ms %.1f fill_promo %llu\n",
+                       gxp->promo_drain(), gxp->stage_slots(), gxp->stage_pinned() ? 1 : 0,
+                       (unsigned long long)promo_n_gen, (unsigned long long)promo_b_gen,
+                       promo_b_gen ? double(promo_n_gen) / double(promo_b_gen) : 0.0,
+                       promo_ms_gen / tk2,
+                       promo_n_gen ? promo_ms_gen / double(promo_n_gen) : 0.0,
+                       gbs, double(promo_by_gen) / tk2 / 1e6,
+                       gs.ms_join_wait / tk2, gs.ms_job / tk2, gs.ms_cpu_half / tk2,
+                       gx_fill_base.ms_promote,
+                       (unsigned long long)gx_fill_base.promotions);
             }
             printf("  где что лежит         : веса экспертов — Vulkan (%.2f ГиБ, "
                    "%zu буфер(а/ов) > 256 МиБ); вход, идентификаторы, выход половины — "

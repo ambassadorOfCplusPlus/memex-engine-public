@@ -211,6 +211,12 @@ class GpuExperts {
     // which is both a fence per matrix and one more host-visible allocation to fail.
     int  stage_slots()  const { return stage_slots_; }
     bool stage_pinned() const { return stage_pinned_; }
+    // How many queued promotions the idle worker folds behind ONE submit and ONE fence. This
+    // is the batch size the fence accounting is a function of: at 1 every promotion pays its
+    // own submit and its own fence, which is what 1902 batches for 1902 promotions meant.
+    // Overridable by MEMEX_PROMO_DRAIN so both arms live in one binary - and printed, because
+    // a setting that did not apply is indistinguishable from one that did not help (rule 68).
+    int  promo_drain()  const { return promo_drain_; }
     bool readback_mapped() const { return !out_mapped_.empty() && out_mapped_.back() != nullptr; }
 
     // Recompute the slot map from the resident set and queue the uploads the change implies.
@@ -292,7 +298,10 @@ class GpuExperts {
     void worker();
     void worker_loop();
     void flush_layer(int il);
-    void upload(int il, int slot, int expert);
+    // False means the run is over: the source read failed, failed_ is set, and nothing the
+    // open batch recorded may be confirmed. Callers must stop draining rather than carry on
+    // into the next slot, which would only fail again with the batch already closed.
+    bool upload(int il, int slot, int expert);
     void compute(int il, int k);
 
     GpuExpertsConfig cfg_;
@@ -350,6 +359,12 @@ class GpuExperts {
     std::vector<char>     stage_fallback_;
     int                   stage_slots_ = 1;
     bool                  stage_pinned_ = false;
+    // The ring depth is the ceiling on a batch, so this defaults to it: draining further would
+    // make upload() close and reopen the batch mid-drain, reintroducing exactly the fence per
+    // ring-full that the drain exists to remove, while making an arriving dispatch wait longer.
+    int                   promo_drain_ = 1;
+    // Scratch for the drain, owned by the worker thread: filled under mu_, uploaded outside it.
+    std::vector<int>      dr_il_, dr_slot_, dr_expert_;
     bool                  batching_    = false;   // a batch is open on this thread
     int                   batch_used_  = 0;       // promotions recorded into the open batch
     // (layer << 16) | expert. batch_landed_ is worker-thread-only and holds what the OPEN batch
