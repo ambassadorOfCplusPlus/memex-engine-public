@@ -7326,8 +7326,17 @@ int main(int argc, char** argv) {
             if (ss.layer_calls > 0) {
                 const double lc = double(ss.layer_calls);
                 const double tk = double(n_gen > 0 ? n_gen : 1);
+                // PER LAYER, counted rather than assumed. "Crossings per token" hides the
+                // question that matters: one round trip per layer is the design, two is a
+                // doubled latency bill that no bandwidth argument would ever show. At 48
+                // layers a per-token figure of 49 and one of 96 look equally plausible until
+                // the division is written down.
                 printf("vnimanie i marshrutizator na karte: %llu peresechenij, %.1f na "
-                       "tokjen\n", (unsigned long long)ss.layer_calls, lc / tk);
+                       "tokjen = %.2f na sloj%s\n",
+                       (unsigned long long)ss.layer_calls, lc / tk,
+                       lc / (tk * double(h.n_layer > 0 ? h.n_layer : 1)),
+                       lc / (tk * double(h.n_layer > 0 ? h.n_layer : 1)) > 1.35
+                           ? " - BOLSHE ODNOGO NA SLOJ" : "");
                 printf("  na odno peresechenie: vsego %.3f ms = podjom %.3f + ustrojstvo "
                        "%.3f + zabor %.3f\n", ss.layer_ms_total / lc,
                        ss.layer_ms_upload / lc, ss.layer_ms_device / lc,
@@ -7421,6 +7430,34 @@ int main(int argc, char** argv) {
                        (unsigned long long)(gs.readback_fenced + gs.readback_mapped),
                        (unsigned long long)cmp_f, (unsigned long long)tot,
                        gs.layers ? double(tot) / double(gs.layers) : 0.0);
+            }
+            // ------------------------------------------------------------------ the join
+            //
+            // The claim the whole scheme rests on is max(), not sum: the device computes the
+            // resident half WHILE the CPU computes the other. Nothing measured that until
+            // now, and everything else here - hit rate, promotions, fences - describes how
+            // much work the device took, not whether the CPU got to do anything meanwhile.
+            //
+            // Read it as three numbers against each other:
+            //   половина CPU   what the overlap had to work with, fork -> join
+            //   половина карты the device's own dispatch, on the worker's own clock
+            //   ЖДЁМ           the ggml pool STOPPED at the join, n_tasks=1 so it is the pool
+            //
+            // If ЖДЁМ is near zero the overlap works. If ЖДЁМ is most of the token, max() has
+            // been a sum since the beginning and the parallelism never happened.
+            if (gs.join_waits > 0) {
+                const double tk = double(n_gen > 0 ? n_gen : 1);
+                printf("  джойн, на токен       : половина CPU %.2f мс, половина карты %.2f мс, "
+                       "ЖДЁМ %.2f мс\n",
+                       gs.ms_cpu_half / tk, gs.ms_job / tk, gs.ms_join_wait / tk);
+                printf("      джойнов %llu (%.1f на токен), из них половина карты уже была "
+                       "готова %llu (%.1f%%)%s\n",
+                       (unsigned long long)gs.join_waits, double(gs.join_waits) / tk,
+                       (unsigned long long)gs.join_ready,
+                       100.0 * double(gs.join_ready) / double(gs.join_waits),
+                       gs.ms_join_wait / tk > 5.0
+                           ? " — ЖДЁМ БОЛЬШЕ 5 мс/токен: параллельности нет, это сумма"
+                           : " — ожидание мало, половины действительно параллельны");
             }
             printf("  где что лежит         : веса экспертов — Vulkan (%.2f ГиБ, "
                    "%zu буфер(а/ов) > 256 МиБ); вход, идентификаторы, выход половины — "

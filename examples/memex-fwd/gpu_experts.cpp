@@ -973,9 +973,18 @@ void GpuExperts::worker_loop() {
         // promotion costs at worst another token or two of the expert being computed on the
         // CPU - which is what it would have cost anyway had it not been promoted.
         if (!cfg_.deferred) flush_layer(il);
+        // The device half's own wall time, measured on the thread that does it. Against
+        // ms_cpu_half it says which side is the longer of the two, and therefore which one
+        // max() is - and if ms_join_wait is large while this is small, the answer is neither
+        // and the cost is the handover itself.
+        const auto t_job = std::chrono::steady_clock::now();
         compute(il, k);
+        const double job_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_job).count();
         {
             std::lock_guard<std::mutex> lk(mu_);
+            st_.ms_job += job_ms;
             job_active_ = false;
             job_done_   = true;
             busy_       = false;
@@ -1220,6 +1229,7 @@ void GpuExperts::do_fork(int il, const ggml_tensor* ids_res, const ggml_tensor* 
     job_k_      = k;
     job_active_ = true;
     job_done_   = false;
+    fork_t_     = std::chrono::steady_clock::now();
     ++st_.layers;
     if (k == 0) ++st_.layers_empty;
     st_.experts += uint64_t(k);
@@ -1230,8 +1240,21 @@ void GpuExperts::do_fork(int il, const ggml_tensor* ids_res, const ggml_tensor* 
 void GpuExperts::do_join(int il, ggml_tensor* dst, const ggml_tensor* o_res_cpu) {
     (void)il;
     const std::size_t n = std::size_t(cfg_.n_embd) * std::size_t(cfg_.n_used);
+    // Timed from BEFORE the lock, because contending for mu_ is waiting too. Everything
+    // between here and the predicate coming true is the whole ggml pool stopped: this op has
+    // n_tasks = 1, so the other threads are at their barrier.
+    const auto t_arrive = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lk(mu_);
+    const bool ready_on_arrival = job_done_ || failed_;
     cv_done_.wait(lk, [&] { return job_done_ || failed_; });
+    {
+        using ms_d = std::chrono::duration<double, std::milli>;
+        const auto t_go = std::chrono::steady_clock::now();
+        ++st_.join_waits;
+        if (ready_on_arrival) ++st_.join_ready;
+        st_.ms_join_wait += ms_d(t_go - t_arrive).count();
+        st_.ms_cpu_half  += ms_d(t_arrive - fork_t_).count();
+    }
     if (failed_) {
         std::memset(dst->data, 0, n * sizeof(float));
         return;

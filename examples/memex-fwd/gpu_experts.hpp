@@ -80,6 +80,7 @@
 // 256 MiB, and the layer-to-buffer grouping exists to guarantee that rather than to be tidy.
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -137,6 +138,24 @@ struct GpuExpertsStats {
     uint64_t upload_fences_unbatched = 0;
     uint64_t readback_mapped = 0;   // readbacks served by memcpy through the mapping: 0 fences
     uint64_t readback_fenced = 0;   // readbacks that still cost a submit+fence
+    // THE JOIN. This is the quantity that says whether the two halves are parallel at all,
+    // and until now nothing counted it.
+    //
+    // The whole scheme rests on one claim: the device computes the resident half WHILE the
+    // CPU computes the other, so the layer costs max(cpu, device) rather than cpu + device.
+    // Every other number here - hit rate, promotions, fences - is about how much work the
+    // device took. None of them says whether the CPU got to do anything meanwhile.
+    //
+    // ms_join_wait is that number, and it is a hard one: the join op runs with n_tasks = 1,
+    // so while thread 0 sits in cv_done_.wait the other ggml threads are spinning on their
+    // barrier with nothing to do. Time here is the ENTIRE pool stopped, not one thread.
+    // If it is near zero the overlap works and the cost is elsewhere; if it is most of the
+    // token, max() has been a sum all along.
+    uint64_t join_waits      = 0;   // times the CPU reached the join
+    uint64_t join_ready      = 0;   // ...and the device half was already there: a free join
+    double   ms_join_wait    = 0.0; // wall time the ggml pool spent STOPPED at the join
+    double   ms_cpu_half     = 0.0; // fork -> join: the work the CPU had to cover the device with
+    double   ms_job          = 0.0; // device side: the worker's own dispatch, dequeue to done
     // --gpu-experts-check
     uint64_t checked       = 0;   // slots compared against the CPU's own resident half
     uint64_t zero_bad      = 0;   // slots the device does not own that came back non-zero
@@ -388,6 +407,9 @@ class GpuExperts {
     std::string fail_msg_;
     int   job_il_     = -1;
     int   job_k_      = 0;
+    // When do_fork handed this job over. The CPU half runs between this instant and the
+    // moment do_join is entered, so it is what the overlap had to work with.
+    std::chrono::steady_clock::time_point fork_t_{};
     std::vector<int32_t> job_slots_;   // n_used, slot index per compacted entry
     std::vector<int32_t> job_at_;      // n_used, original router slot per compacted entry
     std::vector<float>   job_x_;       // n_embd
