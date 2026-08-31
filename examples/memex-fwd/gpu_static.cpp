@@ -96,13 +96,19 @@ void prefer_one_submit_per_graph() {
 void layer_slots(const GpuStaticLayer& L, ggml_tensor** out) {
     out[0] = L.attn_norm; out[1] = L.wq; out[2] = L.wk; out[3] = L.wv; out[4] = L.wo;
     out[5] = L.q_norm;    out[6] = L.k_norm; out[7] = L.ffn_norm; out[8] = L.router;
-    out[9] = L.rope_freqs;   // may be null
+    out[9]  = L.rope_freqs;      // may be null
+    out[10] = L.post_attn_norm;  // gemma4 only
+    out[11] = L.gate_inp_s;      // gemma4 only
+    out[12] = L.pre_ffw_norm_2;  // gemma4 only
 }
 
 void layer_unslot(GpuStaticLayer& L, ggml_tensor* const* in) {
     L.attn_norm = in[0]; L.wq = in[1]; L.wk = in[2]; L.wv = in[3]; L.wo = in[4];
     L.q_norm    = in[5]; L.k_norm = in[6]; L.ffn_norm = in[7]; L.router = in[8];
-    L.rope_freqs = in[9];
+    L.rope_freqs     = in[9];
+    L.post_attn_norm = in[10];
+    L.gate_inp_s     = in[11];
+    L.pre_ffw_norm_2 = in[12];
 }
 
 }  // namespace
@@ -672,11 +678,13 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
                                       std::size_t(hd) * std::size_t(cfg_.n_kv_max) *
                                       std::size_t(nkv_heads));
     for (int il = 0; il < nl; ++il) {
-        ggml_tensor* s[10];
+        ggml_tensor* s[13];
         layer_slots(src[std::size_t(il)], s);
         std::size_t b = 0;
-        for (int i = 0; i < 10; ++i) {
-            if (!s[i] && i == 9) continue;   // rope_freqs is optional, see layer_slots
+        for (int i = 0; i < 13; ++i) {
+            // Slots 9..12 are optional by design; slot 3 (wv) is optional because five of Gemma's
+            // layers ship no attn_v and take V from the raw K projection instead.
+            if (!s[i] && (i >= 9 || i == 3)) continue;
             if (!s[i]) {
                 char m[160];
                 snprintf(m, sizeof(m), "sloj %d: ne hvataet tenzora vnimanija #%d", il, i);
@@ -753,10 +761,10 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
         ctxs_l_[gi] = cx;
 
         for (int il = l0; il < l1; ++il) {
-            ggml_tensor* ss[10];
-            ggml_tensor* dd[10] = {nullptr};
+            ggml_tensor* ss[13];
+            ggml_tensor* dd[13] = {nullptr};
             layer_slots(src[std::size_t(il)], ss);
-            for (int i = 0; i < 10; ++i) {
+            for (int i = 0; i < 13; ++i) {
                 if (!ss[i]) { dd[i] = nullptr; continue; }   // optional slot
                 dd[i] = ggml_new_tensor(cx, ss[i]->type, GGML_MAX_DIMS, ss[i]->ne);
                 char nm[64];
@@ -816,11 +824,11 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
 
         // In pieces, so the driver is never asked for a staging buffer the size of a tensor.
         for (int il = l0; il < l1; ++il) {
-            ggml_tensor* ss[10];
-            ggml_tensor* dd[10];
+            ggml_tensor* ss[13];
+            ggml_tensor* dd[13];
             layer_slots(src[std::size_t(il)], ss);
             layer_slots(lw_[std::size_t(il)], dd);
-            for (int i = 0; i < 10; ++i) {
+            for (int i = 0; i < 13; ++i) {
                 if (!ss[i] || !dd[i]) continue;   // optional slot, see layer_slots
                 const std::size_t need = ggml_nbytes(ss[i]);
                 const char* sp = (const char*)ss[i]->data;
@@ -911,7 +919,12 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
 
         ggml_tensor* q = ggml_mul_mat(c, L.wq, x);
         ggml_tensor* k = ggml_mul_mat(c, L.wk, x);
-        ggml_tensor* v = ggml_mul_mat(c, L.wv, x);
+        // V's source: its own projection where there is one, and otherwise the RAW output of the
+        // K projection - the node BEFORE k_norm and BEFORE the rotation. Five of Gemma's thirty
+        // layers (5, 11, 17, 23, 29 - the full-attention ones) ship no attn_v at all, and the
+        // reference's `Vcur = Kcur` picks up exactly that node. Taking the normed or roped K
+        // instead would be a different model that still runs.
+        ggml_tensor* v = L.wv ? ggml_mul_mat(c, L.wv, x) : k;
 
         q = ggml_reshape_3d(c, q, hd, nh, 1);
         q = ggml_fused_rms_norm(c, q, L.q_norm, cfg_.rms_eps);
@@ -968,9 +981,34 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         // contiguous bytes, for one token.
         kqv = ggml_reshape_2d(c, kqv, dq, 1);
 
-        ggml_tensor* ffn_inp = ggml_add(c, ggml_mul_mat(c, L.wo, kqv), cur);
-        ggml_tensor* xf = ggml_fused_rms_norm(c, ffn_inp, L.ffn_norm, cfg_.rms_eps);
-        ggml_tensor* rl = ggml_mul_mat(c, L.router, xf);
+        // DVA BLOKA, a ne odin s raznymi razmerami. U gemma4 mezhdu wo i ostatkom stoit norma,
+        // kotoroj u qwen3moe net, a marshrutizator chitaet VYHOD VNIMANIJA cherez svoj sobstvennyj
+        // ves ffn_gate_inp_s, a ne vyhod ffn_norm. Formy pri etom mogli by sovpadat - reshaet
+        // poriadok uzlov, poetomu vetka po flagu, a ne po geometrii.
+        //
+        // Uzel v uzel povtorjaet build_gemma4_step, kotoryj proveren protiv etalona (vse zondy
+        // 0,0000%). Ljuboe rashozhdenie zdes - eto rashozhdenie s NIM, i iskat ego nado sravneniem
+        // dvuh, a ne razmyshleniem.
+        ggml_tensor* ffn_inp = nullptr;   // ostatochnyj potok posle vnimanija
+        ggml_tensor* xf      = nullptr;   // vhod plotnoj poloviny (ffn_norm)
+        ggml_tensor* xm      = nullptr;   // vhod marshrutiziruemoj poloviny (pre_ffw_norm_2)
+        ggml_tensor* rl      = nullptr;   // logity marshrutizatora, syrye
+        if (cfg_.gemma_block) {
+            ggml_tensor* kqv_out = ggml_mul_mat(c, L.wo, kqv);
+            ggml_tensor* attn    = ggml_fused_rms_norm(c, kqv_out, L.post_attn_norm, cfg_.rms_eps);
+            ffn_inp = ggml_add(c, attn, cur);
+            xf      = ggml_fused_rms_norm(c, ffn_inp, L.ffn_norm, cfg_.rms_eps);
+            xm      = ggml_fused_rms_norm(c, ffn_inp, L.pre_ffw_norm_2, cfg_.rms_eps);
+            // Marshrutizator ot vyhoda vnimanija, cherez svoj ves. Masshtab 1/sqrt(n_embd) uzhe
+            // vnutri etogo tenzora - etalon perestavljaet ego data na masshtabirovannuju kopiju
+            // pri zagruzke, i primenit ego vtoroj raz znachit podelit logity na 53 eshchjo raz.
+            ggml_tensor* tmp = ggml_fused_rms_norm(c, ffn_inp, L.gate_inp_s, cfg_.rms_eps);
+            rl = ggml_mul_mat(c, L.router, tmp);
+        } else {
+            ffn_inp = ggml_add(c, ggml_mul_mat(c, L.wo, kqv), cur);
+            xf      = ggml_fused_rms_norm(c, ffn_inp, L.ffn_norm, cfg_.rms_eps);
+            rl      = ggml_mul_mat(c, L.router, xf);
+        }
 
         // One readback rather than three. Each ggml_backend_tensor_get on a device buffer the
         // driver did not host-map is a submit and a fence; three of them per layer would treble
@@ -992,10 +1030,14 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         if (!split_said) { split_said = true;
             fprintf(stderr, "SPLIT_OUT %d\n", split_out); fflush(stderr); }
         ggml_tensor* out = nullptr;
-        if (split_out) {
+        if (split_out || cfg_.gemma_block) {
+            // gemma4 vsegda razdelno: u nejo CHETYRE vyhoda, i sklejka ih v odin tenzor potrebovala
+            // by trjoh concat vmesto dvuh - to est tri lishnih dispatcha radi togo, chto slozhennoe
+            // chtenie i tak dostajot odnim krugom.
             ggml_set_output(ffn_inp);
             ggml_set_output(xf);
             ggml_set_output(rl);
+            if (xm) ggml_set_output(xm);
         } else {
             out = ggml_concat(c, ggml_concat(c, ffn_inp, xf, 0), rl, 0);
             ggml_set_output(out);
@@ -1053,6 +1095,7 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
                 ggml_build_forward_expand(gf, ffn_inp);
                 ggml_build_forward_expand(gf, xf);
                 ggml_build_forward_expand(gf, rl);
+                if (xm) ggml_build_forward_expand(gf, xm);
             }
             static bool said = false;
             if (!said) { said = true; fprintf(stderr, "STATIC_TRUNC 0 uzlov %d\n", ggml_graph_n_nodes(gf)); fflush(stderr); }
@@ -1080,7 +1123,7 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
             return false;
         }
         G.gf = gf;  G.ga = ga;  G.out = out;
-        G.o_res = ffn_inp; G.o_xf = xf; G.o_rl = rl;
+        G.o_res = ffn_inp; G.o_xf = xf; G.o_rl = rl; G.o_xm = xm;
         G.kdst = kdst; G.vdst = vdst; G.kcpy = kcpy; G.vcpy = vcpy;
         G.K = K; G.V = V; G.kq = kq; G.probs = p;
         G.mapped = nullptr;
@@ -1213,7 +1256,12 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
                          const ggml_tensor* mask) {
     auto t0 = std::chrono::steady_clock::now();
     ++st_.layer_calls;
-    const std::size_t out_floats = std::size_t(2 * cfg_.n_embd + cfg_.n_expert);
+    // Tri velichiny u qwen3moe (ostatok, ego norma, logity) i CHETYRE u gemma4: u nejo dve raznye
+    // pre-normy nad odnim i tem zhe ostatkom - ffn_norm dlja plotnoj poloviny i pre_ffw_norm_2 dlja
+    // marshrutiziruemoj - i vernut obe deshevle, chem zastavit host schitat odnu zanovo.
+    const std::size_t out_floats = cfg_.gemma_block
+        ? std::size_t(3 * cfg_.n_embd + cfg_.n_expert)
+        : std::size_t(2 * cfg_.n_embd + cfg_.n_expert);
 
     if (!fail_msg_.empty()) { std::memset(dst->data, 0, ggml_nbytes(dst)); return; }
     if (step_nkv_ <= 0) {
@@ -1288,11 +1336,18 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
                 // Three copies into the same pinned buffer at the offsets the concatenated
                 // layout used, so the host side downstream is byte-for-byte what it was.
                 const std::size_t ne = std::size_t(cfg_.n_embd);
-                const bool a = ggml_backend_vk_arm_readback(be_, G.o_res, rb_,          0, ne * sizeof(float));
-                const bool b = ggml_backend_vk_arm_readback(be_, G.o_xf,  rb_ + ne,     0, ne * sizeof(float));
-                const bool cc= ggml_backend_vk_arm_readback(be_, G.o_rl,  rb_ + 2 * ne, 0,
-                                                            std::size_t(cfg_.n_expert) * sizeof(float));
-                folded = a && b && cc;
+                // Poriadok tot zhe, chto davala sklejka: ostatok, normy, logity. Host nizhe chitaet
+                // rb_ po tem zhe smeshchenijam, poetomu menjat ih nelzja bez pravki obeih storon.
+                bool ok = ggml_backend_vk_arm_readback(be_, G.o_res, rb_,      0, ne * sizeof(float));
+                ok = ok && ggml_backend_vk_arm_readback(be_, G.o_xf, rb_ + ne, 0, ne * sizeof(float));
+                std::size_t off = 2 * ne;
+                if (G.o_xm) {
+                    ok = ok && ggml_backend_vk_arm_readback(be_, G.o_xm, rb_ + off, 0, ne * sizeof(float));
+                    off += ne;
+                }
+                ok = ok && ggml_backend_vk_arm_readback(be_, G.o_rl, rb_ + off, 0,
+                                                        std::size_t(cfg_.n_expert) * sizeof(float));
+                folded = ok;
             }
         }
         auto tb = std::chrono::steady_clock::now();
@@ -1329,9 +1384,14 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
                 ggml_backend_tensor_get(G.out, rb_, 0, out_floats * sizeof(float));
             } else {
                 const std::size_t ne = std::size_t(cfg_.n_embd);
-                ggml_backend_tensor_get(G.o_res, rb_,          0, ne * sizeof(float));
-                ggml_backend_tensor_get(G.o_xf,  rb_ + ne,     0, ne * sizeof(float));
-                ggml_backend_tensor_get(G.o_rl,  rb_ + 2 * ne, 0,
+                ggml_backend_tensor_get(G.o_res, rb_,      0, ne * sizeof(float));
+                ggml_backend_tensor_get(G.o_xf,  rb_ + ne, 0, ne * sizeof(float));
+                std::size_t off = 2 * ne;
+                if (G.o_xm) {
+                    ggml_backend_tensor_get(G.o_xm, rb_ + off, 0, ne * sizeof(float));
+                    off += ne;
+                }
+                ggml_backend_tensor_get(G.o_rl, rb_ + off, 0,
                                         std::size_t(cfg_.n_expert) * sizeof(float));
             }
         }

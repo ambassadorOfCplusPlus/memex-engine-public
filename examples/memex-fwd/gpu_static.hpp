@@ -156,6 +156,11 @@ struct GpuStaticConfig {
     // filled it must be n_layer long and it wins over the scalars.
     std::vector<GpuStaticGeom> geom;
 
+    // Build gemma4's block instead of qwen3moe's. Not derivable from the geometry: the shapes
+    // could be identical and the block still different, and it is the block that decides which
+    // nodes exist and in what order.
+    bool gemma_block = false;
+
     // The shape of layer il, whichever way it was given.
     GpuStaticGeom at(int il) const {
         if (!geom.empty()) return geom[std::size_t(il)];
@@ -182,6 +187,12 @@ struct GpuStaticLayer {
     ggml_tensor* router = nullptr;
     // OPTIONAL. gemma4 full-attention layers only; null everywhere else. See layer_slots.
     ggml_tensor* rope_freqs = nullptr;
+    // OPTIONAL, gemma4 only. Its block is not qwen3moe's: a norm sits between wo and the
+    // residual, the router reads the ATTENTION OUTPUT through its own rms weight rather than the
+    // feed-forward norm, and the routed half has a second pre-norm of its own.
+    ggml_tensor* post_attn_norm  = nullptr;
+    ggml_tensor* gate_inp_s      = nullptr;
+    ggml_tensor* pre_ffw_norm_2  = nullptr;
 };
 
 struct GpuStaticStats {
@@ -356,6 +367,10 @@ class GpuStatic {
         ggml_tensor*   o_res = nullptr;   // the residual stream, [n_embd, 1]
         ggml_tensor*   o_xf  = nullptr;   // its normed copy, [n_embd, 1]
         ggml_tensor*   o_rl  = nullptr;   // the router logits, [n_expert, 1]
+        // gemma4 only: the routed half's own pre-norm of the residual stream. Its dense half uses
+        // ffn_norm (o_xf) and its routed half uses pre_ffw_norm_2, and they are different weights
+        // over the same input - so the card returns both rather than making the host redo one.
+        ggml_tensor*   o_xm  = nullptr;
         ggml_tensor*   kdst = nullptr;   // the write view, aimed at n_past
         ggml_tensor*   vdst = nullptr;
         ggml_tensor*   kcpy = nullptr;   // and the copy node that carries the same offset
