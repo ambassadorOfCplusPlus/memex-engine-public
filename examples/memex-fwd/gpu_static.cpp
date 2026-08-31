@@ -15,6 +15,14 @@
 // exactly the word that hides a buffer the driver quietly moved to system memory.
 #include "gpu_experts.hpp"
 
+// MEMEX_STATIC_TRUNC, read once. See the truncation block in the layer graph builder for what it
+// is for; in short, it is the only instrument on this backend that can attribute device cost,
+// because per-node timestamps cannot (METHODS 80).
+static int memex_static_trunc() {
+    static const int v = getenv("MEMEX_STATIC_TRUNC") ? atoi(getenv("MEMEX_STATIC_TRUNC")) : 0;
+    return v;
+}
+
 namespace memex {
 
 namespace {
@@ -880,12 +888,29 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
 
         q = ggml_reshape_3d(c, q, hd, nh, 1);
         q = ggml_fused_rms_norm(c, q, L.q_norm, cfg_.rms_eps);
-        q = ggml_rope_multi(c, q, t_pos_, nullptr, hd, sections, cfg_.rope_type,
-                            cfg_.n_ctx_train, cfg_.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        // MEMEX_NO_ROPE=1 drops both rope nodes from this graph. The OUTPUT IS THEN WRONG and
+        // that is the point: device time does not depend on the values, so an arm whose
+        // arithmetic is deliberately broken still measures the cost of the nodes that were
+        // removed (the same licence rule 73 gives, and the same one the node-count sweeps used).
+        //
+        // Why it is worth an arm of its own. The per-node device timings say ROPE costs 117 us a
+        // call, twice a layer, 235 us of the 476 us a crossing takes - on 16 KB of data, i.e.
+        // 0.14 GB/s. Barriers were refuted as the explanation (narrowing them changed nothing)
+        // and so were submits (one instead of two changed nothing), so either those timings are
+        // honest and rope really is the largest single term in attention, or the timestamp is
+        // charging rope for the drain of the projection before it. Removing the node cannot be
+        // misattributed: whatever the crossing loses is what the node cost.
+        static const int no_rope = getenv("MEMEX_NO_ROPE") ? atoi(getenv("MEMEX_NO_ROPE")) : 0;
+        if (!no_rope) {
+            q = ggml_rope_multi(c, q, t_pos_, nullptr, hd, sections, cfg_.rope_type,
+                                cfg_.n_ctx_train, cfg_.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        }
         k = ggml_reshape_3d(c, k, hd, nkvh, 1);
         k = ggml_fused_rms_norm(c, k, L.k_norm, cfg_.rms_eps);
-        k = ggml_rope_multi(c, k, t_pos_, nullptr, hd, sections, cfg_.rope_type,
-                            cfg_.n_ctx_train, cfg_.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        if (!no_rope) {
+            k = ggml_rope_multi(c, k, t_pos_, nullptr, hd, sections, cfg_.rope_type,
+                                cfg_.n_ctx_train, cfg_.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        }
 
         // [hd, n_head_kv, 1] -> [hd, 1, n_head_kv], same bytes at the same offsets.
         ggml_tensor* Kc = ggml_reshape_3d(c, k, hd, 1, nkvh);
@@ -922,16 +947,83 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         // the very item this stage exists to keep small. The router's logits go back RAW: the
         // host's softmax and top-k stay the same ops in the same order they were before the
         // card existed, so the routing decision does not move.
-        ggml_tensor* out = ggml_concat(c, ggml_concat(c, ffn_inp, xf, 0), rl, 0);
-        ggml_set_output(out);
+        // MEMEX_SPLIT_OUT=1 (default) drops the two ggml_concat nodes. They existed only to pack
+        // the three things the host needs - the residual stream, its normed copy and the router
+        // logits - into ONE tensor, because a separate ggml_backend_tensor_get per output would
+        // have been three submit-and-fence round trips. That reason is gone: readbacks are now
+        // folded into the graph's own command buffer, so three copies cost three entries in one
+        // command buffer and still one round trip.
+        //
+        // What it saves: two dispatches of nineteen, 14.3 us each, 1.4 ms of a 53.9 ms token.
+        // Bit-identical - a concat moves bytes, it does not compute.
+        static const int split_out = getenv("MEMEX_SPLIT_OUT")
+                                         ? atoi(getenv("MEMEX_SPLIT_OUT")) : 1;
+        ggml_tensor* out = nullptr;
+        if (split_out) {
+            ggml_set_output(ffn_inp);
+            ggml_set_output(xf);
+            ggml_set_output(rl);
+        } else {
+            out = ggml_concat(c, ggml_concat(c, ffn_inp, xf, 0), rl, 0);
+            ggml_set_output(out);
+        }
 
         ggml_cgraph* gf = ggml_new_graph_custom(c, nodes, false);
         // The two cache writes go in first, exactly as the host graph orders them: the read
         // views below are views of the same buffer rather than descendants of the copies, so
         // nothing but insertion order puts the write before the read.
-        ggml_build_forward_expand(gf, kcpy);
-        ggml_build_forward_expand(gf, vcpy);
-        ggml_build_forward_expand(gf, out);
+        // MEMEX_STATIC_TRUNC=N: build the graph only up to stage N. THE OUTPUT IS THEN WRONG,
+        // deliberately, and that is what makes this an instrument: device time does not depend
+        // on the values (rule 73), so the INCREMENT from stage N to stage N+1 is the true cost
+        // of the nodes between them - including their pre-dispatch barrier and any submit they
+        // trigger.
+        //
+        // Why not per-node timestamps. Tried, and refuted (METHODS 80): execution on the card is
+        // serial, so a small node's timestamp span includes the drain of the big node before it,
+        // and the logger duly reported ROPE as the most expensive op in attention while removing
+        // it changed nothing. An increment cannot be misattributed - the barrier and the wait are
+        // part of what was removed.
+        //
+        // Why stages rather than single nodes. Run-to-run noise on this box is about 1 ms per
+        // token, i.e. ~20 us per crossing; one node at ~10 us is below it. Stages remove five to
+        // ten nodes at a time, which puts the signal above the floor.
+        //
+        //   1 input norm only          2 + q,k,v projections      3 + q,k norms and ropes
+        //   4 + KV cache writes        5 + kq                     6 + softmax
+        //   7 + kqv                    8 + o_proj and residual    0 or >=9 full graph
+        const int trunc = memex_static_trunc();
+        if (trunc >= 1 && trunc <= 8) {
+            ggml_tensor* stop = nullptr;
+            switch (trunc) {
+                case 1: stop = x;   break;
+                case 2: stop = v;   break;   // q and k are ancestors of nothing yet; v pulls x
+                case 3: stop = k;   break;   // k carries norm+rope; q's pair is a sibling
+                case 4: stop = nullptr; break;
+                case 5: stop = kq;  break;
+                case 6: stop = p;   break;
+                case 7: stop = kqv; break;
+                case 8: stop = ffn_inp; break;
+            }
+            if (trunc == 2) { ggml_build_forward_expand(gf, q); ggml_build_forward_expand(gf, k); }
+            if (trunc == 3) { ggml_build_forward_expand(gf, q); }
+            if (trunc >= 4) { ggml_build_forward_expand(gf, kcpy); ggml_build_forward_expand(gf, vcpy); }
+            if (stop) ggml_build_forward_expand(gf, stop);
+            if (trunc == 4) { /* nothing beyond the writes */ }
+            fprintf(stderr, "STATIC_TRUNC %d uzlov %d\n", trunc, ggml_graph_n_nodes(gf));
+            fflush(stderr);
+        } else {
+            ggml_build_forward_expand(gf, kcpy);
+            ggml_build_forward_expand(gf, vcpy);
+            if (out) {
+                ggml_build_forward_expand(gf, out);
+            } else {
+                ggml_build_forward_expand(gf, ffn_inp);
+                ggml_build_forward_expand(gf, xf);
+                ggml_build_forward_expand(gf, rl);
+            }
+            static bool said = false;
+            if (!said) { said = true; fprintf(stderr, "STATIC_TRUNC 0 uzlov %d\n", ggml_graph_n_nodes(gf)); fflush(stderr); }
+        }
 
         ggml_gallocr_t ga = ggml_gallocr_new(buft_);
         if (!ga || !ggml_gallocr_reserve(ga, gf) || !ggml_gallocr_alloc_graph(ga, gf)) {
@@ -955,6 +1047,7 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
             return false;
         }
         G.gf = gf;  G.ga = ga;  G.out = out;
+        G.o_res = ffn_inp; G.o_xf = xf; G.o_rl = rl;
         G.kdst = kdst; G.vdst = vdst; G.kcpy = kcpy; G.vcpy = vcpy;
         G.K = K; G.V = V; G.kq = kq; G.probs = p;
         G.mapped = nullptr;
@@ -1125,6 +1218,40 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
         }
         ggml_backend_tensor_set(t_lx_, cur->data, 0,
                                 std::size_t(cfg_.n_embd) * sizeof(float));
+        // Fold the readback into the graph's own command buffer, so this layer costs ONE
+        // round trip to the device instead of two. Measured on the expert path first: the
+        // separate read there was 113 us a layer for 46 KB, i.e. two submit-and-fence round
+        // trips where one would do, and folding it in took the expert dispatch from 21.60 to
+        // 16.82 ms per token with the tokens still identical.
+        //
+        // Here the same term is BIGGER: 0.114 ms of fence on each of 49 crossings per token,
+        // 5.59 ms of a 58.7 ms token, and the CPU thread is stopped for all of it because the
+        // layer path runs inside ggml_map_custom on the thread executing the node.
+        //
+        // rb_ is pinned, which is the condition for folding; if arming refuses we take the old
+        // path and are no worse off. MEMEX_FOLD_READBACK=0 forces the old path.
+        static const int fold_rb = getenv("MEMEX_FOLD_READBACK")
+                                       ? atoi(getenv("MEMEX_FOLD_READBACK")) : 1;
+        // Under MEMEX_STATIC_TRUNC the output tensor is not in the graph, so gallocr never gave
+        // it a buffer and both arming and reading it would abort on "tensor buffer not set".
+        // The values are garbage in that mode by design; only the device time is being read.
+        const bool truncated = memex_static_trunc() != 0;
+        bool folded = false;
+        if (fold_rb && !truncated) {
+            if (G.out) {
+                folded = ggml_backend_vk_arm_readback(be_, G.out, rb_, 0,
+                                                      out_floats * sizeof(float));
+            } else {
+                // Three copies into the same pinned buffer at the offsets the concatenated
+                // layout used, so the host side downstream is byte-for-byte what it was.
+                const std::size_t ne = std::size_t(cfg_.n_embd);
+                const bool a = ggml_backend_vk_arm_readback(be_, G.o_res, rb_,          0, ne * sizeof(float));
+                const bool b = ggml_backend_vk_arm_readback(be_, G.o_xf,  rb_ + ne,     0, ne * sizeof(float));
+                const bool cc= ggml_backend_vk_arm_readback(be_, G.o_rl,  rb_ + 2 * ne, 0,
+                                                            std::size_t(cfg_.n_expert) * sizeof(float));
+                folded = a && b && cc;
+            }
+        }
         auto tb = std::chrono::steady_clock::now();
         ggml_backend_graph_compute(be_, G.gf);
         auto tc = std::chrono::steady_clock::now();
@@ -1154,8 +1281,20 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
         // rb_ is shared with the head. Safe by construction rather than by luck: both run from
         // ggml_map_custom with n_tasks == 1 on the one thread that executes the node, and the
         // head is the last node of the graph while every layer is strictly before it.
-        ggml_backend_tensor_get(G.out, rb_, 0, out_floats * sizeof(float));
-        std::memcpy(dst->data, rb_, out_floats * sizeof(float));
+        if (!folded && !truncated) {
+            if (G.out) {
+                ggml_backend_tensor_get(G.out, rb_, 0, out_floats * sizeof(float));
+            } else {
+                const std::size_t ne = std::size_t(cfg_.n_embd);
+                ggml_backend_tensor_get(G.o_res, rb_,          0, ne * sizeof(float));
+                ggml_backend_tensor_get(G.o_xf,  rb_ + ne,     0, ne * sizeof(float));
+                ggml_backend_tensor_get(G.o_rl,  rb_ + 2 * ne, 0,
+                                        std::size_t(cfg_.n_expert) * sizeof(float));
+            }
+        }
+        if (!truncated) {
+            std::memcpy(dst->data, rb_, out_floats * sizeof(float));
+        }
         ++st_.layer_readback_fenced;
         auto td = std::chrono::steady_clock::now();
         st_.layer_ms_upload += std::chrono::duration<double, std::milli>(tb - ta).count();

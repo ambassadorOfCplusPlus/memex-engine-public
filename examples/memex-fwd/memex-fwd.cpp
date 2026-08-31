@@ -2800,8 +2800,27 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // the weight is mmapped and shared; multiplying x by s before the matmul is the same
         // product as the reference's pre-scaled w, and it is the same magnitude going into
         // mul_mat, which matters on the iqk path where the activation vector is quantised.
+        // NO second scale here. The comment above was right that llm_scale_gate_inp_s exists
+        // and wrong about what it leaves behind under mmap.
+        //
+        // With mmap the function does NOT edit the mapped bytes - it cannot, they are shared
+        // and read-only. It allocates model.aux_buffer, writes val[j] * 1/sqrt(n_embd) into
+        // it, and REPOINTS gis->data at that buffer (llama.cpp:3839-3851). So the tensor this
+        // engine fetches by name out of the same llama_model already carries the scale, and
+        // applying f_router_scale on top of it divided the router logits by 53.07 a second
+        // time.
+        //
+        // What that looked like: logits 53x too SMALL, so softmax comes out nearly uniform and
+        // the eight chosen weights land near 1/8 each instead of a real mixture. The routed
+        // half then shrinks by sqrt(sum w^2) - 1/sqrt(8) = 0.354 for uniform weights against
+        // ~1 for a peaked one, i.e. about 2.83x. Measured: 2.936 (rms 0.78495 against the
+        // reference's 2.30438). That is the whole 17.11% divergence at ffn_moe_combined.
+        //
+        // The generalisation is the same one as before, only sharper: a weight can be
+        // transformed between the file and the graph, AND the transformation can be invisible
+        // in the file because it lives in a substituted data pointer. Checking the gguf is not
+        // enough; the value has to be read from the tensor the graph will actually see.
         ggml_tensor* rnormed = fnorm(c, attn_out, L.router_scale, eps);
-        if (h.f_router_scale != 1.0f) rnormed = ggml_scale(c, rnormed, h.f_router_scale);
         ggml_tensor* rlogits = ggml_mul_mat(c, L.router, rnormed);
         ggml_tensor* probs = ggml_soft_max(c, rlogits);
         ggml_tensor* sel = ggml_top_k(c, probs, h.n_expert_used);
@@ -3942,14 +3961,29 @@ double expert_bytes_one(const Weights& w, const HParams& h) {
 // Resident experts in video memory, as an option
 // ---------------------------------------------------------------------------------------
 
-// Off by default, and the defaults for everything else are the values the simulation over real
-// router traces settled on: 29 of 128 per layer is what 3.6 GB of usable video memory holds,
-// and 64/3/8 is the window, period and promotion budget that gave 67-80% hits at 19-50 MB of
+// Off by default. The other defaults came from a simulation over router traces - 29 of 128 per
+// layer is what 3.6 GB of usable video memory holds, and 64/3/8 gave 67-80% hits at 19-50 MB of
 // promotions per token. See resident_set.hpp.
+//
+// The period is NOT from that simulation any more, because the simulation was scoring the wrong
+// thing. It maximised hits and treated promotions as free; they are not. A promotion costs
+// 1.306 ms and one hit-rate point is worth 0.368 ms per token, so ONE promotion per token has to
+// buy 3.55 points just to break even. Refreshing every 3 tokens buys about 2.3 points at 6.91
+// promotions and loses badly.
+//
+// Measured, two clean replicates each, one session, interleaved:
+//     period 3 (the old default)   14.10 / 14.19 tok/s   spread 0.6%
+//     frozen after warm-up         16.41 / 16.49         spread 0.5%   +16.3%
+// Periods 16/32/64 are not results - spreads 12.6% and 5.8%, and period 64 has one replicate.
+//
+// So the default is now 32: it keeps the set adapting, which matters across a domain switch (a
+// code-derived set takes 24.1% of Russian-text picks against 25.0% for a random one), while
+// costing about a fifth of the promotions of period 3. Use --resident-freeze for the fastest
+// measured arm when the workload does not change.
 struct ResidentOpt {
     int capacity = 0;      // --resident, experts per layer; 0 = off
     int window   = 64;     // --resident-window, tokens
-    int period   = 3;      // --resident-period, tokens
+    int period   = 32;     // --resident-period, tokens
     int budget   = 8;      // --resident-budget, promotions per refresh
     bool lfu     = true;   // --resident-policy lfu | lru
     // --resident-freeze: after the warm-up the set stops changing. Zero promotions is the
@@ -5775,8 +5809,12 @@ int main(int argc, char** argv) {
         }
         if (h.f_embd_scale > 0.0f) printf("  вложения масштабируются на %g\n", h.f_embd_scale);
         if (h.f_router_scale != 1.0f) {
-            printf("  vhod marshrutizatora umnozhaetsja na %g -- etalon delaet to zhe samoe\n", h.f_router_scale);
-            printf("  s samim ffn_gate_inp.scale pri zagruzke (llm_scale_gate_inp_s)\n");
+            // Pechataem, no NE primenjaem. Masshtab uzhe vnutri ffn_gate_inp.scale k tomu
+            // momentu, kak ego vidit etot dvizhok: pri mmap llm_scale_gate_inp_s perestavljaet
+            // gis->data na masshtabirovannuju kopiju v aux_buffer. V FAJLE lezhit 32.05, v
+            // TENZORE 0.604, i do grafa dohodit tolko vtoroe.
+            printf("  masshtab marshrutizatora %g UZHE vnutri ffn_gate_inp.scale, povtorno ne primenjaem\n",
+                   h.f_router_scale);
         }
     }
 
@@ -7847,6 +7885,28 @@ int main(int argc, char** argv) {
                                       promo_fe_gen) / double(promo_n_gen) : 0.0,
                        promo_rd_gen > 0.0
                            ? double(promo_rdby_gen) / 1e9 / (promo_rd_gen / 1000.0) : 0.0);
+            }
+            // IZ CHEGO SOSTOIT DISPATCH. Odna ASCII-stroka, po tem zhe prichinam, chto
+            // PROMO_AB: eto samyj krupnyj neobjasnjonnyj chlen tokjena. ms_job prihodit okolo
+            // 21,4 ms na tokjen, a bajty, kotorye karta dolzhna prochitat pri 71% popadanij,
+            // eto okolo 650 MB, to est 5,0 ms pri izmerennyh 131 GB/s. Chetyre raza, i do sih
+            // por nikto ne razdelil, gde oni.
+            //
+            // Vazhno: eto VESJA rabota, vkljuchaja nachalnyj proliv videopamjati, potomu chto
+            // bazy dlja vychitanija u etih chetyrjoh schjotchikov net. Sravnivat s job_tok iz
+            // PROMO_AB (on tozhe bez vychitanija) - oni dolzhny sojtis.
+            {
+                const double nd  = double(gs.n_dispatch ? gs.n_dispatch : 1);
+                const double ntk = double(n_gen > 0 ? n_gen : 1);
+                printf("DISPATCH_AB n %llu in %.4f graph %.4f out %.4f scatter %.4f "
+                       "sum %.4f job %.4f in_tok %.4f graph_tok %.4f out_tok %.4f "
+                       "scatter_tok %.4f job_tok %.4f\n",
+                       (unsigned long long)gs.n_dispatch,
+                       gs.ms_in / nd, gs.ms_graph / nd, gs.ms_out / nd, gs.ms_scatter / nd,
+                       (gs.ms_in + gs.ms_graph + gs.ms_out + gs.ms_scatter) / nd,
+                       gs.ms_job / nd,
+                       gs.ms_in / ntk, gs.ms_graph / ntk, gs.ms_out / ntk,
+                       gs.ms_scatter / ntk, gs.ms_job / ntk);
             }
             printf("  где что лежит         : веса экспертов — Vulkan (%.2f ГиБ, "
                    "%zu буфер(а/ов) > 256 МиБ); вход, идентификаторы, выход половины — "

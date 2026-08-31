@@ -178,6 +178,20 @@ struct GpuExpertsStats {
     uint64_t n_read          = 0;   // read_plain calls: three per promotion
     uint64_t read_bytes      = 0;   // bytes those calls moved
     uint64_t n_fence_calls   = 0;   // batch_end calls that had anything recorded
+    // WHAT THE DISPATCH ITSELF IS MADE OF, and it is the largest unexplained term in the token.
+    //
+    // ms_job measures compute(il) end to end and comes back at ~21.4 ms/token. The bytes that
+    // dispatch has to move are far less than that: at 71.3% hits the card reads about 650 MB
+    // per token, which at the measured 131 GB/s of video memory is 5.0 ms. Four times over,
+    // and the gap has never been split. On one layer it is 445 us against 104 us of bytes.
+    //
+    // compute() does exactly four things, so four timers name the whole of it. If they do not
+    // sum to ms_job, the remainder is the instrument's own error and is worth knowing too.
+    double   ms_in           = 0.0; // ggml_backend_tensor_set: the activation and the id list
+    double   ms_graph        = 0.0; // ggml_backend_graph_compute: the three matmuls
+    double   ms_out          = 0.0; // ggml_backend_tensor_get: the readback
+    double   ms_scatter      = 0.0; // memcpy back into the router's slots, pure host work
+    uint64_t n_dispatch      = 0;   // compute() calls that did anything (k > 0)
     // --gpu-experts-check
     uint64_t checked       = 0;   // slots compared against the CPU's own resident half
     uint64_t zero_bad      = 0;   // slots the device does not own that came back non-zero

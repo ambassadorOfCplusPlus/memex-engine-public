@@ -316,6 +316,12 @@ class GpuStatic {
         ggml_cgraph*   gf = nullptr;
         ggml_gallocr_t ga = nullptr;
         ggml_tensor*   out = nullptr;    // the concatenated [2*n_embd + n_expert, 1] result
+        // The three pieces separately. Used when MEMEX_SPLIT_OUT is on and `out` is null: the two
+        // ggml_concat nodes that packed them existed only because a separate readback per output
+        // used to cost a separate round trip, which folding the readback into the graph removed.
+        ggml_tensor*   o_res = nullptr;   // the residual stream, [n_embd, 1]
+        ggml_tensor*   o_xf  = nullptr;   // its normed copy, [n_embd, 1]
+        ggml_tensor*   o_rl  = nullptr;   // the router logits, [n_expert, 1]
         ggml_tensor*   kdst = nullptr;   // the write view, aimed at n_past
         ggml_tensor*   vdst = nullptr;
         ggml_tensor*   kcpy = nullptr;   // and the copy node that carries the same offset

@@ -1051,6 +1051,40 @@ struct ggml_backend_vk_context {
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k;
     vk::Fence fence, almost_ready_fence;
     bool almost_ready_fence_pending {};
+    // The batch upload path (ggml_backend_vk_batch_begin/_end) gets its OWN fence rather than
+    // sharing ctx->fence with compute. Two reasons, and the second is why it exists at all:
+    // the prefetch runs on a different thread from the graph, so one fence shared between them
+    // is a latent race; and an asynchronous end needs a fence that nobody else resets.
+    vk::Fence transfer_fence;
+
+    // ONE ARMED READBACK, folded into the graph's own command buffer.
+    //
+    // Why it exists. A layer of the resident-expert path costs two round trips to the device,
+    // not one: ggml_backend_graph_compute submits and waits on a fence, then
+    // ggml_backend_tensor_get submits and waits on a SECOND. Measured, three replicates:
+    // the readback is 113 us per layer for 46 KB, i.e. 0.4 GB/s - which is nothing to do with
+    // bandwidth (46 KB over PCIe is ~8 us) and everything to do with the round trip; the
+    // measured floor of one submit-plus-fence on this device is 59 us, and 113 is two of them.
+    // Over 48 layers that is 5.45 ms of a 61 ms token.
+    //
+    // What this does. Records the copy into the SAME command buffer as the graph's last node,
+    // so the graph's own fence covers it and the second round trip disappears. The destination
+    // must be pinned host memory: ggml_vk_buffer_read_2d_async then records a plain copyBuffer
+    // with no staging and no deferred memcpy, which is what makes this safe to fold in.
+    struct pending_rb_t {
+        vk_buffer src    = nullptr;
+        size_t    offset = 0;
+        void *    dst    = nullptr;
+        size_t    size   = 0;
+    };
+    // Up to four, because a layer has three outputs the host needs (the residual stream, its
+    // normed copy and the router logits) and packing them with two ggml_concat nodes to make one
+    // readback costs two dispatches - 14.3 us each, 1.4 ms a token over 48 layers. Arming them
+    // separately costs three copies in the SAME command buffer, i.e. still one round trip, and
+    // deletes both concats.
+    static constexpr int max_pending_rb = 4;
+    pending_rb_t pending_rb[max_pending_rb];
+    int          pending_rb_n = 0;
 
     vk_buffer buffer_pool[MAX_VK_BUFFERS];
 
@@ -4007,6 +4041,11 @@ static void ggml_vk_instance_init() {
     vk_submit_stats   = ggml_vk_env_int("GGML_VK_SUBMIT_STATS",   0) != 0;
     vk_no_sync        = ggml_vk_env_int("GGML_VK_NO_SYNC",        0) != 0;
     vk_narrow_sync    = ggml_vk_env_int("GGML_VK_NARROW_SYNC",    0);
+    // Rule 68: an arm whose setting was not confirmed is not an arm. Printed once so an A/B
+    // script can verify which branch actually ran rather than trusting that the environment
+    // variable reached the process.
+    fprintf(stderr, "NARROW_SYNC %d SUBMIT_DIVISOR %d\n", vk_narrow_sync, vk_submit_divisor);
+    fflush(stderr);
     if (vk_submit_nodes < 1) {
         vk_submit_nodes = 1;
     }
@@ -4157,6 +4196,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
 
     ctx->fence = ctx->device->device.createFence({});
     ctx->almost_ready_fence = ctx->device->device.createFence({});
+    ctx->transfer_fence = ctx->device->device.createFence({});
 
     ctx->compute_cmd_pool.init(ctx->device, &ctx->device->compute_queue);
     ctx->transfer_cmd_pool.init(ctx->device, &ctx->device->transfer_queue);
@@ -9698,6 +9738,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 #endif
 
     if (submit || last_node) {
+        // Fold the armed readback in before the buffer is closed. Only on the last node: an
+        // earlier submit would copy an output the graph has not finished writing.
+        if (last_node && ctx->pending_rb_n > 0) {
+            for (int r = 0; r < ctx->pending_rb_n; ++r) {
+                ggml_vk_buffer_read_async(compute_ctx, ctx->pending_rb[r].src,
+                                          ctx->pending_rb[r].offset,
+                                          ctx->pending_rb[r].dst, ctx->pending_rb[r].size);
+            }
+            ctx->pending_rb_n = 0;
+        }
         ggml_vk_ctx_end(compute_ctx);
 
         // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
@@ -9854,12 +9904,53 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             ggml_vk_submit(subctx, ctx->almost_ready_fence);
             ctx->almost_ready_fence_pending = true;
         } else {
+            // GGML_VK_FENCE_SPLIT=1 times the two halves of the round trip separately and
+            // prints a running average. The question it answers: a graph of ONE trivial node
+            // measures 310 us end to end on this device and 28 further nodes add only 272 us, so
+            // the fixed part dominates - but nothing said whether it is the submit ioctl or the
+            // wait for the GPU to come back. The fix differs: a cheaper submit path against a
+            // cheaper completion signal.
+            //
+            // No early return here: the out_memcpys drain below must still run.
+            static const int fence_split = getenv("GGML_VK_FENCE_SPLIT")
+                                               ? atoi(getenv("GGML_VK_FENCE_SPLIT")) : 0;
+            static double acc_submit = 0.0, acc_wait = 0.0;
+            static uint64_t acc_n = 0;
+            // The MINIMUM over thousands of calls is the question, not the mean. If some waits
+            // come back in tens of microseconds and others in hundreds, 290 us is variance -
+            // scheduling or power management - and the fix is keeping the device hot. If every
+            // wait is ~290, it is a floor and the only lever left is fewer round trips.
+            static double min_wait = 1e9, max_wait = 0.0;
+            static uint64_t bucket[6] = {0,0,0,0,0,0};   // <50, <100, <200, <400, <1000, rest (us)
+            const auto t_fs0 = std::chrono::steady_clock::now();
             ggml_vk_submit(subctx, use_fence ? ctx->fence : vk::Fence{});
+            const auto t_fs1 = std::chrono::steady_clock::now();
+            if (use_fence) {
+                ggml_vk_wait_for_fence(ctx);
+            }
+            const auto t_fs2 = std::chrono::steady_clock::now();
+            if (fence_split && use_fence) {
+                using D = std::chrono::duration<double, std::milli>;
+                acc_submit += D(t_fs1 - t_fs0).count();
+                const double w = D(t_fs2 - t_fs1).count();
+                acc_wait += w;
+                if (w < min_wait) min_wait = w;
+                if (w > max_wait) max_wait = w;
+                const double wus = w * 1000.0;
+                bucket[wus < 50 ? 0 : wus < 100 ? 1 : wus < 200 ? 2 : wus < 400 ? 3 : wus < 1000 ? 4 : 5]++;
+                if (++acc_n % 2000 == 0) {
+                    fprintf(stderr, "FENCE_SPLIT n %llu submit %.4f zhdjom %.4f min %.4f max %.4f "
+                            "|<50 %llu |<100 %llu |<200 %llu |<400 %llu |<1000 %llu |rest %llu\n",
+                            (unsigned long long)acc_n, acc_submit / double(acc_n),
+                            acc_wait / double(acc_n), min_wait, max_wait,
+                            (unsigned long long)bucket[0], (unsigned long long)bucket[1],
+                            (unsigned long long)bucket[2], (unsigned long long)bucket[3],
+                            (unsigned long long)bucket[4], (unsigned long long)bucket[5]);
+                    fflush(stderr);
+                }
+            }
         }
 
-        if (use_fence) {
-            ggml_vk_wait_for_fence(ctx);
-        }
 #ifdef GGML_VULKAN_CHECK_RESULTS
         ggml_vk_check_results_1(ctx, cgraph, tensor_idx);
 #endif
@@ -9935,6 +10026,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->device->device.destroyFence(ctx->fence);
     ctx->device->device.destroyFence(ctx->almost_ready_fence);
+    ctx->device->device.destroyFence(ctx->transfer_fence);
 
     for (auto& pool : ctx->descriptor_pools) {
         ctx->device->device.destroyDescriptorPool(pool);
@@ -10406,6 +10498,35 @@ GGML_CALL bool ggml_backend_vk_batch_set_tensor(ggml_backend_t backend, ggml_ten
     return true;
 }
 
+// Arm a readback to be folded into the NEXT graph_compute on this backend. Returns false if it
+// cannot be folded - the caller then falls back to ggml_backend_tensor_get and is no worse off
+// than before. Refuses a non-pinned destination rather than silently taking the staging path,
+// because staging defers a memcpy that nothing on this path would drain.
+GGML_CALL bool ggml_backend_vk_arm_readback(ggml_backend_t backend, const ggml_tensor * tensor,
+                                            void * dst, size_t offset, size_t size) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_vk(tensor->buffer)) {
+        return false;
+    }
+    vk_buffer pinned = nullptr;
+    size_t    pinned_off = 0;
+    ggml_vk_host_get(ctx->device, dst, pinned, pinned_off);
+    if (pinned == nullptr) {
+        return false;   // not pinned: folding it in would need staging, which nobody drains here
+    }
+    if (ctx->pending_rb_n >= ggml_backend_vk_context::max_pending_rb) {
+        return false;   // caller falls back to ggml_backend_tensor_get and is no worse off
+    }
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+    ggml_backend_vk_context::pending_rb_t& e = ctx->pending_rb[ctx->pending_rb_n++];
+    e.src    = buf_ctx->dev_buffer;
+    e.offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+    e.dst    = dst;
+    e.size   = size;
+    return true;
+}
+
 GGML_CALL void ggml_backend_vk_batch_end(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_vk(backend));
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -10419,8 +10540,54 @@ GGML_CALL void ggml_backend_vk_batch_end(ggml_backend_t backend) {
     for (auto& cpy : transfer_ctx->in_memcpys) {
         memcpy(cpy.dst, cpy.src, cpy.n);
     }
-    ggml_vk_submit(transfer_ctx, ctx->fence);
-    ggml_vk_wait_for_fence(ctx);
+    ggml_vk_submit(transfer_ctx, ctx->transfer_fence);
+    // GGML_VK_BATCH_SPIN=1 restores the old behaviour so the two can be compared in ONE binary
+    // and one session. A before/after built as two binaries would put the comparison across a
+    // rebuild, and this project has measured 11.6% of drift between sessions on an unchanged
+    // binary - three times the 4.2% within-session floor.
+    static const int batch_spin = getenv("GGML_VK_BATCH_SPIN") ? atoi(getenv("GGML_VK_BATCH_SPIN")) : 0;
+    // Rule 68: an arm whose setting was not confirmed is not an arm. Printed once, on the
+    // first batch, so the A/B script can verify which branch actually ran instead of trusting
+    // that the environment variable reached the process.
+    static bool batch_spin_said = false;
+    if (!batch_spin_said) {
+        batch_spin_said = true;
+        fprintf(stderr, "BATCH_WAIT %s\n", batch_spin ? "spin" : "sleep");
+        fflush(stderr);
+    }
+    if (batch_spin) {
+        vk::Result r;
+        while ((r = ctx->device->device.getFenceStatus(ctx->transfer_fence)) != vk::Result::eSuccess) {
+            if (r != vk::Result::eNotReady) {
+                fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(r).c_str(), __FILE__, __LINE__);
+                exit(1);
+            }
+            for (uint32_t i = 0; i < 100; ++i) {
+                YIELD(); YIELD(); YIELD(); YIELD(); YIELD();
+                YIELD(); YIELD(); YIELD(); YIELD(); YIELD();
+            }
+        }
+        ctx->device->device.resetFences({ ctx->transfer_fence });
+        for (auto& cpy : transfer_ctx->out_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+        ctx->transfer_ctx.reset();
+        return;
+    }
+    // A BLOCKING wait, not ggml_vk_wait_for_fence's YIELD spin.
+    //
+    // The spin is right for the graph: the calling thread has nothing else to do and waking
+    // promptly is worth a core. It is wrong here. This wait runs on the prefetch thread, it
+    // lasts 0.949 ms of the 1.306 ms a promotion costs, and the core it burns is the one the
+    // CPU half of the model wants - which is exactly the mechanism the frozen-set measurement
+    // pointed at (freezing the set gave back 3.95 ms of join wait per token while CPU time
+    // per token did not move at all).
+    //
+    // waitForFences sleeps instead. The wall time of the transfer is unchanged; what changes
+    // is that the core is released while it happens.
+    VK_CHECK(ctx->device->device.waitForFences({ ctx->transfer_fence }, true, UINT64_MAX),
+             "ggml_backend_vk_batch_end waitForFences");
+    ctx->device->device.resetFences({ ctx->transfer_fence });
     for (auto& cpy : transfer_ctx->out_memcpys) {
         memcpy(cpy.dst, cpy.src, cpy.n);
     }
@@ -10487,6 +10654,7 @@ static bool ggml_vk_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, st
 }
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    const auto t_gc0 = std::chrono::steady_clock::now();
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
@@ -10519,6 +10687,30 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
     ggml_vk_preallocate_buffers(ctx);
     ggml_pipeline_allocate_descriptor_sets(ctx);
+    // GGML_VK_HOST_SPLIT=1 prints how much of a graph_compute call is spent BEFORE anything is
+    // submitted: the dry-run pass over every node, shader loading, buffer preallocation and
+    // descriptor-set allocation. All of it is redone on every call although our layer graphs are
+    // structurally identical from token to token - only the KV length changes.
+    //
+    // Why this is the question. A graph of ONE trivial node costs 310 us end to end. The submit
+    // is 20 us and the fence wait comes back in 42 us at its fastest and under 100 for most
+    // calls, so the driver and the card account for roughly a third. The rest has to be here,
+    // and unlike the driver it is our own code.
+    {
+        static const int host_split = getenv("GGML_VK_HOST_SPLIT")
+                                          ? atoi(getenv("GGML_VK_HOST_SPLIT")) : 0;
+        static double acc = 0.0; static uint64_t n = 0; static double mn = 1e9;
+        if (host_split) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t_gc0).count();
+            acc += ms; if (ms < mn) mn = ms;
+            if (++n % 2000 == 0) {
+                fprintf(stderr, "HOST_SPLIT n %llu do_submita %.4f min %.4f uzlov %d\n",
+                        (unsigned long long)n, acc / double(n), mn, cgraph->n_nodes);
+                fflush(stderr);
+            }
+        }
+    }
 
     int last_node = cgraph->n_nodes - 1;
 

@@ -47,6 +47,13 @@ GGML_API GGML_CALL bool ggml_backend_vk_batch_set_tensor(ggml_backend_t backend,
                                                         const void * data, size_t offset, size_t size);
 GGML_API GGML_CALL void ggml_backend_vk_batch_end(ggml_backend_t backend);
 
+// Fold one readback into the next graph_compute's command buffer, removing a whole
+// submit-and-fence round trip per call. `dst` must be pinned host memory
+// (ggml_backend_vk_host_buffer_type); returns false if it cannot be folded, and the caller
+// should then use ggml_backend_tensor_get as before.
+GGML_API GGML_CALL bool ggml_backend_vk_arm_readback(ggml_backend_t backend, const struct ggml_tensor * tensor,
+                                                     void * dst, size_t offset, size_t size);
+
 // Host pointer to THIS TENSOR'S bytes when the driver placed its buffer in host-visible,
 // host-coherent memory (which it does for a small buffer, in the BAR heap), else NULL. Reading a
 // few tens of KB straight through the mapping beats ggml_backend_tensor_get's submit+fence,

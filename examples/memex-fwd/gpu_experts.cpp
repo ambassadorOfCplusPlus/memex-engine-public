@@ -1366,9 +1366,13 @@ void GpuExperts::compute(int il, int k) {
     std::fill(res_.begin(), res_.begin() + ne * std::size_t(cfg_.n_used), 0.0f);
     if (k <= 0) return;
 
+    // Four timers over the four things this function does. The clock is steady_clock at ~25 ns
+    // a call; eight calls per layer is 0.4 us against a 445 us layer, i.e. 0.09%.
+    const auto t_in0 = std::chrono::steady_clock::now();
     ggml_backend_tensor_set(t_x_, job_x_.data(), 0, ne * sizeof(float));
     ggml_backend_tensor_set(n_ids_[std::size_t(k)], job_slots_.data(), 0,
                             std::size_t(k) * sizeof(int32_t));
+    const auto t_in1 = std::chrono::steady_clock::now();
     // Re-aiming rather than rebuilding, the same trick the decode graph's cache writes use:
     // every layer's three expert stacks have the same shape and type, so one built graph per
     // width serves all forty-eight of them and the only thing that moves is src[0].
@@ -1376,7 +1380,30 @@ void GpuExperts::compute(int il, int k) {
     n_gate_[std::size_t(k)]->src[0] = gate_[std::size_t(il)];
     n_down_[std::size_t(k)]->src[0] = down_[std::size_t(il)];
 
+    // Arm the readback so it rides in the graph's own command buffer. Measured: the separate
+    // ggml_backend_tensor_get below costs 113 us a layer for 46 KB - two submit-and-fence round
+    // trips where one would do, 5.45 ms of a 61 ms token over forty-eight layers.
+    //
+    // rb_ is pinned (ggml_backend_vk_host_buffer_type above), which is the condition for folding
+    // it in; if arming refuses for any reason we take the old path and are no worse off.
+    // MEMEX_FOLD_READBACK=0 forces the old path so the two can be compared in one binary.
+    static const int fold_rb = getenv("MEMEX_FOLD_READBACK")
+                                   ? atoi(getenv("MEMEX_FOLD_READBACK")) : 1;
+    const std::size_t rb_bytes = ne * std::size_t(k) * sizeof(float);
+    bool folded = false;
+    if (fold_rb) {
+        folded = ggml_backend_vk_arm_readback(be_, n_out_[std::size_t(k)], rb_, 0, rb_bytes);
+    }
+    static bool fold_said = false;
+    if (!fold_said) {
+        fold_said = true;
+        fprintf(stderr, "FOLD_READBACK %s\n", folded ? "on" : "off");
+        fflush(stderr);
+    }
+
+    const auto t_g0 = std::chrono::steady_clock::now();
     ggml_backend_graph_compute(be_, gf_[std::size_t(k)]);
+    const auto t_g1 = std::chrono::steady_clock::now();
 
     // THE READBACK, AND IT WAS COSTING THE WHOLE SCHEME. Measured, not reasoned about.
     //
@@ -1402,11 +1429,11 @@ void GpuExperts::compute(int il, int k) {
     // Kept as a counted quantity rather than deleted, because "fences per layer" is still worth
     // knowing; it is simply not the quantity that decides this.
     const std::size_t ki = std::size_t(k);
-    ggml_backend_tensor_get(n_out_[ki], rb_, 0, ne * std::size_t(k) * sizeof(float));
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        ++st_.readback_fenced;
+    const auto t_o0 = std::chrono::steady_clock::now();
+    if (!folded) {
+        ggml_backend_tensor_get(n_out_[ki], rb_, 0, rb_bytes);
     }
+    const auto t_o1 = std::chrono::steady_clock::now();
 
     // Scatter back into router slots. Everything else stays the exact 0.0f the fill left,
     // which is what makes ggml_add(o_res, o_oth) a per-slot x + 0.0f and therefore the
@@ -1415,6 +1442,17 @@ void GpuExperts::compute(int il, int k) {
         const int s = job_at_[std::size_t(j)];
         std::memcpy(res_.data() + ne * std::size_t(s), rb_ + ne * std::size_t(j),
                     ne * sizeof(float));
+    }
+    const auto t_s1 = std::chrono::steady_clock::now();
+    {
+        using D = std::chrono::duration<double, std::milli>;
+        std::lock_guard<std::mutex> lk(mu_);
+        ++st_.readback_fenced;
+        st_.ms_in      += D(t_in1 - t_in0).count();
+        st_.ms_graph   += D(t_g1  - t_g0 ).count();
+        st_.ms_out     += D(t_o1  - t_o0 ).count();
+        st_.ms_scatter += D(t_s1  - t_o1 ).count();
+        ++st_.n_dispatch;
     }
 }
 
