@@ -92,6 +92,24 @@
 
 namespace memex {
 
+// Odna geometrija sloja vnimanija. U Gemma 4 ih DVE na tridcat sloev - dvadcat pjat okonnyh s
+// golovami 16/8 po 256 i pjat polnyh s 16/2 po 512 - i osnovanie povorota s masshtabom softmax
+// menjajutsja vmeste s nimi. U qwen3moe ona odna, poetomu etogo tut ranshe ne bylo.
+struct GpuStaticGeom {
+    int   n_head    = 0;
+    int   n_head_kv = 0;
+    int   head_dim  = 0;
+    int   n_rot     = 0;    // rope dimensions; equals head_dim unless the model says otherwise
+    int   rope_type = 0;
+    float rope_base = 0.0f;
+    // The WHOLE softmax scale, not a correction to 1/sqrt(head_dim). Zero means "use
+    // 1/sqrt(head_dim)", which is what every architecture but gemma4 wants.
+    float attn_scale = 0.0f;
+    // Sliding window in positions; 0 means the layer sees the whole cache. Twenty-five of
+    // Gemma four thirty layers are windowed at 1024.
+    int   n_swa     = 0;
+};
+
 struct GpuStaticConfig {
     int n_embd  = 0;
     int n_vocab = 0;
@@ -132,6 +150,20 @@ struct GpuStaticConfig {
     int   rope_type  = 0;
     float rope_base  = 0.0f;
     float rms_eps    = 0.0f;
+
+    // Per-layer geometry. EMPTY means "every layer is the shape given by the scalars above",
+    // which is the qwen3moe case and keeps that path byte-for-byte what it was. When it is
+    // filled it must be n_layer long and it wins over the scalars.
+    std::vector<GpuStaticGeom> geom;
+
+    // The shape of layer il, whichever way it was given.
+    GpuStaticGeom at(int il) const {
+        if (!geom.empty()) return geom[std::size_t(il)];
+        GpuStaticGeom g;
+        g.n_head = n_head; g.n_head_kv = n_head_kv; g.head_dim = head_dim;
+        g.n_rot = head_dim; g.rope_type = rope_type; g.rope_base = rope_base;
+        return g;
+    }
 };
 
 // The model's own attention tensors for one layer, still on the host. Read once at init and
@@ -412,6 +444,10 @@ class GpuStatic {
     int  step_past_ = -1;   // what set_step last aimed the writes at
     int  step_nkv_  = 0;    // and the reads
     bool step_mask_sent_ = false;   // the mask is uploaded once per token, on the first layer
+    // ...unless it changes. Gemma 4 has TWO masks - twenty-five layers see a 1024-position window
+    // and five see the whole cache - so the once-per-token rule is wrong there. Comparing the
+    // source pointer gives the same one upload for qwen3moe and the correct two for gemma4.
+    const void* step_mask_src_ = nullptr;
 };
 
 // A whole-module check that needs no model file: a synthetic Q6_K head of a realistic width,

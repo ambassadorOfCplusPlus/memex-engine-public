@@ -355,6 +355,7 @@ void GpuStatic::shutdown() {
     step_past_ = -1;
     step_nkv_ = 0;
     step_mask_sent_ = false;
+    step_mask_src_  = nullptr;
 
     for (ggml_gallocr_t g : ga_) {
         if (g) ggml_gallocr_free(g);
@@ -644,6 +645,9 @@ bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::str
 
 bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
     const int nl = cfg_.n_layer;
+    // hd i nkv_heads zdes tolko dlja proverok i pechati; sam kesh vydeljaetsja po
+    // POSLOJNOJ geometrii nizhe - u gemma4 golovy 16/2 po 512 i 16/8 po 256 v odnoj modeli,
+    // i odin razmer na vse sloi vydelil by chetvert nuzhnogo libо vchetvero bolshe.
     const int hd = cfg_.head_dim;
     const int nkv_heads = cfg_.n_head_kv;
     const std::size_t align = ggml_backend_buft_get_alignment(buft_);
@@ -757,10 +761,14 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
             // The cache, in exactly the host cache's layout: keys [head_dim, n_kv, heads] and
             // values transposed within each head. Same shape and same type is what lets the
             // prefill's cache be uploaded tensor for tensor rather than repacked on the way.
-            kv_k_[std::size_t(il)] = ggml_new_tensor_3d(cx, GGML_TYPE_F16, hd,
-                                                        cfg_.n_kv_max, nkv_heads);
+            // POSLOJNO. U gemma4 golovy 16/2 po 512 i 16/8 po 256 zhivut v odnoj modeli, tak chto
+            // odin razmer na vse sloi vydelil by libo chetvert nuzhnogo, libo vchetvero bolshe -
+            // i pervoe ne dalo by nikakoj oshibki formy, prosto nevernyj otvet.
+            const GpuStaticGeom gk = cfg_.at(il);
+            kv_k_[std::size_t(il)] = ggml_new_tensor_3d(cx, GGML_TYPE_F16, gk.head_dim,
+                                                        cfg_.n_kv_max, gk.n_head_kv);
             kv_v_[std::size_t(il)] = ggml_new_tensor_3d(cx, GGML_TYPE_F16, cfg_.n_kv_max,
-                                                        hd, nkv_heads);
+                                                        gk.head_dim, gk.n_head_kv);
         }
         if (pad > 0) {
             ggml_tensor* p = ggml_new_tensor_1d(cx, GGML_TYPE_F32,
@@ -817,12 +825,11 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
 
 bool GpuStatic::build_layer_graphs(std::string* err) {
     const int nl = cfg_.n_layer;
-    const int hd = cfg_.head_dim;
     const int ne = cfg_.n_embd;
-    const int nh = cfg_.n_head;
-    const int nkvh = cfg_.n_head_kv;
-    const int dq = nh * hd;
-    const float kq_scale = 1.0f / std::sqrt(float(hd));
+    // GEOMETRIJA TEPER POSLOJNAJA. Ranshe hd/nh/nkvh brались odin raz na vsju model, potomu chto
+    // u qwen3moe ona odna. U gemma4 ih dve: dvadcat pjat okonnyh sloev s golovami 16/8 po 256 i
+    // pjat polnyh s 16/2 po 512, s raznym osnovaniem povorota i masshtabom softmax. cfg_.at(il)
+    // otdajot skaljary, kogda vektor pust, tak chto put qwen3moe ne izmenilsja ni na bajt.
     int sections[GGML_MROPE_SECTIONS] = {0};
 
     // The per-step inputs. Small, so they land in the BAR window, which is exactly where a
@@ -854,6 +861,15 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
     sites_.assign(std::size_t(nl), Site());
 
     for (int il = 0; il < nl; ++il) {
+        const GpuStaticGeom gm = cfg_.at(il);
+        const int   hd   = gm.head_dim;
+        const int   nh   = gm.n_head;
+        const int   nkvh = gm.n_head_kv;
+        const int   dq   = nh * hd;
+        // Ves masshtab, a ne popravka k 1/sqrt(hd): gemma4 zajavljaet edinicu i imenno edinicu
+        // imeet v vidu, a raznica mezhdu 1.0 i 1/sqrt(512) portit vyhod, a ne lomaet ego - to est
+        // hudshim iz vozmozhnyh sposobov.
+        const float kq_scale = gm.attn_scale > 0.0f ? gm.attn_scale : 1.0f / std::sqrt(float(hd));
         LayerGraph& G = lg_[std::size_t(il)];
         GpuStaticLayer& L = lw_[std::size_t(il)];
         sites_[std::size_t(il)].self = this;
@@ -905,14 +921,14 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         if (!no_rope_said) { no_rope_said = true;
             fprintf(stderr, "NO_ROPE %d\n", no_rope); fflush(stderr); }
         if (!no_rope) {
-            q = ggml_rope_multi(c, q, t_pos_, nullptr, hd, sections, cfg_.rope_type,
-                                cfg_.n_ctx_train, cfg_.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            q = ggml_rope_multi(c, q, t_pos_, nullptr, gm.n_rot, sections, gm.rope_type,
+                                cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         }
         k = ggml_reshape_3d(c, k, hd, nkvh, 1);
         k = ggml_fused_rms_norm(c, k, L.k_norm, cfg_.rms_eps);
         if (!no_rope) {
-            k = ggml_rope_multi(c, k, t_pos_, nullptr, hd, sections, cfg_.rope_type,
-                                cfg_.n_ctx_train, cfg_.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            k = ggml_rope_multi(c, k, t_pos_, nullptr, gm.n_rot, sections, gm.rope_type,
+                                cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         }
 
         // [hd, n_head_kv, 1] -> [hd, 1, n_head_kv], same bytes at the same offsets.
@@ -1212,7 +1228,13 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
         // The mask changes once per token, not once per layer. Uploading it on the first layer
         // and not on the other forty-seven removes 47/48 of that transfer, and at long context
         // the mask is the largest of the three inputs.
-        if (!step_mask_sent_) {
+        // Otpravljaem masku, kogda ona SMENILAS, a ne odin raz za shag. Ranshe bylo odin raz, na
+        // pervom sloe, i dlja qwen3moe eto verno - tam maska odna na vsju model. U gemma4 ih dve:
+        // dvadcat pjat sloev so skolzjashchim oknom v 1024 pozicii i pjat polnyh, i host stroit dlja
+        // nih raznye maski. Sravnenie ukazatelja dajot to zhe samoe dlja qwen3moe (odna otpravka na
+        // shag) i pravilnoe dlja gemma4 (dve). Dispatchi idut posledovatelno, po odnomu na sloj,
+        // tak chto otpravit nuzhnuju masku pered dispatchem sloja - dostatochno.
+        if (step_mask_src_ != (mask ? mask->data : nullptr)) {
             if (!mask || mask->type != GGML_TYPE_F32 || mask->ne[0] < step_nkv_) {
                 fail_msg_ = "maska vnimanija uzhe, chem naceleno pozicij";
                 std::memset(dst->data, 0, ggml_nbytes(dst));
@@ -1220,6 +1242,7 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
             }
             ggml_backend_tensor_set(t_mask_, mask->data, 0,
                                     std::size_t(step_nkv_) * sizeof(float));
+            step_mask_src_ = mask->data;
             step_mask_sent_ = true;
         }
         ggml_backend_tensor_set(t_lx_, cur->data, 0,
