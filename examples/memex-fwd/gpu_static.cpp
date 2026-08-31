@@ -241,7 +241,8 @@ bool GpuStatic::init(const GpuStaticConfig& cfg, ggml_tensor* out, std::string* 
         *err = "bessmyslennaja konfiguracija";
         return false;
     }
-    if (!out) { *err = "output.weight otsutstvuet"; return false; }
+    // Golova neobjazatelna: gemma4 beret sloi, no ne golovu (sm. cfg_.head).
+    if (cfg_.head && !out) { *err = "output.weight otsutstvuet"; return false; }
     if (out->ne[0] != cfg_.n_embd || out->ne[1] != cfg_.n_vocab) {
         char b[200];
         snprintf(b, sizeof(b),
@@ -286,8 +287,10 @@ bool GpuStatic::init(const GpuStaticConfig& cfg, ggml_tensor* out, std::string* 
     }
 
     GpuExperts::print_heaps("do razmeshchenija staticheskoj golovy");
-    if (!alloc_head(out, err)) { shutdown(); return false; }
-    if (!build_graphs(err)) { shutdown(); return false; }
+    if (cfg_.head && !alloc_head(out, err)) { shutdown(); return false; }
+    // Grafy GOLOVY - tolko kogda golova est. Bez etoj proverki oni stroilis by po nulevomu
+    // tenzoru: padenie s narusheniem dostupa srazu posle pechati kuch, bez edinogo soobshchenija.
+    if (cfg_.head && !build_graphs(err)) { shutdown(); return false; }
 
     // Pinned host memory for the readback: ggml_vk_buffer_read_2d_async looks the destination
     // up in the pinned registry (ggml_vk_host_get) and copies straight into it when it finds
@@ -311,7 +314,7 @@ bool GpuStatic::init(const GpuStaticConfig& cfg, ggml_tensor* out, std::string* 
     // Doing it here also moves the ggml_backend_supports_op check to init, which is where a
     // refusal belongs - a head in a type the backend has no pipeline for aborts inside the
     // backend rather than returning an error, so it has to be caught before any token.
-    {
+    if (cfg_.head) {
         std::vector<float> zx(std::size_t(cfg_.n_embd), 0.0f);
         std::vector<float> zo(std::size_t(cfg_.n_vocab), 0.0f);
         if (!block(zx.data(), 1, zo.data())) {
@@ -754,7 +757,12 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
         std::size_t pad = 0;
         if (gbytes <= min_group) pad = min_group - gbytes + align;
 
-        const std::size_t n_t = std::size_t(l1 - l0) * 11 + 4;
+        // 16 tenzorov na sloj, a ne 11. Bylo devjat vesov plus dva kesha; stalo do trinadcati
+        // vesov (tri sobstvennyh u gemma4 plus rope_freqs) plus te zhe dva kesha. Staryj raschjot
+        // davai rovno 74400 bajt na gruppu v vosemnadcat sloev, a trebovalos 74464 - i otkaz byl
+        // ne diagnostiruemyj: ggml_new_object vozvrashchaet nol posredi razmeshchenija, a padaet
+        // potom i v drugom meste, s narusheniem dostupa i bez edinogo soobshchenija.
+        const std::size_t n_t = std::size_t(l1 - l0) * 16 + 8;
         ggml_init_params ip = {ggml_tensor_overhead() * n_t + 4096, nullptr, true};
         ggml_context* cx = ggml_init(ip);
         if (!cx) { *err = "ggml_init dlja vesov sloev ne udalsja"; return false; }
@@ -868,7 +876,12 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         if (!buf_lin_) { *err = "vhodnoj bufer sloja ne vydelilsja"; return false; }
     }
 
-    const std::size_t nodes = 48;
+    // Zapas uzlov na sloj. U bloka gemma4 ih bolshe: norma mezhdu wo i ostatkom, dve pre-normy
+    // polovin vmesto odnoj i otdelnaja norma vhoda marshrutizatora - okolo chetyrjoh sverh
+    // qwen3moe, plus vidy na chetyre vyhoda vmesto trjoh. Staryj zapas konchalsja na 64 bajtah
+    // ('needed 74464, available 74400'), i otkaz pri etom ne diagnostiruemyj: ggml_new_object
+    // vozvrashchaet nol posredi postroenija, a padaet potom i v drugom meste.
+    const std::size_t nodes = cfg_.gemma_block ? 72 : 48;
     ggml_init_params ip = {
         (ggml_tensor_overhead() * (nodes + 24) + ggml_graph_overhead_custom(nodes, false))
             * std::size_t(nl) + 8192,
@@ -945,14 +958,24 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         if (!no_rope_said) { no_rope_said = true;
             fprintf(stderr, "NO_ROPE %d\n", no_rope); fflush(stderr); }
         if (!no_rope) {
-            q = ggml_rope_multi(c, q, t_pos_, L.rope_freqs, gm.n_rot, sections, gm.rope_type,
-                                cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            // ROPE_EXT dlja gemma4, ROPE_MULTI dlja qwen3moe. Eto RAZNYE operacii, a ne odna s
+            // raznymi parametrami: multi vrashchaet po sekcijam (mnogomernyj rope), ext - obychnyj.
+            // Proverennyj build_gemma4_step zovjot imenno ext, i podmena odnogo drugim dajot
+            // rabotajushchij graf s drugim otvetom - 1 sovpavshij tokjen iz 6 i L2 do 78%.
+            q = cfg_.gemma_block
+                ? ggml_rope_ext(c, q, t_pos_, L.rope_freqs, gm.n_rot, gm.rope_type,
+                                cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f)
+                : ggml_rope_multi(c, q, t_pos_, L.rope_freqs, gm.n_rot, sections, gm.rope_type,
+                                  cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         }
         k = ggml_reshape_3d(c, k, hd, nkvh, 1);
         k = ggml_fused_rms_norm(c, k, L.k_norm, cfg_.rms_eps);
         if (!no_rope) {
-            k = ggml_rope_multi(c, k, t_pos_, L.rope_freqs, gm.n_rot, sections, gm.rope_type,
-                                cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            k = cfg_.gemma_block
+                ? ggml_rope_ext(c, k, t_pos_, L.rope_freqs, gm.n_rot, gm.rope_type,
+                                cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f)
+                : ggml_rope_multi(c, k, t_pos_, L.rope_freqs, gm.n_rot, sections, gm.rope_type,
+                                  cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         }
 
         // [hd, n_head_kv, 1] -> [hd, 1, n_head_kv], same bytes at the same offsets.
@@ -1440,8 +1463,12 @@ void GpuStatic::layer_op(ggml_tensor* dst, const ggml_tensor* /*proto*/,
 ggml_tensor* GpuStatic::layer(ggml_context* c, int il, ggml_tensor* cur, ggml_tensor* mask) {
     // ggml_map_custom3's destination is a duplicate of its FIRST source, so the shape has to
     // arrive as a tensor. proto is never read; it exists to say [2*n_embd + n_expert, 1].
+    // Tri velichiny u qwen3moe i CHETYRE u gemma4 - u nejo dve raznye pre-normy nad odnim
+    // ostatkom. Razmer dolzhen sovpadat s tem, chto realno chitaetsja obratno (out_floats v
+    // do_layer), inache vid vyhodit za predely istochnika i ggml.c:5427 lovit eto utverzhdeniem.
     ggml_tensor* proto = ggml_new_tensor_2d(c, GGML_TYPE_F32,
-                                            2 * cfg_.n_embd + cfg_.n_expert, 1);
+                                            (cfg_.gemma_block ? 3 : 2) * cfg_.n_embd
+                                                + cfg_.n_expert, 1);
     return ggml_map_custom3(c, proto, cur, mask, layer_op, /*n_tasks=*/1,
                             &sites_[std::size_t(il)]);
 }

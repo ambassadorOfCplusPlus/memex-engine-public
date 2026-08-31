@@ -2611,7 +2611,8 @@ bool build_dense_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& 
 // name) are in the code and have never been run.
 bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
                        const Gemma4Weights& w, Cache& kv, int n_tokens, int n_past,
-                       int n_kv, bool all_logits, bool keep_probes) {
+                       int n_kv, bool all_logits, bool keep_probes,
+                       memex::GpuStatic* gstat = nullptr) {
     if (n_tokens <= 0 || n_kv <= 0 || n_past < 0) {
         printf("gemma4: бессмысленные размеры n_tokens %d, n_past %d, n_kv %d\n",
                n_tokens, n_past, n_kv);
@@ -2621,8 +2622,12 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
     // the eight-way fold, and the join four. Ninety-six a layer is roughly double what it
     // needs, which is the right side to be wrong on: running out shows up as a truncated
     // graph rather than as an error.
-    const size_t n_nodes = size_t(h.n_layer) * 96 + 256;
-    ggml_init_params ip = {ggml_tensor_overhead() * (n_nodes + 512) +
+    // Zapas na sloj podnjat s 96 do 128 i hvost s 512 do 768. Prichina: vetka s vnimaniem na
+    // karte dobavljaet na kazhdyj sloj chetyre view-tenzora i reshape k nim, i staryj zapas
+    // konchilsja na 64 bajtah - 'needed 74464, available 74400'. Otkaz pri etom ne graficheskij
+    // i ne arifmeticheskij: ggml_new_object prosto vozvrashchaet nol posredi postroenija grafa.
+    const size_t n_nodes = size_t(h.n_layer) * 128 + 256;
+    ggml_init_params ip = {ggml_tensor_overhead() * (n_nodes + 768) +
                            ggml_graph_overhead_custom(n_nodes, false), nullptr, true};
     g->ctx = ggml_init(ip);
     if (!g->ctx) return false;
@@ -2661,6 +2666,41 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // divergence enters at, which no per-layer output can.
         const bool inner = keep_probes && il <= 1;
         const std::string sil = std::to_string(il);
+        // VNIMANIE NA KARTE. Ona vozvrashchaet chetyre velichiny odnim chteniem: ostatochnyj potok
+        // posle vnimanija, dve pre-normy nad nim (plotnaja polovina beret ffn_norm, marshrutiziruemaja
+        // pre_ffw_norm_2) i syrye logity marshrutizatora. Syrye - chtoby softmax i top-k ostalis temi
+        // zhe operacijami v tom zhe porjadke, chto i do karty: reshenie o marshrute ne dvigaetsja.
+        //
+        // Maska vybiraetsja po vidu sloja. Ih dve, i modul otpravljaet tu, chto prishla, pri smene -
+        // dispatchi idut po odnomu na sloj, tak chto etogo dostatochno.
+        ggml_tensor* attn_out = nullptr;
+        ggml_tensor* hd_in    = nullptr;
+        ggml_tensor* moe_in   = nullptr;
+        ggml_tensor* rlogits  = nullptr;
+        ggml_tensor* card_lay = nullptr;
+        // Kesh prinadlezhit karte, kogda sloi na nej: host bolshe ne pishet v nego i ne dolzhen
+        // perenaceljivat zapisi. Bez etogo flaga aim_cache_writes ne nahodit, chto celit, i
+        // vozvrashchaet lozh - otkaz chestnyj, no prichina ego v tom, chto pisat uzhe nechego.
+#ifdef MEMEX_FWD_GPU_EXPERTS
+        const bool card = gstat && gstat->layers_on() && n_tokens == 1;
+        if (card) {
+            ggml_tensor* msk = (G.kind == LayerKind::ATTN_SWA && g->mask_swa) ? g->mask_swa
+                                                                              : g->mask;
+            g->on_card = true;
+            card_lay = gstat->layer(c, il, cur, msk);
+            const size_t ne = size_t(h.n_embd);
+            attn_out = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, h.n_embd, 0), h.n_embd, 1);
+            hd_in    = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, h.n_embd, ne * sizeof(float)),
+                                       h.n_embd, 1);
+            moe_in   = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, h.n_embd, 2 * ne * sizeof(float)),
+                                       h.n_embd, 1);
+            rlogits  = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, h.n_expert, 3 * ne * sizeof(float)),
+                                       h.n_expert, 1);
+        }
+#else
+        const bool card = false;
+#endif
+        if (!card) {
         ggml_tensor* x = fnorm(c, cur, L.attn_norm, eps);
         if (inner) g->probes.push_back({"attn_norm-" + sil, x});
 
@@ -2760,7 +2800,7 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         if (inner) g->probes.push_back({"kqv_out-" + sil, kqv_out});
         ggml_tensor* attn = fnorm(c, kqv_out, L.post_attn_norm, eps);
         if (inner) g->probes.push_back({"sa_normed-" + sil, attn});
-        ggml_tensor* attn_out = ggml_add(c, attn, inpSA);
+        attn_out = ggml_add(c, attn, inpSA);
         // The reference gives the name "attn_out" to two different quantities, and which one
         // depends on the layer. A layer that has its own wv - the 25 windowed ones - goes
         // through build_std_attention, which does cb(cur, "attn_out", il) and only THEN adds
@@ -2776,16 +2816,17 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
             g->probes.push_back({"attn_out-" + std::to_string(il),
                                  L.wv ? attn : attn_out});
         }
+        }   // konec vetki !card: vsjo vyshe schitala karta
 
         // ---- the dense half. gelu(gate) * up, which is what LLM_FFN_GELU + LLM_FFN_PAR
         // resolves to; ggml_fused_up_gate is the reference's own op for it.
-        ggml_tensor* hd_in = fnorm(c, attn_out, L.ffn_norm, eps);
+        if (!card) hd_in = fnorm(c, attn_out, L.ffn_norm, eps);
         if (keep_probes) g->probes.push_back({"ffn_norm_1-" + sil, hd_in});
         ggml_tensor* dense = ggml_mul_mat(c, L.down,
             ggml_fused_up_gate(c, L.up, L.gate, hd_in, GGML_UNARY_OP_GELU));
 
         // ---- the routed half.
-        ggml_tensor* moe_in = fnorm(c, attn_out, L.pre_ffw_norm_2, eps);
+        if (!card) moe_in = fnorm(c, attn_out, L.pre_ffw_norm_2, eps);
         if (keep_probes) g->probes.push_back({"ffn_norm_2-" + std::to_string(il), moe_in});
         // ffn_gate_inp.scale as it sits in the FILE is not the tensor the reference's graph
         // sees. llm_scale_gate_inp_s (llama.cpp:3805) walks every gemma4 layer at LOAD time
@@ -2820,8 +2861,10 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // transformed between the file and the graph, AND the transformation can be invisible
         // in the file because it lives in a substituted data pointer. Checking the gguf is not
         // enough; the value has to be read from the tensor the graph will actually see.
-        ggml_tensor* rnormed = fnorm(c, attn_out, L.router_scale, eps);
-        ggml_tensor* rlogits = ggml_mul_mat(c, L.router, rnormed);
+        if (!card) {
+            ggml_tensor* rnormed = fnorm(c, attn_out, L.router_scale, eps);
+            rlogits = ggml_mul_mat(c, L.router, rnormed);
+        }
         ggml_tensor* probs = ggml_soft_max(c, rlogits);
         ggml_tensor* sel = ggml_top_k(c, probs, h.n_expert_used);
         ggml_tensor* weights = ggml_get_rows(c,
@@ -3371,8 +3414,11 @@ struct Generator {
                                     all_logits);
         }
         if (g4) {
+            // Karta peredajotsja i sjuda. Bez etogo poshagovaja sverka sravnivala put BEZ karty
+            // sam s soboj i davala sovpadenie do chetvjortogo znaka - rezultat, kotoryj vygljadit
+            // kak uspeh i ne javljaetsja im.
             return build_gemma4_step(g, buft, *h, *g4, kv, n_tokens, n_past, n_kv_max,
-                                     all_logits, want_probes);
+                                     all_logits, want_probes, gstat);
         }
         if (q35) {
             return build_qwen35_step(g, buft, *h, *q35, kv, ds, n_tokens, n_past, n_kv_max,
@@ -5846,7 +5892,11 @@ int main(int argc, char** argv) {
                    "геометрию с целевой моделью\n");
             return 1;
         }
-        if (sopt.layers) {
+        // gemma4 TEPER MOZHET: u nejo svoj postroitel grafa sloja (cfg_.gemma_block), poslojnaja
+        // geometrija, dve maski i neobjazatelnye slots dlja treh ejo sobstvennyh tenzorov i dlja
+        // otsutstvujushchego wv. Vsjo eto proverjaetsja --decode-check: on sveryaet KAZHDYJ shag s
+        // llama_decode, i imenno tak byla najdena predydushchaja oshibka v etoj vetke.
+        if (sopt.layers && !arch_g4) {
             // GpuStatic строит один граф слоя и переиспользует его на всех слоях: у него одна
             // форма головы, один размер, одно окно. У gemma4 из тридцати слоёв двадцать пять со
             // скользящим окном, головы 16/2 по 512 чередуются с 16/8 по 256, а масштаб внимания
@@ -6252,9 +6302,16 @@ int main(int argc, char** argv) {
 #ifdef MEMEX_FWD_GPU_EXPERTS
     std::unique_ptr<memex::GpuStatic> gstat;
     if (sopt.on) {
-        if (!arch_q3) {
+        // GOLOVA - po-prezhnemu tolko qwen3moe: u gemma4 ona schitaetsja svoim putjom, s
+        // ogranicheniem logitov i privjazkoj k embeddingu, i podmena tam ne proverena.
+        //
+        // No SLOI - drugoe delo. Postroitel gemma4 ne zovjot head_matmul vovse, tak chto put
+        // golovy u nejo prosto ne ispolzuetsja, a zapret na nego zapreshchal zaodno i sloi. Tot
+        // zhe sluchaj, chto s --gen: zapret okazalsja shire svoej prichiny.
+        if (!arch_q3 && !(arch_g4 && sopt.layers)) {
             printf("--gpu-static: poka tolko qwen3moe - drugie arhitektury stroit golovu "
                    "svoim putjom (fnorm, softcap), i podmena tam ne proverena\n");
+            if (arch_g4) printf("  sloi u gemma4 mozhno: --gpu-static-layers\n");
             return 1;
         }
         memex::GpuStaticConfig sc;
@@ -6273,9 +6330,29 @@ int main(int argc, char** argv) {
         sc.rope_type = h.rope_type;
         sc.rope_base = h.rope_base;
         sc.rms_eps   = h.rms_eps;
+        // POSLOJNAJA geometrija. Dlja qwen3moe vektor ostajotsja pustym i modul beret skaljary -
+        // put ne izmenilsja ni na bajt. Dlja gemma4 on zapolnjaetsja, potomu chto u nejo dve
+        // geometrii na tridcat sloev i odin razmer na vse vydelil by chetvert nuzhnogo kesha.
+        if (arch_g4) {
+            sc.gemma_block = true;
+            sc.head = false;   // ejo postroitel golovu na karte ne zovjot; 748 MiB ne tratim
+            sc.geom.resize(std::size_t(h.n_layer));
+            for (int il = 0; il < h.n_layer; ++il) {
+                const LayerGeom& G = h.L(il);
+                memex::GpuStaticGeom& g = sc.geom[std::size_t(il)];
+                g.n_head    = G.n_head;
+                g.n_head_kv = G.n_head_kv;
+                g.head_dim  = G.head_dim;
+                g.n_rot     = G.n_rot;
+                g.rope_type = h.rope_type;
+                g.rope_base = G.rope_base;
+                g.attn_scale = h.f_attn_scale;   // gemma4 zajavljaet 1.0 i imenno ejo imeet v vidu
+                g.n_swa     = (G.kind == LayerKind::ATTN_SWA) ? h.n_swa : 0;
+            }
+        }
         gstat.reset(new memex::GpuStatic());
         std::string serr;
-        if (!gstat->init(sc, w.out, &serr)) {
+        if (!gstat->init(sc, arch_g4 ? w4.out : w.out, &serr)) {
             printf("--gpu-static: %s\n", serr.c_str());
             return 1;
         }
@@ -6303,11 +6380,25 @@ int main(int argc, char** argv) {
     if (gsp && gsp->config().layers) {
         slayers.resize(std::size_t(h.n_layer));
         for (int il = 0; il < h.n_layer; ++il) {
-            const Weights::Layer& L = w.layers[std::size_t(il)];
             memex::GpuStaticLayer& S = slayers[std::size_t(il)];
-            S.attn_norm = L.attn_norm; S.wq = L.wq; S.wk = L.wk; S.wv = L.wv; S.wo = L.wo;
-            S.q_norm = L.q_norm; S.k_norm = L.k_norm; S.ffn_norm = L.ffn_norm;
-            S.router = L.router;
+            if (arch_g4) {
+                // Gemma neset tri tenzora, kotoryh u qwen3moe net, i mozhet ne nesti wv: pjat ejo
+                // sloev berut V iz syroj proekcii K. Modul eto umeet - slot objavlen
+                // neobjazatelnym, - no tolko esli emu peredat nullptr, a ne chuzhoj tenzor.
+                const Gemma4Weights::Layer& L = w4.layers[std::size_t(il)];
+                S.attn_norm = L.attn_norm; S.wq = L.wq; S.wk = L.wk; S.wv = L.wv; S.wo = L.wo;
+                S.q_norm = L.q_norm; S.k_norm = L.k_norm; S.ffn_norm = L.ffn_norm;
+                S.router = L.router;
+                S.post_attn_norm = L.post_attn_norm;
+                S.pre_ffw_norm_2 = L.pre_ffw_norm_2;
+                S.gate_inp_s     = L.router_scale;   // ves rms dlja VHODA marshrutizatora
+                S.rope_freqs     = h.L(il).rope_freqs;
+            } else {
+                const Weights::Layer& L = w.layers[std::size_t(il)];
+                S.attn_norm = L.attn_norm; S.wq = L.wq; S.wk = L.wk; S.wv = L.wv; S.wo = L.wo;
+                S.q_norm = L.q_norm; S.k_norm = L.k_norm; S.ffn_norm = L.ffn_norm;
+                S.router = L.router;
+            }
         }
     }
     // Placing the attention weights needs the cache length, which every mode decides for
@@ -6505,6 +6596,7 @@ int main(int argc, char** argv) {
         if (!place_layers(n_kv_max)) return 1;
         Generator gen;
         gen.want_probes = (probe_name == "all");
+        gen.gstat = gsp;   // poshagovaja sverka dolzhna proverjat imenno tot put, kotoryj rabotaet
         gen.gstat = gsp;
         if (!gen.init(be, buft, &h, arch_q3 ? &w : nullptr, nullptr, n_kv_max, min_experts,
                       expert_thresh, arch_g4 ? &w4 : nullptr,

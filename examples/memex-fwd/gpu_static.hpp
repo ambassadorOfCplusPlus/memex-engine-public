@@ -161,6 +161,12 @@ struct GpuStaticConfig {
     // nodes exist and in what order.
     bool gemma_block = false;
 
+    // Vygruzhat li golovu. Dlja gemma4 - NET: ejo postroitel schitaet golovu svoim putjom, s
+    // ogranicheniem logitov i privjazkoj k embeddingu, i head() u nejo ne vyzyvaetsja nikogda.
+    // Bez etogo flaga na kartu ujdjot 748 MiB mjortvogo gruza iz 3,8 GB - pjataja chast pamjati
+    // pod tenzor, kotoryj nikto ne prochtjot.
+    bool head = true;
+
     // The shape of layer il, whichever way it was given.
     GpuStaticGeom at(int il) const {
         if (!geom.empty()) return geom[std::size_t(il)];
