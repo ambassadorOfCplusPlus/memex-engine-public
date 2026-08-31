@@ -2696,6 +2696,16 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
                                        h.n_embd, 1);
             rlogits  = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, h.n_expert, 3 * ne * sizeof(float)),
                                        h.n_expert, 1);
+
+            // Te zhe zondy, chto u processornogo puti, i s temi zhe imenami. Bez nih sverka
+            // vidit tolko logity v konce i govorit "gde-to v tridcati slojah", a s nimi nazyvaet
+            // KAKAJA iz chetyrjoh velichin razoshlas i na kakom sloe. Imena objazany sovpadat s
+            // temi, chto pushit vetka bez karty - inache report ih molcha propustit.
+            if (keep_probes) {
+                g->probes.push_back({"attn_out-" + sil, attn_out});
+                g->probes.push_back({"ffn_norm_1-" + sil, hd_in});
+                g->probes.push_back({"ffn_norm_2-" + sil, moe_in});
+            }
         }
 #else
         const bool card = false;

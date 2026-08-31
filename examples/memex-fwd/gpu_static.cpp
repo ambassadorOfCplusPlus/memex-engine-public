@@ -1121,7 +1121,11 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
                 if (xm) ggml_build_forward_expand(gf, xm);
             }
             static bool said = false;
-            if (!said) { said = true; fprintf(stderr, "STATIC_TRUNC 0 uzlov %d\n", ggml_graph_n_nodes(gf)); fflush(stderr); }
+            if (!said) { said = true;
+                fprintf(stderr, "STATIC_TRUNC 0 uzlov %d gemma_block %d geom %d rope %s\n",
+                        ggml_graph_n_nodes(gf), cfg_.gemma_block ? 1 : 0,
+                        (int)cfg_.geom.size(), cfg_.gemma_block ? "ext" : "multi");
+                fflush(stderr); }
         }
 
         ggml_gallocr_t ga = ggml_gallocr_new(buft_);
