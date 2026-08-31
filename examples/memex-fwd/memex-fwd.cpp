@@ -5846,12 +5846,28 @@ int main(int argc, char** argv) {
                    "геометрию с целевой моделью\n");
             return 1;
         }
-        if (n_gen > 0) {
-            printf("--gen пока только для qwen3moe: эта ветка несёт зонный кэш, резидентный "
-                   "набор и половину на карте, и все три написаны под одну геометрию.\n");
-            printf("  для \"%s\" есть --decode-check N: он и генерирует, и сверяет каждый "
-                   "шаг с llama_decode — что для дельта-сети и есть настоящая проверка\n",
-                   h.arch.c_str());
+        if (sopt.layers) {
+            // GpuStatic строит один граф слоя и переиспользует его на всех слоях: у него одна
+            // форма головы, один размер, одно окно. У gemma4 из тридцати слоёв двадцать пять со
+            // скользящим окном, головы 16/2 по 512 чередуются с 16/8 по 256, а масштаб внимания
+            // единица вместо 1/sqrt(d). Отказ по имени, а не молчаливый неверный ответ.
+            printf("--gpu-static-layers пока только для qwen3moe: один граф слоя на все слои, "
+                   "а у \"%s\" геометрия своя на каждом\n", h.arch.c_str());
+            return 1;
+        }
+        // --gen для gemma4 РАЗРЕШЁН. Запрет стоял на всей ветке, хотя привязаны к геометрии были
+        // только необязательные модули - зонный кэш, резидентный набор и половина на карте, - и
+        // каждый из них отказывает сам, по имени, выше. Оставалась чистая процессорная генерация,
+        // и она не привязана ни к чему: build_gemma4_step проверен (все зонды 0,0000%), кэш
+        // по-слойный, а маска и раскладка весов от архитектуры не зависят.
+        //
+        // Мешали только четыре жёстких вызова build_step в самом цикле, мимо диспетчера
+        // build_one, который все три архитектуры и так умеет.
+        if (n_gen > 0 && !arch_g4) {
+            printf("--gen пока только для qwen3moe и gemma4: у \"%s\" дельта-сеть, и её "
+                   "состояние между шагами цикл генерации не переносит\n", h.arch.c_str());
+            printf("  есть --decode-check N: он и генерирует, и сверяет каждый шаг с "
+                   "llama_decode — что для дельта-сети и есть настоящая проверка\n");
             return 1;
         }
     }
@@ -6775,9 +6791,17 @@ int main(int argc, char** argv) {
         }
 
         Graph pre;
-        if (!build_step(&pre, buft, h, w, kv, n, 0, n_kv_max, min_experts, expert_thresh,
-                        /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/false,
-                        rset.get(), /*gx=*/nullptr, gsp)) {
+        // Диспетчер по архитектуре вместо жёсткого вызова. Цикл генерации звал build_step
+        // напрямую, минуя build_one, который все три архитектуры умеет, - и это была
+        // единственная причина, по которой gemma4 не могла генерировать. Необязательные модули
+        // для неё запрещены выше по имени, поэтому здесь они заведомо пусты.
+        const bool built_pre = arch_g4
+            ? build_gemma4_step(&pre, buft, h, w4, kv, n, 0, n_kv_max,
+                                /*all_logits=*/false, /*keep_probes=*/false)
+            : build_step(&pre, buft, h, w, kv, n, 0, n_kv_max, min_experts, expert_thresh,
+                         /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/false,
+                         rset.get(), /*gx=*/nullptr, gsp);
+        if (!built_pre) {
             printf("граф префилла не собрался\n");
             return 1;
         }
@@ -6963,10 +6987,14 @@ int main(int argc, char** argv) {
         double build_ms = 0.0;
         if (!zopt.on || zopt.check) {
             const auto t_b = Clock::now();
-            if (!build_step(&dec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
-                            /*all_logits=*/false, /*zc=*/nullptr,
-                            /*keep_dbg=*/zopt.check || rset != nullptr,
-                            /*rs=*/nullptr, /*gx=*/nullptr, gsp)) {
+            const bool built_dec = arch_g4
+                ? build_gemma4_step(&dec, buft, h, w4, kv, 1, n, n_kv_max,
+                                    /*all_logits=*/false, /*keep_probes=*/false)
+                : build_step(&dec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
+                             /*all_logits=*/false, /*zc=*/nullptr,
+                             /*keep_dbg=*/zopt.check || rset != nullptr,
+                             /*rs=*/nullptr, /*gx=*/nullptr, gsp);
+            if (!built_dec) {
                 printf("граф декода не собрался\n");
                 return 1;
             }

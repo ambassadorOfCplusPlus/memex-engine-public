@@ -1057,6 +1057,28 @@ struct ggml_backend_vk_context {
     // is a latent race; and an asynchronous end needs a fence that nobody else resets.
     vk::Fence transfer_fence;
 
+    // INSTRUMENT COUNTERS, PER CONTEXT. They used to be function-local statics, which meant one
+    // set for the whole process while TWO contexts - attention and experts - run on two different
+    // threads. That is a data race, and worse than the race: it mixed the two into one average, so
+    // every FENCE_SPLIT and GAP_WAIT number taken with both backends live was a blend of a 29-node
+    // attention crossing and a 3-node expert dispatch. Found in review; the numbers taken before
+    // the fix are marked in STATE.md.
+    struct instr_t {
+        double   acc_submit = 0.0, acc_wait = 0.0, host_acc = 0.0;
+        double   min_wait = 1e9, max_wait = 0.0, host_min = 1e9;
+        uint64_t n = 0, host_n = 0;
+        uint64_t bucket[6] = {0,0,0,0,0,0};
+        double   gap_wait[4] = {0,0,0,0};
+        uint64_t gap_n[4] = {0,0,0,0};
+        std::chrono::steady_clock::time_point prev_done{};
+    } instr;
+    int instr_id = 0;   // printed so the two contexts can be told apart in one log
+
+    // No keep-warm state here any more. The poke it served was measured at -0,7% and was also
+    // invalid Vulkan use: it took a command buffer from transfer_cmd_pool and never waited for it,
+    // while ggml_vk_graph_cleanup resets that pool at the end of every graph_compute. Deleted
+    // rather than kept behind a flag - see the comment at its old call site in gpu_static.cpp.
+
     // ONE ARMED READBACK, folded into the graph's own command buffer.
     //
     // Why it exists. A layer of the resident-expert path costs two round trips to the device,
@@ -4197,6 +4219,13 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->fence = ctx->device->device.createFence({});
     ctx->almost_ready_fence = ctx->device->device.createFence({});
     ctx->transfer_fence = ctx->device->device.createFence({});
+    // A distinct id per context, printed by the instruments. Two contexts live on one device here -
+    // attention and experts - and telling their numbers apart is the whole point of the fix that
+    // moved the counters off file statics.
+    {
+        static std::atomic<int> next_instr_id{0};
+        ctx->instr_id = next_instr_id++;
+    }
 
     ctx->compute_cmd_pool.init(ctx->device, &ctx->device->compute_queue);
     ctx->transfer_cmd_pool.init(ctx->device, &ctx->device->transfer_queue);
@@ -9914,14 +9943,19 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             // No early return here: the out_memcpys drain below must still run.
             static const int fence_split = getenv("GGML_VK_FENCE_SPLIT")
                                                ? atoi(getenv("GGML_VK_FENCE_SPLIT")) : 0;
-            static double acc_submit = 0.0, acc_wait = 0.0;
-            static uint64_t acc_n = 0;
+            auto& I = ctx->instr;
             // The MINIMUM over thousands of calls is the question, not the mean. If some waits
             // come back in tens of microseconds and others in hundreds, 290 us is variance -
             // scheduling or power management - and the fix is keeping the device hot. If every
             // wait is ~290, it is a floor and the only lever left is fewer round trips.
-            static double min_wait = 1e9, max_wait = 0.0;
-            static uint64_t bucket[6] = {0,0,0,0,0,0};   // <50, <100, <200, <400, <1000, rest (us)
+
+            // THE QUESTION THIS ANSWERS. The wait is not a floor: its minimum over thousands of
+            // calls is 42 us while our crossings sit at 200-400. So the hardware can answer fast
+            // and something distinguishes the slow calls. The most likely candidate is how long
+            // the card sat idle before the submit - RDNA2 gates the graphics core when idle, and
+            // we hand it nothing for ~300 us on every layer while the CPU computes the mixture.
+            // Correlating the wait against the gap since the previous completion settles it.
+
             const auto t_fs0 = std::chrono::steady_clock::now();
             ggml_vk_submit(subctx, use_fence ? ctx->fence : vk::Fence{});
             const auto t_fs1 = std::chrono::steady_clock::now();
@@ -9931,21 +9965,40 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             const auto t_fs2 = std::chrono::steady_clock::now();
             if (fence_split && use_fence) {
                 using D = std::chrono::duration<double, std::milli>;
-                acc_submit += D(t_fs1 - t_fs0).count();
+                I.acc_submit += D(t_fs1 - t_fs0).count();
                 const double w = D(t_fs2 - t_fs1).count();
-                acc_wait += w;
-                if (w < min_wait) min_wait = w;
-                if (w > max_wait) max_wait = w;
+                I.acc_wait += w;
+                if (w < I.min_wait) I.min_wait = w;
+                if (w > I.max_wait) I.max_wait = w;
                 const double wus = w * 1000.0;
-                bucket[wus < 50 ? 0 : wus < 100 ? 1 : wus < 200 ? 2 : wus < 400 ? 3 : wus < 1000 ? 4 : 5]++;
-                if (++acc_n % 2000 == 0) {
-                    fprintf(stderr, "FENCE_SPLIT n %llu submit %.4f zhdjom %.4f min %.4f max %.4f "
+                I.bucket[wus < 50 ? 0 : wus < 100 ? 1 : wus < 200 ? 2 : wus < 400 ? 3 : wus < 1000 ? 4 : 5]++;
+                // Only generation. A prefill graph waits milliseconds and there are thousands of
+                // them, so mixing them in makes every bucket a report about prefill: the first
+                // version of this had 46 and 281 calls in its two fast buckets against 2304 real
+                // crossings, and 3669 prefill calls averaging 5.3 ms in the last one. A 2 ms cut
+                // separates them cleanly - no generation crossing comes near it.
+                if (I.prev_done.time_since_epoch().count() != 0 && wus < 2000.0) {
+                    const double gap_us = D(t_fs0 - I.prev_done).count() * 1000.0;
+                    const int gi = gap_us < 100 ? 0 : gap_us < 300 ? 1 : gap_us < 600 ? 2 : 3;
+                    I.gap_wait[gi] += wus; I.gap_n[gi]++;
+                }
+                I.prev_done = t_fs2;
+                if (++I.n % 2000 == 0) {
+                    fprintf(stderr, "FENCE_SPLIT ctx %d n %llu submit %.4f zhdjom %.4f min %.4f max %.4f "
                             "|<50 %llu |<100 %llu |<200 %llu |<400 %llu |<1000 %llu |rest %llu\n",
-                            (unsigned long long)acc_n, acc_submit / double(acc_n),
-                            acc_wait / double(acc_n), min_wait, max_wait,
-                            (unsigned long long)bucket[0], (unsigned long long)bucket[1],
-                            (unsigned long long)bucket[2], (unsigned long long)bucket[3],
-                            (unsigned long long)bucket[4], (unsigned long long)bucket[5]);
+                            ctx->instr_id,
+                            (unsigned long long)I.n, I.acc_submit / double(I.n),
+                            I.acc_wait / double(I.n), I.min_wait, I.max_wait,
+                            (unsigned long long)I.bucket[0], (unsigned long long)I.bucket[1],
+                            (unsigned long long)I.bucket[2], (unsigned long long)I.bucket[3],
+                            (unsigned long long)I.bucket[4], (unsigned long long)I.bucket[5]);
+                    fprintf(stderr, "GAP_WAIT ctx %d (tolko generacija) prostoj<100us: n %llu zhdjom %.1f us | <300: n %llu %.1f "
+                            "| <600: n %llu %.1f | bolshe: n %llu %.1f\n",
+                            ctx->instr_id,
+                            (unsigned long long)I.gap_n[0], I.gap_n[0] ? I.gap_wait[0]/double(I.gap_n[0]) : 0.0,
+                            (unsigned long long)I.gap_n[1], I.gap_n[1] ? I.gap_wait[1]/double(I.gap_n[1]) : 0.0,
+                            (unsigned long long)I.gap_n[2], I.gap_n[2] ? I.gap_wait[2]/double(I.gap_n[2]) : 0.0,
+                            (unsigned long long)I.gap_n[3], I.gap_n[3] ? I.gap_wait[3]/double(I.gap_n[3]) : 0.0);
                     fflush(stderr);
                 }
             }
@@ -10699,14 +10752,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     {
         static const int host_split = getenv("GGML_VK_HOST_SPLIT")
                                           ? atoi(getenv("GGML_VK_HOST_SPLIT")) : 0;
-        static double acc = 0.0; static uint64_t n = 0; static double mn = 1e9;
         if (host_split) {
+            auto& I = ctx->instr;
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t_gc0).count();
-            acc += ms; if (ms < mn) mn = ms;
-            if (++n % 2000 == 0) {
-                fprintf(stderr, "HOST_SPLIT n %llu do_submita %.4f min %.4f uzlov %d\n",
-                        (unsigned long long)n, acc / double(n), mn, cgraph->n_nodes);
+            I.host_acc += ms; if (ms < I.host_min) I.host_min = ms;
+            if (++I.host_n % 2000 == 0) {
+                fprintf(stderr, "HOST_SPLIT ctx %d n %llu do_submita %.4f min %.4f uzlov %d\n",
+                        ctx->instr_id, (unsigned long long)I.host_n,
+                        I.host_acc / double(I.host_n), I.host_min, cgraph->n_nodes);
                 fflush(stderr);
             }
         }

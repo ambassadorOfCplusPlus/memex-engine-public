@@ -901,6 +901,9 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         // charging rope for the drain of the projection before it. Removing the node cannot be
         // misattributed: whatever the crossing loses is what the node cost.
         static const int no_rope = getenv("MEMEX_NO_ROPE") ? atoi(getenv("MEMEX_NO_ROPE")) : 0;
+        static bool no_rope_said = false;
+        if (!no_rope_said) { no_rope_said = true;
+            fprintf(stderr, "NO_ROPE %d\n", no_rope); fflush(stderr); }
         if (!no_rope) {
             q = ggml_rope_multi(c, q, t_pos_, nullptr, hd, sections, cfg_.rope_type,
                                 cfg_.n_ctx_train, cfg_.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
@@ -958,6 +961,9 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         // Bit-identical - a concat moves bytes, it does not compute.
         static const int split_out = getenv("MEMEX_SPLIT_OUT")
                                          ? atoi(getenv("MEMEX_SPLIT_OUT")) : 1;
+        static bool split_said = false;
+        if (!split_said) { split_said = true;
+            fprintf(stderr, "SPLIT_OUT %d\n", split_out); fflush(stderr); }
         ggml_tensor* out = nullptr;
         if (split_out) {
             ggml_set_output(ffn_inp);
@@ -1232,6 +1238,9 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
         // path and are no worse off. MEMEX_FOLD_READBACK=0 forces the old path.
         static const int fold_rb = getenv("MEMEX_FOLD_READBACK")
                                        ? atoi(getenv("MEMEX_FOLD_READBACK")) : 1;
+        static bool fold_said_st = false;
+        if (!fold_said_st) { fold_said_st = true;
+            fprintf(stderr, "FOLD_READBACK_STATIC %d\n", fold_rb); fflush(stderr); }
         // Under MEMEX_STATIC_TRUNC the output tensor is not in the graph, so gallocr never gave
         // it a buffer and both arming and reading it would abort on "tensor buffer not set".
         // The values are garbage in that mode by design; only the device time is being read.
@@ -1295,6 +1304,23 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
         if (!truncated) {
             std::memcpy(dst->data, rb_, out_floats * sizeof(float));
         }
+        // NO KEEP-WARM POKE HERE, and the reason is worth keeping.
+        //
+        // It was built on a measured correlation: the round trip cost 310 us when the card had
+        // been idle under 100 us before the submit and 486 us when it had been idle over 600, so
+        // 75 us a crossing and about 7.6 ms of a 53.9 ms token looked like it was being paid for
+        // letting the card fall asleep. A 256-byte fire-and-forget copy was supposed to stop that.
+        //
+        // Measured: **-0,7%** (16,0363 against 16,1471 tok/s), and the poke's own cost showed up
+        // in the fence column, 0,002 -> 0,031 ms a crossing. The correlation was not causal.
+        //
+        // It was also UNSAFE. The poke took its command buffer from transfer_cmd_pool and never
+        // waited for it, while ggml_vk_graph_cleanup resets that same pool at the end of every
+        // graph_compute - resetting a command pool whose buffer is still executing is invalid use
+        // of Vulkan, and the two timings overlap (poke 310-486 us against a layer's 450-600 us).
+        // A 192-of-192 token check would never have caught it; it shows up as a driver fault under
+        // load. Found in review, and the right answer to "refuted and unsafe" is to delete rather
+        // than keep behind a flag.
         ++st_.layer_readback_fenced;
         auto td = std::chrono::steady_clock::now();
         st_.layer_ms_upload += std::chrono::duration<double, std::milli>(tb - ta).count();
