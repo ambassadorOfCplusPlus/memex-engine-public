@@ -6421,6 +6421,15 @@ int main(int argc, char** argv) {
             printf("--gpu-static-layers: %s\n", lerr.c_str());
             return false;
         }
+        // Bajty vesov sloev - edinstvennaja proverka, chto v videopamjati lezhit to zhe, chto u
+        // modeli. Tot zhe kljuch --gpu-static-verify, chto i dlja golovy.
+        if (gsp->config().verify) {
+            std::string verr;
+            if (!gsp->verify_layers(slayers.data(), &verr)) {
+                printf("proverka bajtov sloev ne proshla: %s\n", verr.c_str());
+                return false;
+            }
+        }
         printf("\nvnimanie, marshrutizatory i KV-kesh na karte: %d sloev, kesh %d pozicij, "
                "vsego %.1f MiB v videopamjati, za %.0f ms\n", h.n_layer, n_kv_max,
                double(gsp->vram_bytes()) / 1048576.0, ms_since(t_l));

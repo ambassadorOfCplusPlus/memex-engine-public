@@ -338,6 +338,8 @@ class GpuStatic {
     // Waits for nothing - there is no worker - but it is still only valid between graph
     // computations, because it borrows the readback staging.
     bool verify_head(std::string* err);
+    // Slot za slotom po vsem slojam. Sm. kommentarij u realizacii.
+    bool verify_layers(const GpuStaticLayer* src, std::string* err);
 
     // Non-empty when a device call threw. The run is then wrong and has to say so rather
     // than carry on with a graph node that quietly produced zeros.

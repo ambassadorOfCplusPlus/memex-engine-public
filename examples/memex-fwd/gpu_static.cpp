@@ -334,7 +334,7 @@ bool GpuStatic::init(const GpuStaticConfig& cfg, ggml_tensor* out, std::string* 
                                     ggml_backend_buffer_get_size(buf_in_));
     }
 
-    if (cfg_.verify) {
+    if (cfg_.verify && cfg_.head) {
         std::string verr;
         if (!verify_head(&verr)) {
             *err = "proverka bajtov golovy v videopamjati ne proshla: " + verr;
@@ -524,6 +524,53 @@ ggml_tensor* GpuStatic::head(ggml_context* c, ggml_tensor* x) {
 // ---------------------------------------------------------------------------------------
 // The one check nothing else can make
 // ---------------------------------------------------------------------------------------
+
+// Kazhdyj vygruzhennyj tenzor SLOJA obratno i sravnit s modelju, slot za slotom. To zhe, chto
+// verify_head delaet dlja golovy, i po toj zhe prichine: eto edinstvennaja proverka, chto v
+// videopamjati lezhat imenno te bajty, kotorye u modeli, i nichto drugoe v dvizhke ejo ne vidit.
+//
+// Napisana potomu, chto arifmetika ukazala imenno sjuda: normirovka na karte dajot rms 11,22 pri
+// etalonnyh 1,18, a normirovka po srednekvadratichnomu vozvrashchaet velichinu porjadka svoego
+// VESA - znachit ves na karte primerno vdesjatero bolshe nastojashchego, to est v slot popal ne
+// tot tenzor. Slot za slotom eto i nazovjot.
+bool GpuStatic::verify_layers(const GpuStaticLayer* src, std::string* err) {
+    if (!on() || lg_.empty()) { *err = "sloi ne na karte"; return false; }
+    static const char* kNames[13] = {"attn_norm","wq","wk","wv","wo","q_norm","k_norm",
+                                     "ffn_norm","router","rope_freqs","post_attn_norm",
+                                     "gate_inp_s","pre_ffw_norm_2"};
+    std::vector<char> tmp;
+    int bad = 0;
+    for (int il = 0; il < cfg_.n_layer; ++il) {
+        ggml_tensor* ss[13]; ggml_tensor* dd[13];
+        layer_slots(src[std::size_t(il)], ss);
+        layer_slots(lw_[std::size_t(il)], dd);
+        for (int i = 0; i < 13; ++i) {
+            if (!ss[i] || !dd[i]) {
+                if ((ss[i] == nullptr) != (dd[i] == nullptr)) {
+                    printf("  sloj %2d slot %-15s: odna storona est, drugoj net" "\n", il, kNames[i]);
+                    ++bad;
+                }
+                continue;
+            }
+            const std::size_t total = ggml_nbytes(dd[i]);
+            if (total != ggml_nbytes(ss[i])) {
+                printf("  sloj %2d slot %-15s: razmery ne sovpali, %zu protiv %zu" "\n",
+                       il, kNames[i], total, ggml_nbytes(ss[i]));
+                ++bad; continue;
+            }
+            tmp.resize(total);
+            ggml_backend_tensor_get(dd[i], tmp.data(), 0, total);
+            if (std::memcmp(tmp.data(), ss[i]->data, total) != 0) {
+                printf("  sloj %2d slot %-15s: BAJTY RASHODJATSJA (%s protiv %s)" "\n",
+                       il, kNames[i], ggml_get_name(dd[i]), ggml_get_name(ss[i]));
+                ++bad;
+            }
+        }
+    }
+    if (bad) { char b[96]; snprintf(b, sizeof(b), "rashozhdenij v slotah: %d", bad); *err = b; return false; }
+    printf("  bajty vesov sloev v videopamjati sovpadajut s modelju: %d sloev x 13 slotov" "\n", cfg_.n_layer);
+    return true;
+}
 
 bool GpuStatic::verify_head(std::string* err) {
     if (!on() || !d_out_ || !src_out_) { *err = "vykljucheno"; return false; }
