@@ -938,6 +938,16 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         // reference's `Vcur = Kcur` picks up exactly that node. Taking the normed or roped K
         // instead would be a different model that still runs.
         ggml_tensor* v = L.wv ? ggml_mul_mat(c, L.wv, x) : k;
+        if (cfg_.gemma_block) {
+            // V NORMIRUETSJA po golove, BEZ vesa, na kazhdom sloe gemma4 - vkljuchaja te, u
+            // kotoryh est svoja proekcija V. Tenzora v_norm v fajle net; norma bezvesovaja i ona
+            // vsjo ravno tam. U qwen3moe ejo net vovse, poetomu v grafe karty ejo i ne bylo.
+            //
+            // Bez nejo karta pishet v kesh nenormirovannoe V, i vnimanie nevernо s PERVOGO shaga
+            // dekoda - rovno tot priznak, chto nabljudalsja: L2 16,5% na pozicii 4 i odin
+            // sovpavshij tokjen iz shesti.
+            v = ggml_rms_norm(c, ggml_reshape_3d(c, v, hd, nkvh, 1), cfg_.rms_eps);
+        }
 
         q = ggml_reshape_3d(c, q, hd, nh, 1);
         q = ggml_fused_rms_norm(c, q, L.q_norm, cfg_.rms_eps);

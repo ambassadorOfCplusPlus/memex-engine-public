@@ -6607,7 +6607,6 @@ int main(int argc, char** argv) {
         Generator gen;
         gen.want_probes = (probe_name == "all");
         gen.gstat = gsp;   // poshagovaja sverka dolzhna proverjat imenno tot put, kotoryj rabotaet
-        gen.gstat = gsp;
         if (!gen.init(be, buft, &h, arch_q3 ? &w : nullptr, nullptr, n_kv_max, min_experts,
                       expert_thresh, arch_g4 ? &w4 : nullptr,
                       arch_q35 ? &w35 : nullptr)) {
