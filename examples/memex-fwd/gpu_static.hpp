@@ -180,6 +180,8 @@ struct GpuStaticLayer {
     ggml_tensor* k_norm = nullptr;
     ggml_tensor* ffn_norm = nullptr;
     ggml_tensor* router = nullptr;
+    // OPTIONAL. gemma4 full-attention layers only; null everywhere else. See layer_slots.
+    ggml_tensor* rope_freqs = nullptr;
 };
 
 struct GpuStaticStats {

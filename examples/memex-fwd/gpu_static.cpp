@@ -84,17 +84,25 @@ void prefer_one_submit_per_graph() {
 #endif
 }
 
-// The nine weights of one layer, always in this order, so that a group's byte estimate and its
-// actual allocation cannot drift apart. Nine parallel arrays is how a wq gets uploaded where a
-// wk belongs, with no shape error anywhere to catch it.
-void layer_slots(const GpuStaticLayer& L, ggml_tensor** out9) {
-    out9[0] = L.attn_norm; out9[1] = L.wq; out9[2] = L.wk; out9[3] = L.wv; out9[4] = L.wo;
-    out9[5] = L.q_norm;    out9[6] = L.k_norm; out9[7] = L.ffn_norm; out9[8] = L.router;
+// The tensors of one layer, always in this order, so that a group's byte estimate and its actual
+// allocation cannot drift apart. Parallel arrays is how a wq gets uploaded where a wk belongs,
+// with no shape error anywhere to catch it.
+//
+// SLOT 9 IS OPTIONAL and every user must treat it so. It is gemma4's rope_freqs: per-dimension
+// divisors of the rope angle, 1.0 for the first 64 pairs and 1e30 for the remaining 192, which
+// drives theta to zero and leaves dimensions 128..511 unrotated. Only gemma4's full-attention
+// layers carry one; qwen3moe has none anywhere. Dropping it does not fail and does not change a
+// shape - it rotates what must not move, which is the worst way for an input to be missing.
+void layer_slots(const GpuStaticLayer& L, ggml_tensor** out) {
+    out[0] = L.attn_norm; out[1] = L.wq; out[2] = L.wk; out[3] = L.wv; out[4] = L.wo;
+    out[5] = L.q_norm;    out[6] = L.k_norm; out[7] = L.ffn_norm; out[8] = L.router;
+    out[9] = L.rope_freqs;   // may be null
 }
 
-void layer_unslot(GpuStaticLayer& L, ggml_tensor* const* in9) {
-    L.attn_norm = in9[0]; L.wq = in9[1]; L.wk = in9[2]; L.wv = in9[3]; L.wo = in9[4];
-    L.q_norm    = in9[5]; L.k_norm = in9[6]; L.ffn_norm = in9[7]; L.router = in9[8];
+void layer_unslot(GpuStaticLayer& L, ggml_tensor* const* in) {
+    L.attn_norm = in[0]; L.wq = in[1]; L.wk = in[2]; L.wv = in[3]; L.wo = in[4];
+    L.q_norm    = in[5]; L.k_norm = in[6]; L.ffn_norm = in[7]; L.router = in[8];
+    L.rope_freqs = in[9];
 }
 
 }  // namespace
@@ -664,10 +672,11 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
                                       std::size_t(hd) * std::size_t(cfg_.n_kv_max) *
                                       std::size_t(nkv_heads));
     for (int il = 0; il < nl; ++il) {
-        ggml_tensor* s[9];
+        ggml_tensor* s[10];
         layer_slots(src[std::size_t(il)], s);
         std::size_t b = 0;
-        for (int i = 0; i < 9; ++i) {
+        for (int i = 0; i < 10; ++i) {
+            if (!s[i] && i == 9) continue;   // rope_freqs is optional, see layer_slots
             if (!s[i]) {
                 char m[160];
                 snprintf(m, sizeof(m), "sloj %d: ne hvataet tenzora vnimanija #%d", il, i);
@@ -744,10 +753,11 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
         ctxs_l_[gi] = cx;
 
         for (int il = l0; il < l1; ++il) {
-            ggml_tensor* ss[9];
-            ggml_tensor* dd[9];
+            ggml_tensor* ss[10];
+            ggml_tensor* dd[10] = {nullptr};
             layer_slots(src[std::size_t(il)], ss);
-            for (int i = 0; i < 9; ++i) {
+            for (int i = 0; i < 10; ++i) {
+                if (!ss[i]) { dd[i] = nullptr; continue; }   // optional slot
                 dd[i] = ggml_new_tensor(cx, ss[i]->type, GGML_MAX_DIMS, ss[i]->ne);
                 char nm[64];
                 snprintf(nm, sizeof(nm), "vk.blk%d.w%d", il, i);
@@ -806,11 +816,12 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
 
         // In pieces, so the driver is never asked for a staging buffer the size of a tensor.
         for (int il = l0; il < l1; ++il) {
-            ggml_tensor* ss[9];
-            ggml_tensor* dd[9];
+            ggml_tensor* ss[10];
+            ggml_tensor* dd[10];
             layer_slots(src[std::size_t(il)], ss);
             layer_slots(lw_[std::size_t(il)], dd);
-            for (int i = 0; i < 9; ++i) {
+            for (int i = 0; i < 10; ++i) {
+                if (!ss[i] || !dd[i]) continue;   // optional slot, see layer_slots
                 const std::size_t need = ggml_nbytes(ss[i]);
                 const char* sp = (const char*)ss[i]->data;
                 for (std::size_t off = 0; off < need; off += kUploadChunk) {
@@ -921,13 +932,13 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         if (!no_rope_said) { no_rope_said = true;
             fprintf(stderr, "NO_ROPE %d\n", no_rope); fflush(stderr); }
         if (!no_rope) {
-            q = ggml_rope_multi(c, q, t_pos_, nullptr, gm.n_rot, sections, gm.rope_type,
+            q = ggml_rope_multi(c, q, t_pos_, L.rope_freqs, gm.n_rot, sections, gm.rope_type,
                                 cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         }
         k = ggml_reshape_3d(c, k, hd, nkvh, 1);
         k = ggml_fused_rms_norm(c, k, L.k_norm, cfg_.rms_eps);
         if (!no_rope) {
-            k = ggml_rope_multi(c, k, t_pos_, nullptr, gm.n_rot, sections, gm.rope_type,
+            k = ggml_rope_multi(c, k, t_pos_, L.rope_freqs, gm.n_rot, sections, gm.rope_type,
                                 cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         }
 
