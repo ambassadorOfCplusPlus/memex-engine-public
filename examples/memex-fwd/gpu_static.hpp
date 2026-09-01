@@ -160,6 +160,10 @@ struct GpuStaticConfig {
     // could be identical and the block still different, and it is the block that decides which
     // nodes exist and in what order.
     bool gemma_block = false;
+    // Compute gemma4's dense feed-forward half on the card too. Separate from gemma_block
+    // because it is a separate bet: the block shape is a correctness question, this is a
+    // memory-budget one and it can be turned off when the card has no room.
+    bool dense_ffn = false;
 
     // Vygruzhat li golovu. Dlja gemma4 - NET: ejo postroitel schitaet golovu svoim putjom, s
     // ogranicheniem logitov i privjazkoj k embeddingu, i head() u nejo ne vyzyvaetsja nikogda.
@@ -199,6 +203,13 @@ struct GpuStaticLayer {
     ggml_tensor* post_attn_norm  = nullptr;
     ggml_tensor* gate_inp_s      = nullptr;
     ggml_tensor* pre_ffw_norm_2  = nullptr;
+    // OPTIONAL, gemma4 only: the DENSE feed-forward half, which gemma4 runs on every token
+    // beside the routed one. 3 x 2816 x 2112 per layer at q8_0 is 569 MB read from host RAM
+    // every token - 22.9 ms of an 86.6 ms token, a quarter of it, and read unconditionally,
+    // which makes it the most predictable traffic in the model and the best thing to move.
+    ggml_tensor* ffn_up   = nullptr;
+    ggml_tensor* ffn_gate = nullptr;
+    ggml_tensor* ffn_down = nullptr;
 };
 
 struct GpuStaticStats {
@@ -269,6 +280,9 @@ class GpuStatic {
     // head() would then build a graph against a null weight - an access violation, which is
     // exactly how the nohead arm died the first time it ran.
     bool head_on() const { return be_ != nullptr && d_out_ != nullptr; }
+    // Whether the DENSE feed-forward half is computed on the card. The graph builder needs it
+    // to know whether slot 1 of the layer output is that half's input or its result.
+    bool dense_on() const { return be_ != nullptr && cfg_.dense_ffn; }
     const GpuStaticConfig& config() const { return cfg_; }
     const GpuStaticStats&  stats()  const { return st_; }
     const std::vector<GpuStaticBuffer>& buffers() const { return bufs_info_; }

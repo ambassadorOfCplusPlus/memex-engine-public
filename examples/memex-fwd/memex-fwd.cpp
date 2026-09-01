@@ -2814,6 +2814,7 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         ggml_tensor* moe_in   = nullptr;
         ggml_tensor* rlogits  = nullptr;
         ggml_tensor* card_lay = nullptr;
+        bool card_dense = false;
         // Kesh prinadlezhit karte, kogda sloi na nej: host bolshe ne pishet v nego i ne dolzhen
         // perenaceljivat zapisi. Bez etogo flaga aim_cache_writes ne nahodit, chto celit, i
         // vozvrashchaet lozh - otkaz chestnyj, no prichina ego v tom, chto pisat uzhe nechego.
@@ -2823,6 +2824,10 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
             ggml_tensor* msk = (G.kind == LayerKind::ATTN_SWA && g->mask_swa) ? g->mask_swa
                                                                               : g->mask;
             g->on_card = true;
+            // Whether slot 1 of the layer output is the dense half's INPUT or its RESULT. The
+            // card decides, and the graph has to ask rather than assume: with the dense half
+            // off the card the host still computes it from that slot.
+            card_dense = gstat->dense_on();
             card_lay = gstat->layer(c, il, cur, msk);
             const size_t ne = size_t(h.n_embd);
             attn_out = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, h.n_embd, 0), h.n_embd, 1);
@@ -3002,8 +3007,15 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // defeated the detector written for it: gemma_card_probe.ps1 counts distinct values per
         // family, and thirty good values from the copy hide thirty identical ones from the view.
         if (keep_probes && !card) g->probes.push_back({"ffn_norm_1-" + sil, hd_in});
-        ggml_tensor* dense = ggml_mul_mat(c, L.down,
-            ggml_fused_up_gate(c, L.up, L.gate, hd_in, GGML_UNARY_OP_GELU));
+        // On the card path with --gpu-static-dense, slot 1 of the layer output is ALREADY the
+        // dense half's result rather than its input: the card computed it there, in the same
+        // place and the same size, so nothing about the readback layout changed. Recomputing
+        // it here would read the same 569 MB per token from host RAM that moving it was meant
+        // to stop, and would silently make the measurement report no gain.
+        ggml_tensor* dense = card_dense
+            ? hd_in
+            : ggml_mul_mat(c, L.down,
+                  ggml_fused_up_gate(c, L.up, L.gate, hd_in, GGML_UNARY_OP_GELU));
 
         // ---- the routed half.
         if (!card) moe_in = fnorm(c, attn_out, L.pre_ffw_norm_2, eps);
@@ -4346,6 +4358,12 @@ struct GpuStaticOpt {
     // 131 GB/s the same bytes cost 6 ms. That is the largest single term left in gemma4's
     // token, and it deserves a measurement in one binary rather than a claim.
     bool nohead   = false;
+    // --gpu-static-dense: gemma4's dense feed-forward half on the card as well.
+    //
+    // It is the largest unconditional read left in the token - 3 x 2816 x 2112 per layer at
+    // q8_0 is 569 MB every token, 22.9 ms of 86.6 - and unlike an expert it is read whether
+    // or not any router picks it, which makes it the best MiB-for-MiB resident in the model.
+    bool dense    = false;
 };
 
 // Off by default, and it stays off until it is MEASURED faster - not until it looks right.
@@ -5816,6 +5834,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--gpu-static-verify")) { sopt.on = true; sopt.verify = true; }
         else if (!strcmp(a, "--gpu-static-layers")) { sopt.on = true; sopt.layers = true; }
         else if (!strcmp(a, "--gpu-static-nohead")) { sopt.nohead = true; }
+        else if (!strcmp(a, "--gpu-static-dense")) { sopt.on = true; sopt.layers = true; sopt.dense = true; }
         // Answered here, and it does nothing but exit zero. It is the queue's startability
         // probe (bench/build_safe.ps1, Test-Startable): a binary that fails to load its DLLs
         // dies before printing anything, with -1073741511 or -1073741515, and every log then
@@ -6634,6 +6653,7 @@ int main(int argc, char** argv) {
             // there was never anything architecture-specific to verify - the refusal was wider
             // than its reason, the third time that pattern has cost this project a whole lever.
             sc.head = !sopt.nohead;
+            sc.dense_ffn = sopt.dense;
             sc.geom.resize(std::size_t(h.n_layer));
             for (int il = 0; il < h.n_layer; ++il) {
                 const LayerGeom& G = h.L(il);
@@ -6691,6 +6711,13 @@ int main(int argc, char** argv) {
                 S.pre_ffw_norm_2 = L.pre_ffw_norm_2;
                 S.gate_inp_s     = L.router_scale;   // ves rms dlja VHODA marshrutizatora
                 S.rope_freqs     = h.L(il).rope_freqs;
+                // The dense half, only when it was asked for: 569 MB of q8_0 across thirty
+                // layers, and leaving the slots null is how the card knows not to build it.
+                if (sopt.dense) {
+                    S.ffn_up   = L.up;
+                    S.ffn_gate = L.gate;
+                    S.ffn_down = L.down;
+                }
             } else {
                 const Weights::Layer& L = w.layers[std::size_t(il)];
                 S.attn_norm = L.attn_norm; S.wq = L.wq; S.wk = L.wk; S.wv = L.wv; S.wo = L.wo;

@@ -100,6 +100,9 @@ void layer_slots(const GpuStaticLayer& L, ggml_tensor** out) {
     out[10] = L.post_attn_norm;  // gemma4 only
     out[11] = L.gate_inp_s;      // gemma4 only
     out[12] = L.pre_ffw_norm_2;  // gemma4 only
+    out[13] = L.ffn_up;          // gemma4 dense half, only with --gpu-static-dense
+    out[14] = L.ffn_gate;
+    out[15] = L.ffn_down;
 }
 
 void layer_unslot(GpuStaticLayer& L, ggml_tensor* const* in) {
@@ -109,6 +112,9 @@ void layer_unslot(GpuStaticLayer& L, ggml_tensor* const* in) {
     L.post_attn_norm = in[10];
     L.gate_inp_s     = in[11];
     L.pre_ffw_norm_2 = in[12];
+    L.ffn_up         = in[13];
+    L.ffn_gate       = in[14];
+    L.ffn_down       = in[15];
 }
 
 }  // namespace
@@ -535,16 +541,17 @@ ggml_tensor* GpuStatic::head(ggml_context* c, ggml_tensor* x) {
 // tot tenzor. Slot za slotom eto i nazovjot.
 bool GpuStatic::verify_layers(const GpuStaticLayer* src, std::string* err) {
     if (!on() || lg_.empty()) { *err = "sloi ne na karte"; return false; }
-    static const char* kNames[13] = {"attn_norm","wq","wk","wv","wo","q_norm","k_norm",
+    static const char* kNames[16] = {"attn_norm","wq","wk","wv","wo","q_norm","k_norm",
                                      "ffn_norm","router","rope_freqs","post_attn_norm",
-                                     "gate_inp_s","pre_ffw_norm_2"};
+                                     "gate_inp_s","pre_ffw_norm_2",
+                                     "ffn_up","ffn_gate","ffn_down"};
     std::vector<char> tmp;
     int bad = 0, cmp_slots = 0;
     for (int il = 0; il < cfg_.n_layer; ++il) {
-        ggml_tensor* ss[13]; ggml_tensor* dd[13];
+        ggml_tensor* ss[16]; ggml_tensor* dd[16];
         layer_slots(src[std::size_t(il)], ss);
         layer_slots(lw_[std::size_t(il)], dd);
-        for (int i = 0; i < 13; ++i) {
+        for (int i = 0; i < 16; ++i) {
             if (!ss[i] || !dd[i]) {
                 if ((ss[i] == nullptr) != (dd[i] == nullptr)) {
                     printf("  sloj %2d slot %-15s: odna storona est, drugoj net" "\n", il, kNames[i]);
@@ -578,7 +585,7 @@ bool GpuStatic::verify_layers(const GpuStaticLayer* src, std::string* err) {
     }
     printf("  bajty vesov sloev v videopamjati sovpadajut s modelju: svereno %d slotov"
            " na %d slojah, propushcheno pustyh s oboih storon %d" "\n",
-           cmp_slots, cfg_.n_layer, cfg_.n_layer * 13 - cmp_slots);
+           cmp_slots, cfg_.n_layer, cfg_.n_layer * 16 - cmp_slots);
     return true;
 }
 
@@ -738,10 +745,10 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
                                       std::size_t(hd) * std::size_t(cfg_.n_kv_max) *
                                       std::size_t(nkv_heads));
     for (int il = 0; il < nl; ++il) {
-        ggml_tensor* s[13];
+        ggml_tensor* s[16];
         layer_slots(src[std::size_t(il)], s);
         std::size_t b = 0;
-        for (int i = 0; i < 13; ++i) {
+        for (int i = 0; i < 16; ++i) {
             // Slots 9..12 are optional by design; slot 3 (wv) is optional because five of Gemma's
             // layers ship no attn_v and take V from the raw K projection instead.
             if (!s[i] && (i >= 9 || i == 3)) continue;
@@ -826,10 +833,10 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
         ctxs_l_[gi] = cx;
 
         for (int il = l0; il < l1; ++il) {
-            ggml_tensor* ss[13];
-            ggml_tensor* dd[13] = {nullptr};
+            ggml_tensor* ss[16];
+            ggml_tensor* dd[16] = {nullptr};
             layer_slots(src[std::size_t(il)], ss);
-            for (int i = 0; i < 13; ++i) {
+            for (int i = 0; i < 16; ++i) {
                 if (!ss[i]) { dd[i] = nullptr; continue; }   // optional slot
                 dd[i] = ggml_new_tensor(cx, ss[i]->type, GGML_MAX_DIMS, ss[i]->ne);
                 char nm[64];
@@ -896,11 +903,11 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
 
         // In pieces, so the driver is never asked for a staging buffer the size of a tensor.
         for (int il = l0; il < l1; ++il) {
-            ggml_tensor* ss[13];
-            ggml_tensor* dd[13];
+            ggml_tensor* ss[16];
+            ggml_tensor* dd[16];
             layer_slots(src[std::size_t(il)], ss);
             layer_slots(lw_[std::size_t(il)], dd);
-            for (int i = 0; i < 13; ++i) {
+            for (int i = 0; i < 16; ++i) {
                 if (!ss[i] || !dd[i]) continue;   // optional slot, see layer_slots
                 const std::size_t need = ggml_nbytes(ss[i]);
                 const char* sp = (const char*)ss[i]->data;
@@ -945,7 +952,8 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
     // qwen3moe, plus vidy na chetyre vyhoda vmesto trjoh. Staryj zapas konchalsja na 64 bajtah
     // ('needed 74464, available 74400'), i otkaz pri etom ne diagnostiruemyj: ggml_new_object
     // vozvrashchaet nol posredi postroenija, a padaet potom i v drugom meste.
-    const std::size_t nodes = cfg_.gemma_block ? 72 : 48;
+    // +4 a layer for the dense half (up, gate, gelu*mul, down) when it is on the card.
+    const std::size_t nodes = cfg_.gemma_block ? (cfg_.dense_ffn ? 96 : 72) : 48;
     ggml_init_params ip = {
         (ggml_tensor_overhead() * (nodes + 24) + ggml_graph_overhead_custom(nodes, false))
             * std::size_t(nl) + 8192,
@@ -1101,6 +1109,27 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
             // pri zagruzke, i primenit ego vtoroj raz znachit podelit logity na 53 eshchjo raz.
             ggml_tensor* tmp = ggml_fused_rms_norm(c, ffn_inp, L.gate_inp_s, cfg_.rms_eps);
             rl = ggml_mul_mat(c, L.router, tmp);
+            // THE DENSE HALF, on the card, in the slot xf used to occupy.
+            //
+            // gemma4 runs a dense feed-forward on every token beside the routed one:
+            // 3 x 2816 x 2112 per layer at q8_0 is 569 MB read from host RAM every token,
+            // 22.9 ms of an 86.6 ms token. It is read UNCONDITIONALLY - no routing decides
+            // it - which makes it the most predictable traffic in the model and a better
+            // resident than any expert: an expert pays only when it is picked.
+            //
+            // It goes in xf's output slot rather than beside it, so the layout the host reads
+            // back is unchanged: [ffn_inp, <xf or dense>, xm, router logits]. The host simply
+            // stops computing the dense half when the card returns it.
+            //
+            // NOT ggml_fused_up_gate: GGML_OP_FUSED_UP_GATE has no Vulkan implementation
+            // (the same fact that keeps the expert path on plain mul_mat_id), so building it
+            // here would strand the layer on the CPU with its weights in video memory.
+            if (cfg_.dense_ffn && L.ffn_up && L.ffn_gate && L.ffn_down) {
+                ggml_tensor* du = ggml_mul_mat(c, L.ffn_up, xf);
+                ggml_tensor* dg = ggml_mul_mat(c, L.ffn_gate, xf);
+                ggml_tensor* da = ggml_mul(c, du, ggml_gelu(c, dg));
+                xf = ggml_mul_mat(c, L.ffn_down, da);
+            }
         } else {
             ffn_inp = ggml_add(c, ggml_mul_mat(c, L.wo, kqv), cur);
             xf      = ggml_fused_rms_norm(c, ffn_inp, L.ffn_norm, cfg_.rms_eps);
