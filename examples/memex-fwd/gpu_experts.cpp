@@ -1,4 +1,5 @@
 #include "gpu_experts.hpp"
+#include <chrono>
 
 #include <algorithm>
 #include <cmath>
@@ -801,7 +802,9 @@ bool GpuExperts::init(const GpuExpertsConfig& cfg, ggml_tensor* const* up,
                 char buf[220];
                 snprintf(buf, sizeof(buf),
                          "бэкенд Vulkan не поддерживает %s над %s — резидентные эксперты "
-                         "должны быть IQ4_XS или Q6_K",
+                         "etot tip ustrojstvo ne podderzhivaet; proverennye zdes - "
+                         "IQ4_XS, Q6_K, Q4_K (poslednij schitaet verno, no medlenno - "
+                         "sm. --gpu-experts-selftest, proba po operacijam)",
                          ggml_op_name(node->op),
                          node->src[0] ? ggml_type_name(node->src[0]->type) : "?");
                 *err = buf;
@@ -1837,9 +1840,39 @@ float xnorm(uint32_t& s, float sigma) {
 // accept, the second means the type must not be used on the device at all.
 namespace {
 
+// One shape and one type, measured for cost and for accuracy. Called once per combination.
+struct OpProbeShape { int n_embd; int n_ff; const char* what; };
+
+void op_probe_one(int threads, const OpProbeShape& shape);
+
 void op_probe(int threads) {
-    const int n_embd = 2048, n_ff = 256, n_exp = 4, n_ids = 4;
-    const ggml_type types[3] = {GGML_TYPE_F16, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS};
+    // TWO SHAPES, because one shape cannot separate the two candidate explanations for
+    // gemma4's device half costing 281 ms against qwen3moe's 22.9 for 1.07x the work: the
+    // TYPE (q4_K against IQ4_XS) and the SHAPE (n_embd 2816 against 2048). Measuring only at
+    // 2048 would answer half the question and read as if it had answered all of it.
+    const OpProbeShape shapes[2] = {
+        {2048, 256, "forma qwen3moe (n_embd 2048)"},
+        {2816, 704, "forma gemma4   (n_embd 2816)"},
+    };
+    for (const OpProbeShape& sh : shapes) op_probe_one(threads, sh);
+}
+
+void op_probe_one(int threads, const OpProbeShape& shape) {
+    // REAL SIZES, and the first version of this probe did not have them.
+    //
+    // It used n_exp 4, n_ids 4, n_ff 256 - 2.1 M multiplications, which on this device costs
+    // 0.09-0.15 ms for EVERY type because that is the launch floor, not the throughput. Read
+    // as a comparison it said "q4_K is as fast as q6_K and faster than IQ4_XS", and I reported
+    // that before noticing the probe had measured overhead. The engine's own dispatch does
+    // 8 slots of 12 at the model's width; anything smaller answers a different question.
+    const int n_embd = shape.n_embd, n_ff = shape.n_ff, n_exp = 12, n_ids = 8;
+    // Q4_K joins the list because gemma4's experts are q4_K and qwen3moe's are IQ4_XS, and the
+    // engine's own graph guard has always said "resident experts must be IQ4_XS or Q6_K" - a
+    // sentence about SUPPORT that has been read as a sentence about the set of usable types.
+    // q4_K computes correctly on this device; the open question is what it COSTS, and this
+    // probe could not answer that because it never timed anything.
+    const ggml_type types[4] = {GGML_TYPE_F16, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS,
+                                GGML_TYPE_Q4_K};
 
     ggml_backend_t cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(cpu, threads);
@@ -1848,7 +1881,8 @@ void op_probe(int threads) {
     ggml_backend_buffer_type_t cbuft = ggml_backend_cpu_buffer_type();
     ggml_backend_buffer_type_t vbuft = ggml_backend_vk_buffer_type(0);
 
-    printf("\n  --- проба по операциям: одна mul_mat_id, одинаковые байты ---\n");
+    printf("\n  --- proba po operacijam: odna mul_mat_id, odinakovye bajty, %s ---\n",
+           shape.what);
     for (ggml_type qt : types) {
         // Host copy, quantised once, then the same bytes pushed to the device.
         ggml_init_params ip = {ggml_tensor_overhead() * 16 + 4096, nullptr, true};
@@ -1894,7 +1928,7 @@ void op_probe(int threads) {
 
         auto run = [&](ggml_context* c, ggml_tensor* w, ggml_tensor* x, ggml_tensor* ids,
                        ggml_backend_t be, ggml_backend_buffer_type_t bt,
-                       std::vector<float>* out, bool with_silu) {
+                       std::vector<float>* out, bool with_silu, double* ms_out = nullptr) {
             ggml_init_params gp = {ggml_tensor_overhead() * 32 +
                                    ggml_graph_overhead_custom(32, false), nullptr, true};
             ggml_context* g = ggml_init(gp);
@@ -1906,7 +1940,21 @@ void op_probe(int threads) {
             ggml_gallocr_t ga = ggml_gallocr_new(bt);
             ggml_gallocr_reserve(ga, gf);
             ggml_gallocr_alloc_graph(ga, gf);
+            // TIMED, and the BEST of several rather than the mean: the first call pays pipeline
+            // creation and shader compilation, which is not what a per-token cost looks like.
+            // The minimum is the honest figure for "what this op costs once it is warm".
             ggml_backend_graph_compute(be, gf);
+            ggml_backend_synchronize(be);
+            double best_ms = 1e9;
+            for (int rep = 0; rep < 8; ++rep) {
+                const auto t0 = std::chrono::steady_clock::now();
+                ggml_backend_graph_compute(be, gf);
+                ggml_backend_synchronize(be);
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+                if (ms < best_ms) best_ms = ms;
+            }
+            if (ms_out) *ms_out = best_ms;
             out->assign(std::size_t(ggml_nelements(r)), 0.0f);
             ggml_backend_tensor_get(r, out->data(), 0, ggml_nbytes(r));
             ggml_gallocr_free(ga);
@@ -1914,8 +1962,9 @@ void op_probe(int threads) {
             (void)c;
         };
         std::vector<float> a, b, a2, b2;
-        run(ch, wh, xh_t, ih, cpu, cbuft, &a, false);
-        run(cd, wd, xd, idd, vk, vbuft, &b, false);
+        double ms_cpu = 0.0, ms_vk = 0.0;
+        run(ch, wh, xh_t, ih, cpu, cbuft, &a, false, &ms_cpu);
+        run(cd, wd, xd, idd, vk, vbuft, &b, false, &ms_vk);
         run(ch, wh, xh_t, ih, cpu, cbuft, &a2, true);
         run(cd, wd, xd, idd, vk, vbuft, &b2, true);
 
@@ -1953,6 +2002,16 @@ void op_probe(int threads) {
             sc_num += double(a[i]) * double(ref[i]);
             sc_den += double(ref[i]) * double(ref[i]);
         }
+        // Cost, beside accuracy. Both are properties of the type on THIS device and neither
+        // predicts the other: gemma4's q4_K experts compute correctly and the device half of
+        // its token came back at 281 ms against qwen3moe's 22.9 for 1.07x the multiplications.
+        // The RATE beside the time. A time alone cannot be told apart from a launch floor,
+        // and that is exactly the mistake this probe invited once already.
+        const double macs = double(n_ids) * double(n_embd) * double(n_ff);
+        printf("  %-8s odna mul_mat_id (%d slotov, %d x %d): CPU %.3f ms, Vulkan %.3f ms; "
+               "Vulkan %.1f GMAC/s\n",
+               ggml_type_name(qt), n_ids, n_embd, n_ff, ms_cpu, ms_vk,
+               ms_vk > 0.0 ? macs / (ms_vk * 1e6) : 0.0);
         printf("  %-8s против эталонного декодера (двойная точность): CPU %.3e, Vulkan %.3e"
                "  (масштаб CPU %.6f)\n",
                ggml_type_name(qt), rel_l2(a.data(), ref.data(), ref.size()),
