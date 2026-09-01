@@ -1295,6 +1295,12 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
     step_past_ = n_past;
     step_nkv_  = n_kv;
     step_mask_sent_ = false;
+    // I ISTOCHNIK TOZHE. Bez etogo sbrosa ukazatel na masku ostajotsja "uzhe otpravlennym"
+    // navsegda: mezhdu shagami on ne menjaetsja, menjaetsja SODERZHIMOE - chislo pozicij rastjot
+    // s kazhdym tokjenom. Karta togda schitaet vnimanie po maske pervogo shaga do konca progona.
+    // Stoilo 7 sovpavshih tokenov iz 192 i bylo pojmano tolko potomu, chto obvjazka sverjaet
+    // tokeny i objavljaet plecho nedejstvitelnym vmesto togo, chtoby otdat pravdopodobnye cifry.
+    step_mask_src_  = nullptr;
     return true;
 }
 
