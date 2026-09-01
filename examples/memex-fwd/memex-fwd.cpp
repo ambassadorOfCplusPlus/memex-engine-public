@@ -6644,6 +6644,12 @@ int main(int argc, char** argv) {
         // POSLOJNAJA geometrija. Dlja qwen3moe vektor ostajotsja pustym i modul beret skaljary -
         // put ne izmenilsja ni na bajt. Dlja gemma4 on zapolnjaetsja, potomu chto u nejo dve
         // geometrii na tridcat sloev i odin razmer na vse vydelil by chetvert nuzhnogo kesha.
+        // --gpu-static-nohead applies to EVERY architecture, and putting it inside the gemma4
+        // branch below meant qwen3moe accepted the flag and silently ignored it: the card still
+        // held its 264 MiB head and a run asked to free it freed 24 MiB. A flag that is parsed
+        // and does nothing is the defect this project has spent a day removing, and this one
+        // was introduced by the fix for its own instance of it.
+        sc.head = !sopt.nohead;
         if (arch_g4) {
             sc.gemma_block = true;
             // The head used to be hardcoded off here, with the note "its builder does not call
@@ -6652,7 +6658,11 @@ int main(int argc, char** argv) {
             // fnorm -> mul_mat -> softcap and the substitution touches only the mul_mat, so
             // there was never anything architecture-specific to verify - the refusal was wider
             // than its reason, the third time that pattern has cost this project a whole lever.
-            sc.head = !sopt.nohead;
+            // gemma4's head used to be hardcoded off here, with the note "its builder does
+            // not call the card head anyway". That was true and self-fulfilling: the builder
+            // did not call it because this line said not to upload it. Its tail is
+            // fnorm -> mul_mat -> softcap and the substitution touches only the mul_mat, so
+            // there was never anything architecture-specific to verify.
             sc.dense_ffn = sopt.dense;
             sc.geom.resize(std::size_t(h.n_layer));
             for (int il = 0; il < h.n_layer; ++il) {
