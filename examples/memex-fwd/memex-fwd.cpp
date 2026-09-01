@@ -7780,7 +7780,16 @@ int main(int argc, char** argv) {
                 printf("  видеопамять против модели ПОСЛЕ генерации: сверено слотов %d, "
                        "расхождений %d%s%s\n", probed, bad, bad ? " — " : "",
                        bad ? verr.c_str() : "");
-                printf("VERIFY_AB slots %d bad %d\n", probed, bad);
+                // "slots 0 bad 0" is not a pass, it is an absence of measurement - and
+                // this line is MACHINE-READ: the bench scripts gate an arm on `bad`, so
+                // a run in which every slot was empty used to certify itself correct.
+                // The third state goes into the line the scripts parse, not only into
+                // the prose above it (rule 83).
+                printf("VERIFY_AB slots %d bad %d%s\n", probed, bad,
+                       probed == 0 ? " NE_IZMERENO" : "");
+                if (probed == 0) {
+                    printf("  NI ODIN slot ne proverjalsja: vse probovannye okazalis pusty. Eto NE sovpadenie bajtov, a otsutstvie proverki.\n");
+                }
             }
 #endif
         } else {
@@ -8184,6 +8193,16 @@ int main(int argc, char** argv) {
                        "половин остаётся x + 0.0f в каждом слоте\n");
                 printf("  худшая отн. L2 на занятом слоте: %.3e (макс. |разность| %.3e)\n",
                        gs.worst_rel, gs.worst_abs);
+                // The third state, in numbers rather than in the prose below. `checked` counts
+                // slots WALKED, both-sides-zero included; a run in which the device owned no
+                // slot printed a large checked beside a worst-L2 of zero and read as clean.
+                printf("  iz nih sravnenie realno sostojalos na %llu slotah; sloev-shagov bez "
+                       "raboty na ustrojstve: %llu\n",
+                       (unsigned long long)gs.compared, (unsigned long long)gs.layers_empty);
+                if (gs.compared == 0) {
+                    printf("  SRAVNENIE NE SOSTOJALOS NI NA ODNOM SLOTE - nol vyshe oznachaet "
+                           "otsutstvie izmerenija, a ne sovpadenie\n");
+                }
                 printf("    это НЕ ноль и не должно им быть: шейдер складывает в другом "
                        "порядке, чем ядро CPU. Ноль здесь означал бы, что устройство ничего "
                        "не считало\n");

@@ -1660,6 +1660,11 @@ void GpuExperts::do_join(int il, ggml_tensor* dst, const ggml_tensor* o_res_cpu)
             // shape and no NaN.
             if (!gpu_zero && cpu_zero) ++st_.zero_bad;
             if (gpu_zero && !cpu_zero) ++st_.owned_bad;
+            // st_.checked counts every slot WALKED, including the pair where both sides are
+            // all-zero and nothing was determined. A run in which the device owned no slot at
+            // all therefore printed a large "checked" beside a worst-L2 of zero, and read as a
+            // clean pass. This counts the slots on which a comparison actually happened.
+            if (!gpu_zero || !cpu_zero) ++st_.compared;
             if (!cpu_zero) {
                 st_.worst_abs = std::max(st_.worst_abs, worst);
                 if (den > 0.0) {

@@ -127,6 +127,10 @@ struct GpuExpertsConfig {
 struct GpuExpertsStats {
     uint64_t layers        = 0;   // layer-steps that reached the device
     uint64_t layers_empty  = 0;   // layer-steps with no resident pick: no dispatch at all
+    // Slots on which a comparison actually took place - i.e. at least one side was non-zero.
+    // `checked` counts slots WALKED and includes the both-zero pair, where nothing is decided;
+    // with `compared` at zero the whole check said nothing however large `checked` was.
+    uint64_t compared      = 0;
     uint64_t experts       = 0;   // compacted ids actually dispatched
     uint64_t promotions    = 0;   // expert slices uploaded over PCIe
     uint64_t promo_bytes   = 0;
