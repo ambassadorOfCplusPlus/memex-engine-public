@@ -868,6 +868,13 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
             *err = m;
             return false;
         }
+        // ZERO IT, for the same reason the host caches are zeroed: this buffer holds the
+        // card's KV cache, the decode reads it over a PADDED extent, and the allocator does
+        // not clear. Uninitialised NaN there survives the mask - NaN + (-INFINITY) is NaN -
+        // and poisons the softmax row. The host side of this was found first, through
+        // gemma4's kq_soft_max_ext-0; the card has its own cache and needed its own memset.
+        // One clear of ~1.2 GiB at 131 GB/s is about 9 ms, once.
+        ggml_backend_buffer_clear(buf, 0);
         bufs_l_[gi] = buf;
         const std::size_t sz = ggml_backend_buffer_get_size(buf);
         vram_bytes_ += sz;
