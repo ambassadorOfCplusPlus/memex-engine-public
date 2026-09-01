@@ -526,11 +526,21 @@ bool GpuExperts::open_plain_source(std::string* err) {
                 break;
             }
             PlainSrc p;
-            p.type = mt->type;
-            p.ne0  = mt->ne[0];
-            p.ne1  = mt->ne[1];
-            p.slab = std::size_t(mt->nb[2]);
-            p.off  = (long long)(data_off + gguf_get_tensor_offset(g, tid));
+            p.type   = mt->type;
+            p.ne0    = mt->ne[0];
+            p.ne1    = mt->ne[1];
+            p.slab   = std::size_t(mt->nb[2]);
+            p.stride = p.slab;
+            p.sub    = 0;
+            p.off    = (long long)(data_off + gguf_get_tensor_offset(g, tid));
+            // Same split as the RAM path, and it has to be done HERE too: desc() returns
+            // plain_[...] verbatim when reading from the file, so a fused source described
+            // only in the RAM branch would read a whole slab into a half-sized buffer.
+            if (cfg_.fused_gate_up && kind != 2) {
+                p.ne1  = mt->ne[1] / 2;
+                p.slab = p.stride / 2;
+                p.sub  = (kind == 0) ? p.slab : 0;   // 0=up (second half), 1=gate (first)
+            }
             plain_[std::size_t(il) * 3u + std::size_t(kind)] = p;
         }
     }
@@ -570,11 +580,22 @@ GpuExperts::PlainSrc GpuExperts::desc(int il, int kind) const {
                   : kind == 1 ? src_gate_[std::size_t(il)]
                               : src_down_[std::size_t(il)];
     PlainSrc p;
-    p.type = t->type;
-    p.ne0  = t->ne[0];
-    p.ne1  = t->ne[1];
-    p.slab = std::size_t(t->nb[2]);
-    p.off  = -1;   // in RAM, not in the file
+    p.type   = t->type;
+    p.ne0    = t->ne[0];
+    p.ne1    = t->ne[1];
+    p.slab   = std::size_t(t->nb[2]);
+    p.stride = p.slab;
+    p.sub    = 0;
+    p.off    = -1;   // in RAM, not in the file
+    // Fused gate+up: one tensor, two roles. The expert stride stays the whole slab; each role
+    // takes half of it, gate first. Halving ne1 as well is what makes the device tensor come
+    // out the same shape it would have had from a separate tensor - which is why nothing
+    // downstream needs to know about any of this.
+    if (cfg_.fused_gate_up && kind != 2) {
+        p.ne1  = t->ne[1] / 2;
+        p.slab = p.stride / 2;
+        p.sub  = (kind == 0) ? p.slab : 0;   // 0=up (second half), 1=gate (first)
+    }
     return p;
 }
 
@@ -584,10 +605,10 @@ bool GpuExperts::read_plain(int il, int kind, int expert, char* dst, std::string
         ggml_tensor* t = kind == 0 ? src_up_[std::size_t(il)]
                       : kind == 1 ? src_gate_[std::size_t(il)]
                                   : src_down_[std::size_t(il)];
-        std::memcpy(dst, (const char*)t->data + std::size_t(expert) * p.slab, p.slab);
+        std::memcpy(dst, (const char*)t->data + std::size_t(expert) * p.stride + p.sub, p.slab);
         return true;
     }
-    const long long off = p.off + (long long)expert * (long long)p.slab;
+    const long long off = p.off + (long long)expert * (long long)p.stride + (long long)p.sub;
     std::lock_guard<std::mutex> lk(io_mu_);
     // 64-bit seek is mandatory: the file is ~17 GB and a 32-bit offset would silently wrap,
     // promoting the wrong expert instead of failing.
@@ -754,7 +775,11 @@ bool GpuExperts::init(const GpuExpertsConfig& cfg, ggml_tensor* const* up,
             // dragged back over PCIe every token - measured at 1.68 tok/s against 9.16.
             ggml_tensor* u = ggml_mul_mat_id(ctx_g_, up_[0], t_x_, ids);
             ggml_tensor* g = ggml_mul_mat_id(ctx_g_, gate_[0], t_x_, ids);
-            ggml_tensor* a = ggml_mul(ctx_g_, u, ggml_silu(ctx_g_, g));
+            // gelu(gate) * up for gemma4, silu(gate) * up for qwen3moe. Same shape, and
+            // ggml_moe_up_gate's own non-fused branch spells it the same way round:
+            // ggml_fused_mul_unary(result_gate, result_up, op).
+            ggml_tensor* act = cfg_.gelu ? ggml_gelu(ctx_g_, g) : ggml_silu(ctx_g_, g);
+            ggml_tensor* a = ggml_mul(ctx_g_, u, act);
             ggml_tensor* o = ggml_mul_mat_id(ctx_g_, down_[0], a, ids);
             ggml_set_output(o);
             ggml_cgraph* gf = ggml_new_graph_custom(ctx_g_, nodes, false);
@@ -2455,7 +2480,12 @@ int gpu_experts_selftest(int threads) {
     const bool ok = !fail_cpu_split && !fail_zero && !fail_sum && !fail_partition &&
                     med > 0.0 && worst_cos > 0.95 && gx.stats().no_slot == 0 &&
                     ref_layers > 0 && ref_gpu <= ref_cpu * 1.05 &&
-                    gx.stats().checked > 0 && gx.stats().zero_bad == 0 &&
+                    // compared, not checked. `checked` counts slots WALKED, both-sides-zero
+                    // included; it was replaced precisely because it can be large while
+                    // nothing was determined. Gating on it here would have kept the hole
+                    // open in the one place with a hard pass/fail - the repair created
+                    // this, and the follow-up audit caught it.
+                    gx.stats().compared > 0 && gx.stats().zero_bad == 0 &&
                     gx.stats().owned_bad == 0 &&
                     // deferred activation: the invariants are gated, the latency is reported
                     def_bad_disjoint == 0 && def_bad_claim == 0 && def_overcommit == 0 &&

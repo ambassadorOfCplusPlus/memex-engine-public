@@ -264,6 +264,11 @@ class GpuStatic {
     void shutdown();
 
     bool on() const { return be_ != nullptr; }
+    // The HEAD specifically, which is not the same question as on(). With --gpu-static-nohead
+    // the module is up and the layers are on the card while the head deliberately is not, and
+    // head() would then build a graph against a null weight - an access violation, which is
+    // exactly how the nohead arm died the first time it ran.
+    bool head_on() const { return be_ != nullptr && d_out_ != nullptr; }
     const GpuStaticConfig& config() const { return cfg_; }
     const GpuStaticStats&  stats()  const { return st_; }
     const std::vector<GpuStaticBuffer>& buffers() const { return bufs_info_; }

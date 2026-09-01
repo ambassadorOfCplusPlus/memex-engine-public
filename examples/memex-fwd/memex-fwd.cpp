@@ -719,7 +719,7 @@ ggml_tensor* fnorm(ggml_context* c, ggml_tensor* x, ggml_tensor* w, float eps) {
 ggml_tensor* head_matmul(ggml_context* c, ggml_tensor* out_w, ggml_tensor* cur,
                          memex::GpuStatic* gstat) {
 #ifdef MEMEX_FWD_GPU_EXPERTS
-    if (gstat && gstat->on()) return gstat->head(c, cur);
+    if (gstat && gstat->head_on()) return gstat->head(c, cur);
 #else
     (void)gstat;
 #endif
@@ -2633,7 +2633,12 @@ bool build_dense_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& 
 bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
                        const Gemma4Weights& w, Cache& kv, int n_tokens, int n_past,
                        int n_kv, bool all_logits, bool keep_probes,
-                       memex::GpuStatic* gstat = nullptr) {
+                       memex::GpuStatic* gstat = nullptr,
+                       // The resident-expert split, defaulted off so every existing call site
+                       // is unchanged. rs decides whether to split at all; gx, when present,
+                       // takes the resident half onto the card.
+                       const memex::ResidentSet* rs = nullptr,
+                       memex::GpuExperts* gx = nullptr) {
     if (n_tokens <= 0 || n_kv <= 0 || n_past < 0) {
         printf("gemma4: бессмысленные размеры n_tokens %d, n_past %d, n_kv %d\n",
                n_tokens, n_past, n_kv);
@@ -2647,7 +2652,11 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
     // karte dobavljaet na kazhdyj sloj chetyre view-tenzora i reshape k nim, i staryj zapas
     // konchilsja na 64 bajtah - 'needed 74464, available 74400'. Otkaz pri etom ne graficheskij
     // i ne arifmeticheskij: ggml_new_object prosto vozvrashchaet nol posredi postroenija grafa.
-    const size_t n_nodes = size_t(h.n_layer) * 128 + 256;
+    // The split builds a SECOND fused up-gate and a second down per layer, plus the id
+    // arithmetic - the same kind of increase build_step budgets for (72 -> 128 there).
+    const bool rsplit = rs && rs->on() && n_tokens == 1;
+    const bool rwarm  = rs && rs->on() && !rsplit;
+    const size_t n_nodes = size_t(h.n_layer) * (rsplit ? 192 : 128) + 256;
     ggml_init_params ip = {ggml_tensor_overhead() * (n_nodes + 768) +
                            ggml_graph_overhead_custom(n_nodes, false), nullptr, true};
     g->ctx = ggml_init(ip);
@@ -2661,6 +2670,12 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         g->mask_swa = ggml_new_tensor_2d(c, GGML_TYPE_F32, n_kv, n_tokens);
     }
     g->n_kv_built = n_kv;
+    // One row per layer, created BEFORE the input buffer is allocated because that is the
+    // buffer it has to live in: it is rewritten between graph computations, once per refresh
+    // rather than once per token. Same lifetime rule as build_step's.
+    if (rsplit) {
+        g->res_mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, h.n_expert, h.n_layer);
+    }
     g->inputs = ggml_backend_alloc_ctx_tensors_from_buft(c, buft);
     if (!g->inputs) return false;
     g->gf = ggml_new_graph_custom(c, n_nodes, false);
@@ -2951,9 +2966,63 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // ggml_moe_up_gate calls over the same fused tensor with the two id lists, keep the
         // per-slot add BEFORE the weighting exactly as build_step does, and check it against
         // the unsplit path. The row ranges above are the only thing that needed research.
-        ggml_tensor* par = ggml_moe_up_gate(c, L.gate_up_exps, nullptr, xe, sel,
-                                            GGML_UNARY_OP_GELU);
-        ggml_tensor* eo = ggml_mul_mat_id(c, L.down_exps, par, sel);
+        // One expert pass, as a lambda, because the split needs it twice with two id lists.
+        // The fused op is called per id list rather than sliced into views: slicing would
+        // reassociate nothing but would stop being the reference's own op.
+        auto experts_g4 = [&](ggml_tensor* ids) {
+            ggml_tensor* p = ggml_moe_up_gate(c, L.gate_up_exps, nullptr, xe, ids,
+                                              GGML_UNARY_OP_GELU);
+            return ggml_mul_mat_id(c, L.down_exps, p, ids);
+        };
+        ggml_tensor* eo = nullptr;
+        if (rsplit) {
+            // Residency for each of this token's picks, gathered out of this layer's row of
+            // the mask by the router's own ids. gemma4 has no expert reduction, so there is
+            // no sel_full/sel distinction here and no -1 to guard against.
+            ggml_tensor* mrow = ggml_reshape_3d(c,
+                ggml_view_1d(c, g->res_mask, h.n_expert,
+                             size_t(il) * g->res_mask->nb[1]), 1, h.n_expert, 1);
+            ggml_tensor* flags   = ggml_get_rows(c, mrow, sel);
+            ggml_tensor* ids_res = memex::resident_split_ids(c, sel, flags, /*resident=*/true);
+            ggml_tensor* ids_oth = memex::resident_split_ids(c, sel, flags, /*resident=*/false);
+            ggml_set_output(ids_res);
+            ggml_set_output(ids_oth);
+            g->res_ids.push_back(ids_res);
+            g->oth_ids.push_back(ids_oth);
+            // The two halves are added PER SLOT, before the weighting and before the fold.
+            // build_step explains why at length and the reasoning transfers verbatim: folding
+            // each half over its own slots reassociates the sum, mul_mat_id has already zeroed
+            // the slots the other half owns, and x + 0.0f is x - so each slot reaches the
+            // shared weight-and-fold bit-identical to the unsplit path's value.
+            //
+            // Named locals rather than two arguments to ggml_add: C++ leaves argument
+            // evaluation order unspecified, and that order is the order the two halves' nodes
+            // enter the graph.
+#ifdef MEMEX_FWD_GPU_EXPERTS
+            if (gx && gx->on()) {
+                ggml_tensor* ids_oth_after = gx->fork(c, il, ids_oth, xe, ids_res);
+                ggml_tensor* o_oth     = experts_g4(ids_oth_after);
+                ggml_tensor* o_res_cpu = gx->config().check ? experts_g4(ids_res) : nullptr;
+                ggml_tensor* o_res     = gx->join(c, il, o_oth, o_res_cpu);
+                eo = ggml_add(c, o_res, o_oth);
+            } else
+#endif
+            {
+                ggml_tensor* o_res = experts_g4(ids_res);
+                ggml_tensor* o_oth = experts_g4(ids_oth);
+                eo = ggml_add(c, o_res, o_oth);
+            }
+        } else {
+            eo = experts_g4(sel);
+            if (rwarm) {
+                // The prefill's routing, so the sliding window is warm by the first generated
+                // token. Nothing in the compute depends on it.
+                ggml_tensor* cp = memex::resident_ids_copy(c, sel);
+                ggml_set_output(cp);
+                g->sel_ids.push_back(cp);
+                ggml_build_forward_expand(g->gf, cp);
+            }
+        }
         // Weight by the router, fold the eight slots, and apply the per-expert scale - all
         // in ONE node.
         //
@@ -5952,7 +6021,16 @@ int main(int argc, char** argv) {
                    "головы на модель, а у \"%s\" она своя на каждом слое\n", h.arch.c_str());
             return 1;
         }
-        if (ropt.on() || gopt.on) {
+        // gemma4 TEPER MOZHET. Otkaz nizhe ostajotsja dlja ostalnyh arhitektur.
+        //
+        // Chto imenno okazalos nevernym v ego sobstvennoj formulirovke: "rasshcheplenie trebuet
+        // dvuh progonov odnogo tenzora s dvumja spiskami id". Dvuh progonov trebuet GRAF - i on
+        // ih delaet, po odnomu na polovinu, rovno kak build_step. A ZAGRUZCHIKU rasshcheplenie
+        // ne nuzhno vovse: srez odnogo eksperta v ffn_gate_up_exps eto [n_embd, 2*n_ff_exp],
+        // gde pervaja polovina - gate, vtoraja - up (ggml.c, vetka as_gate == NULL), i obe
+        // nepreryvny i vyrovneny po blokam kvanta, potomu chto delenie idjot po ne1, a blok
+        // lezhit vdol ne0. Eto dva memcpy.
+        if ((ropt.on() || gopt.on) && !arch_g4) {
             // Gemma's expert pair is one fused tensor and the split needs two dispatches of
             // it; qwen35moe's shared experts are static traffic that the resident set does
             // not model. Both are tractable, neither is verified, and an unverified split is
@@ -6864,10 +6942,22 @@ int main(int argc, char** argv) {
             std::vector<ggml_tensor*> gu, gg, gd;
             gu.reserve(size_t(h.n_layer)); gg.reserve(size_t(h.n_layer));
             gd.reserve(size_t(h.n_layer));
+            // gemma4 hands the SAME tensor as both up and gate: ffn_gate_up_exps holds the
+            // pair, gate in the first half of each expert slab and up in the second. The
+            // loader splits it by byte offset; nothing downstream knows the difference,
+            // because after the split the two roles have exactly the shape they would have
+            // had from two separate tensors.
             for (int il = 0; il < h.n_layer; ++il) {
-                gu.push_back(w.layers[size_t(il)].up);
-                gg.push_back(w.layers[size_t(il)].gate);
-                gd.push_back(w.layers[size_t(il)].down);
+                if (arch_g4) {
+                    ggml_tensor* gup = w4.layers[size_t(il)].gate_up_exps;
+                    gu.push_back(gup);
+                    gg.push_back(gup);
+                    gd.push_back(w4.layers[size_t(il)].down_exps);
+                } else {
+                    gu.push_back(w.layers[size_t(il)].up);
+                    gg.push_back(w.layers[size_t(il)].gate);
+                    gd.push_back(w.layers[size_t(il)].down);
+                }
             }
             memex::GpuExpertsConfig gc;
             gc.n_layers  = h.n_layer;
@@ -6880,6 +6970,10 @@ int main(int argc, char** argv) {
             // A promoted expert is not resident until its bytes are confirmed. See the
             // deferred-activation block in resident_set.hpp for why.
             gc.deferred  = true;
+            // Two independent facts about gemma4, kept as two flags: its expert pair lives in
+            // one tensor, and its activation is GELU rather than SILU.
+            gc.fused_gate_up = arch_g4;
+            gc.gelu          = arch_g4;
             // Where the uploader takes its bytes from. Decided on what the RAM tensors ACTUALLY
             // are, never on what the load was asked to do - those are different questions and
             // the second one has misled this project more than once.
@@ -7016,8 +7110,13 @@ int main(int argc, char** argv) {
         // единственная причина, по которой gemma4 не могла генерировать. Необязательные модули
         // для неё запрещены выше по имени, поэтому здесь они заведомо пусты.
         const bool built_pre = arch_g4
+            // rset, so the prefill exports its routing and the sliding window is warm by the
+            // first generated token - rwarm, not rsplit: with n_tokens > 1 the mask has one
+            // row per layer and not per token, so the prefill stays on the unsplit path.
+            // gsp too: the prefill's head is the same 748 MiB.
             ? build_gemma4_step(&pre, buft, h, w4, kv, n, 0, n_kv_max,
-                                /*all_logits=*/false, /*keep_probes=*/false)
+                                /*all_logits=*/false, /*keep_probes=*/false, gsp,
+                                rset.get(), /*gx=*/nullptr)
             : build_step(&pre, buft, h, w, kv, n, 0, n_kv_max, min_experts, expert_thresh,
                          /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/false,
                          rset.get(), /*gx=*/nullptr, gsp);
@@ -7253,9 +7352,14 @@ int main(int argc, char** argv) {
         bool rdec_built = false;
         if (rset) {
             const auto t_rb = Clock::now();
-            if (!build_step(&rdec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
-                            /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/true,
-                            rset.get(), gxp, gsp)) {
+            const bool built_rdec = arch_g4
+                ? build_gemma4_step(&rdec, buft, h, w4, kv, 1, n, n_kv_max,
+                                    /*all_logits=*/false, /*keep_probes=*/false, gsp,
+                                    rset.get(), gxp)
+                : build_step(&rdec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
+                             /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/true,
+                             rset.get(), gxp, gsp);
+            if (!built_rdec) {
                 printf("расщеплённый граф декода не собрался\n");
                 return 1;
             }
@@ -7660,6 +7764,13 @@ int main(int argc, char** argv) {
                     printf("  видеопамять против модели: сверено слотов %d, расхождений %d%s%s\n",
                            probed, bad, bad ? " — " : "", bad ? verr.c_str() : "");
                     if (bad) return 1;
+                    // The same hole the post-generation copy just lost: skipping empty slots
+                    // without counting them is right, printing "0 checked, 0 discrepancies"
+                    // as a pass is not. This copy did not get the repair the first time.
+                    if (probed == 0) {
+                        printf("  NI ODIN slot ne proverjalsja: vse probovannye pusty. Eto NE "
+                               "sovpadenie bajtov, a otsutstvie proverki.\n");
+                    }
                 }
 #endif
 

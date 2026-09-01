@@ -110,6 +110,17 @@ struct GpuExpertsConfig {
     // Build a second, CPU-computed copy of the resident half and compare it against the
     // device's, per layer per step. Costs the whole saving; exists to prove the plumbing.
     bool check = false;
+    // FUSED gate+up in ONE source tensor per layer (gemma4's ffn_gate_up_exps), and GELU
+    // instead of SILU. Two independent facts about the same architecture, kept as two flags
+    // because nothing says a future one must have both.
+    //
+    // When fused is set, the caller passes the SAME tensor as the up and the gate source; the
+    // loader takes the second half of each expert slab for up and the first for gate, which is
+    // the order ggml's own kernel uses. Everything downstream - the device tensors, the graph,
+    // the slot map, the promotion path - is unchanged, because after the split the two roles
+    // look exactly like two separate tensors.
+    bool fused_gate_up = false;
+    bool gelu          = false;
     // Path to the GGUF the model was loaded from. When set, promotions read the PRE-REPACK
     // bytes straight out of this file instead of out of the in-RAM expert tensors, which
     // decouples the two layouts: RAM may stay interleaved _R8 for the CPU half (worth +34%)
@@ -400,8 +411,21 @@ class GpuExperts {
         ggml_type   type = GGML_TYPE_COUNT;
         int64_t     ne0  = 0;
         int64_t     ne1  = 0;
-        std::size_t slab = 0;   // bytes of one expert, i.e. the stored nb[2]
+        std::size_t slab = 0;   // bytes of one expert OF THIS ROLE - what gets copied
         long long   off  = 0;   // absolute byte offset of the tensor's data in the file
+        // FUSED gate+up (gemma4). One source tensor [n_embd, 2*n_ff_exp, n_expert] holds both
+        // roles, so the stride between experts is twice the bytes of either role and each role
+        // sits at its own offset inside the slab. From ggml.c's own kernel, the branch taken
+        // when as_gate is null:
+        //     src0_2_cur = src0_1->data + cur_a*nb02;   // GATE  - the FIRST half
+        //     src0_1_cur = src0_2_cur + nb02/2;         // UP    - the second
+        // Both halves are contiguous and quantisation-block aligned, because the split runs
+        // along ne1 while a block lies along ne0 (2816 = 11 x 256). So this is two memcpys,
+        // not the "two passes with two id lists" the old refusal described.
+        //
+        // Unfused is stride == slab and sub == 0, which is byte-identical to what was here.
+        std::size_t stride = 0;
+        std::size_t sub    = 0;
     };
     // Indexed [layer*3 + kind], kind 0=up 1=gate 2=down. Empty when reading from RAM.
     std::vector<PlainSrc> plain_;
