@@ -3088,6 +3088,20 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
     ggml_set_output(g->logits);
     for (auto& pr : g->probes) ggml_set_output(pr.second);
     ggml_build_forward_expand(g->gf, g->logits);
+    // A graph that ran out of nodes is TRUNCATED, not refused - ggml_new_object returns null
+    // in the middle of the build and nothing says so. With the resident split the per-layer
+    // budget went 128 -> 192, and if that is still short the symptom is a plausible wrong
+    // answer, which is exactly what "argmax sovpal 0/4, L2 110.8%" looks like.
+    {
+        const int used = ggml_graph_n_nodes(g->gf);
+        if (used + 16 >= int(n_nodes)) {
+            printf("gemma4: graf ispolzoval %d uzlov iz %zu - bjudzheta ne hvataet, graf mozhet byt usechjon\n", used, n_nodes);
+            return false;
+        }
+        if (rsplit) {
+            printf("gemma4: rasshcheplennyj graf - %d uzlov iz %zu\n", used, n_nodes);
+        }
+    }
     g->alloc = ggml_gallocr_new(buft);
     if (!g->alloc) {
         printf("gemma4: ggml_gallocr_new не удался\n");
@@ -7354,7 +7368,8 @@ int main(int argc, char** argv) {
             const auto t_rb = Clock::now();
             const bool built_rdec = arch_g4
                 ? build_gemma4_step(&rdec, buft, h, w4, kv, 1, n, n_kv_max,
-                                    /*all_logits=*/false, /*keep_probes=*/false, gsp,
+                                    /*all_logits=*/false,
+                                    /*keep_probes=*/probe_name == "all", gsp,
                                     rset.get(), gxp)
                 : build_step(&rdec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
                              /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/true,
@@ -7836,6 +7851,35 @@ int main(int argc, char** argv) {
                     ggml_backend_synchronize(be);
                     ggml_backend_tensor_get(dec.logits, ulg.data(), 0,
                                             sizeof(float) * size_t(h.n_vocab));
+                    // WHERE the NaN is, not just that there is one. compare_logits can only
+                    // say the logits are not finite; this names the first tensor in the split
+                    // graph that is not, which is the difference between "the split is wrong"
+                    // and "layer 7's routed half is wrong". Costs one pass over the probes and
+                    // only runs when they were asked for.
+                    if (i == 0 && !rdec.probes.empty()) {
+                        std::vector<float> pv;
+                        bool said = false;
+                        for (const auto& pr : rdec.probes) {
+                            const std::size_t np = std::size_t(ggml_nelements(pr.second));
+                            pv.resize(np);
+                            ggml_backend_tensor_get(pr.second, pv.data(), 0, np * sizeof(float));
+                            std::size_t bad_i = np;
+                            for (std::size_t q = 0; q < np; ++q) {
+                                if (!std::isfinite(pv[q])) { bad_i = q; break; }
+                            }
+                            if (bad_i != np) {
+                                printf("  PERVYJ NEFINITNYJ TENZOR v rasshcheplennom grafe: %s "
+                                       "(element %zu iz %zu, znachenie %g)\n",
+                                       pr.first.c_str(), bad_i, np, pv[bad_i]);
+                                said = true;
+                                break;
+                            }
+                        }
+                        if (!said) {
+                            printf("  vse %zu zondov rasshcheplennogo grafa finitny\n",
+                                   rdec.probes.size());
+                        }
+                    }
                     const LogitCmp c = compare_logits(lg, ulg);
                     // Counted only when the comparison was actually possible: a comparison
                     // that was refused is not a comparison that passed, and folding it into
@@ -7846,9 +7890,19 @@ int main(int argc, char** argv) {
                         rrep.worst_rel = std::max(rrep.worst_rel, c.rel_full);
                         if (c.argmax_ours == c.argmax_ref) rrep.argmax_same++;
                     }
-                    printf("  шаг %2d: расщеплённый против нерасщеплённого, отн. L2 %.9f%%, "
-                           "argmax %s\n", i, c.ok ? 100.0 * c.rel_full : -1.0,
-                           c.ok && c.argmax_ours == c.argmax_ref ? "совпал" : "РАСХОДИТСЯ");
+                    // The refusal REASON, not just -1.0. compare_logits refuses on a zero
+                    // norm, a NaN or a size mismatch, and those are three different bugs; the
+                    // bare -1.0 reads as "diverged" and sent this hunt at the device path when
+                    // the split graph was in fact producing degenerate logits.
+                    if (c.ok) {
+                        printf("  шаг %2d: расщеплённый против нерасщеплённого, отн. L2 %.9f%%, "
+                               "argmax %s\n", i, 100.0 * c.rel_full,
+                               c.argmax_ours == c.argmax_ref ? "совпал" : "РАСХОДИТСЯ");
+                    } else {
+                        printf("  shag %2d: sravnenie OTKAZANO (%s); norma nashej %.6g, "
+                               "etalonnoj %.6g, dlina %zu protiv %zu\n",
+                               i, c.why, c.norm_ours, c.norm_ref, c.n_ours, c.n_ref);
+                    }
                     // On the first step, walk the layers. The logits alone cannot tell a
                     // reassociated sum apart from a mis-wired split: both show up as a
                     // percentage. This can. The split changes nothing but the ORDER of eight
