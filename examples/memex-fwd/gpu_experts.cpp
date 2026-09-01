@@ -874,6 +874,14 @@ bool GpuExperts::init(const GpuExpertsConfig& cfg, ggml_tensor* const* up,
         // measurement of the drain showed the cost is the hold, not the fence.
         promo_yield_ = true;
         if (const char* e = getenv("MEMEX_PROMO_YIELD")) promo_yield_ = (atoi(e) != 0);
+        // ASYNCHRONOUS PROMOTION. Off by default until it is measured: the two arms then live
+        // in ONE binary and one session, which is the only way to compare them - an unchanged
+        // binary has drifted 11.6% across sessions here against a 4.2% within-session floor.
+        promo_async_ = false;
+        if (const char* e = getenv("MEMEX_PROMO_ASYNC")) promo_async_ = (atoi(e) != 0);
+        // Rule 68: an arm whose setting was not confirmed is not an arm.
+        fprintf(stderr, "PROMO_ASYNC %d\n", promo_async_ ? 1 : 0);
+        fflush(stderr);
     }
 
     slot_of_.assign(std::size_t(cfg_.n_layers) * std::size_t(cfg_.n_experts), int16_t(-1));
@@ -1039,10 +1047,21 @@ void GpuExperts::worker_loop() {
     for (;;) {
         int il = -1, k = 0;
         bool drained = false;
+        // Poll a submitted batch before anything else. This is where the deferred wait is
+        // actually paid, and paying it as a poll rather than a wait is the entire change:
+        // by now a dispatch has run, so the fence has usually passed and the poll costs a
+        // getFenceStatus. n_reap_late counts the times it had not - the healthy sign.
+        batch_reap(false);
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_job_.wait(lk, [&] { return quit_ || job_active_ || pending_total_ > 0; });
-            if (quit_) return;
+            if (quit_) {
+                // Leaving with a batch in flight would destroy the fence and the pool under
+                // an executing command buffer. Unlock first: batch_reap takes mu_ itself.
+                lk.unlock();
+                batch_reap(true);
+                return;
+            }
             if (job_active_) {
                 il = job_il_;
                 k  = job_k_;
@@ -1146,6 +1165,20 @@ void GpuExperts::worker_loop() {
             const double pr_ms =
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t_pr).count();
+            // Confirm before anyone is told the queue is empty, and only then. drain() runs on
+            // the main thread and returns when pending_total_ hits zero with the worker idle;
+            // whatever it is guarding - the byte verification reads video memory directly -
+            // must not see a slot whose bytes are still in flight. Outside the timer, because
+            // the wait is no longer part of what a promotion costs, and outside the lock,
+            // because batch_reap takes mu_ itself.
+            {
+                bool empty;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    empty = (pending_total_ == 0);
+                }
+                if (empty) batch_reap(true);
+            }
             std::lock_guard<std::mutex> lk(mu_);
             st_.ms_promote += pr_ms;
             busy_ = false;
@@ -1341,6 +1374,32 @@ void GpuExperts::batch_begin() {
 void GpuExperts::batch_end() {
     if (!batching_) return;
     const bool had_work = batch_used_ > 0;
+
+    // ASYNCHRONOUS ARM. Submit and return; the fence is confirmed later by batch_reap.
+    //
+    // Correctness does not rest on the wait and never did. Deferred activation already refuses
+    // to call an expert resident before its landing is confirmed, and confirmation now moves
+    // from "batch_end returned" to "batch_reap saw the fence". Between the two the expert is
+    // PENDING, which the mask does not name, so no dispatch can read the slot - the same
+    // invariant, held for longer. What the wait was actually buying was promptness, and
+    // promptness costs 0.949 ms of the 1.306 ms a promotion takes.
+    if (promo_async_ && had_work) {
+        ggml_backend_vk_batch_submit(be_);
+        batching_     = false;
+        batch_used_   = 0;
+        batch_flying_ = true;
+        inflight_landed_.insert(inflight_landed_.end(), batch_landed_.begin(), batch_landed_.end());
+        batch_landed_.clear();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            ++st_.batch_fences;
+            ++st_.n_fence_calls;
+        }
+        return;
+    }
+    // An empty batch still has to be closed, and closing it synchronously costs nothing:
+    // ggml_backend_vk_batch_end on a batch with no recorded copies submits an empty buffer.
+
     const auto t_fe = std::chrono::steady_clock::now();
     ggml_backend_vk_batch_end(be_);
     const double fe_ms = std::chrono::duration<double, std::milli>(
@@ -1359,6 +1418,36 @@ void GpuExperts::batch_end() {
         landed_.insert(landed_.end(), batch_landed_.begin(), batch_landed_.end());
     }
     batch_landed_.clear();
+}
+
+// Confirm a submitted batch, or report that it has not landed yet.
+//
+// Called from the worker thread only, and from every point that could otherwise let a batch
+// outlive its safety: before a new batch is opened (one fence, one batch), before a dispatch
+// (so a slot is never read while its bytes are in flight - belt and braces, the mask already
+// covers it), and at shutdown.
+bool GpuExperts::batch_reap(bool block) {
+    if (!batch_flying_) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool done = ggml_backend_vk_batch_reap(be_, block);
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    if (!done) {
+        std::lock_guard<std::mutex> lk(mu_);
+        ++st_.n_reap_late;
+        return false;
+    }
+    batch_flying_ = false;
+    std::lock_guard<std::mutex> lk(mu_);
+    // Only a blocking reap can have waited; a poll that succeeded cost a getFenceStatus. Both
+    // are timed, and the blocking one is the number the whole change is judged by.
+    if (block) {
+        st_.ms_reap_block += ms;
+        ++st_.n_reap_block;
+    }
+    landed_.insert(landed_.end(), inflight_landed_.begin(), inflight_landed_.end());
+    inflight_landed_.clear();
+    return true;
 }
 
 void GpuExperts::compute(int il, int k) {

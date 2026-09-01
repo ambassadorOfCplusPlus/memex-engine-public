@@ -2701,10 +2701,25 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
             // vidit tolko logity v konce i govorit "gde-to v tridcati slojah", a s nimi nazyvaet
             // KAKAJA iz chetyrjoh velichin razoshlas i na kakom sloe. Imena objazany sovpadat s
             // temi, chto pushit vetka bez karty - inache report ih molcha propustit.
+            //
+            // ggml_cont, NOT the views themselves - and this cost a whole diagnosis.
+            //
+            // attn_out, hd_in and moe_in are ggml_view_1d into card_lay, and card_lay is the
+            // output of a map_custom node whose buffer gallocr reuses as soon as its consumers
+            // are done. Thirty layers therefore share one region, and a probe is read AFTER the
+            // graph has run - so every layer reported the LAST layer's bytes. In the log that
+            // looked exactly like a computation fault: ffn_norm_1 identical at layers 28 and 29
+            // (rms 5.30764 both), ffn_norm_2 identical (5.95651 both), L2 in the hundreds and
+            // thousands of per cent. All six decode steps drew from one set of six values -
+            // one per step, shared by all thirty layers, which is the signature.
+            //
+            // ggml_set_output on a view does not protect the parent's storage. A cont has
+            // storage of its own, so set_output pins the bytes the probe will actually read.
+            // Three extra nodes a layer, and only when probes are asked for.
             if (keep_probes) {
-                g->probes.push_back({"attn_out-" + sil, attn_out});
-                g->probes.push_back({"ffn_norm_1-" + sil, hd_in});
-                g->probes.push_back({"ffn_norm_2-" + sil, moe_in});
+                g->probes.push_back({"attn_out-" + sil, ggml_cont(c, attn_out)});
+                g->probes.push_back({"ffn_norm_1-" + sil, ggml_cont(c, hd_in)});
+                g->probes.push_back({"ffn_norm_2-" + sil, ggml_cont(c, moe_in)});
             }
         }
 #else
@@ -7871,6 +7886,14 @@ int main(int argc, char** argv) {
             const double   promo_rd_gen  = gs.ms_read   - gx_fill_base.ms_read;
             const double   promo_rec_gen = gs.ms_record - gx_fill_base.ms_record;
             const double   promo_fe_gen  = gs.ms_fence  - gx_fill_base.ms_fence;
+            // Asynchronous promotion: the wait that batch_end used to pay inside promo_ms is
+            // now paid, if at all, inside batch_reap. These three say whether it disappeared
+            // or merely moved - reap_ms near zero is the claim, reap_ms near fe_promo is the
+            // refutation, and reap_late counts polls that found the batch still flying, which
+            // is the sign the deferral had anything to defer.
+            const double   promo_reap_gen = gs.ms_reap_block - gx_fill_base.ms_reap_block;
+            const uint64_t reap_n_gen     = gs.n_reap_block  - gx_fill_base.n_reap_block;
+            const uint64_t reap_late_gen  = gs.n_reap_late   - gx_fill_base.n_reap_late;
             const uint64_t promo_rdby_gen = gs.read_bytes - gx_fill_base.read_bytes;
             const uint64_t promo_n_gen  = gs.promotions  - gx_fill_base.promotions;
             const uint64_t promo_by_gen = gs.promo_bytes - gx_fill_base.promo_bytes;
@@ -8002,7 +8025,8 @@ int main(int argc, char** argv) {
                        "gbs %.4f mb_tok %.4f join_wait_tok %.4f job_tok %.4f cpu_tok %.4f "
                        "fill_ms %.1f fill_promo %llu budget %d frozen %d hits %.4f "
                        "period %d capacity %d rd_promo %.4f rec_promo %.4f "
-                       "fe_promo %.4f rest_promo %.4f rd_gbs %.4f\n",
+                       "fe_promo %.4f rest_promo %.4f rd_gbs %.4f "
+                       "async %d reap_ms %.4f reap_n %llu reap_late %llu\n",
                        gxp->promo_drain(), gxp->promo_yield() ? 1 : 0, gxp->stage_slots(),
                        gxp->stage_pinned() ? 1 : 0,
                        same, n_gen,
@@ -8022,7 +8046,10 @@ int main(int argc, char** argv) {
                        promo_n_gen ? (promo_ms_gen - promo_rd_gen - promo_rec_gen -
                                       promo_fe_gen) / double(promo_n_gen) : 0.0,
                        promo_rd_gen > 0.0
-                           ? double(promo_rdby_gen) / 1e9 / (promo_rd_gen / 1000.0) : 0.0);
+                           ? double(promo_rdby_gen) / 1e9 / (promo_rd_gen / 1000.0) : 0.0,
+                       gxp->promo_async() ? 1 : 0,
+                       promo_n_gen ? promo_reap_gen / double(promo_n_gen) : 0.0,
+                       (unsigned long long)reap_n_gen, (unsigned long long)reap_late_gen);
             }
             // IZ CHEGO SOSTOIT DISPATCH. Odna ASCII-stroka, po tem zhe prichinam, chto
             // PROMO_AB: eto samyj krupnyj neobjasnjonnyj chlen tokjena. ms_job prihodit okolo

@@ -47,6 +47,23 @@ GGML_API GGML_CALL bool ggml_backend_vk_batch_set_tensor(ggml_backend_t backend,
                                                         const void * data, size_t offset, size_t size);
 GGML_API GGML_CALL void ggml_backend_vk_batch_end(ggml_backend_t backend);
 
+// Asynchronous form of batch_end: submits everything recorded and returns WITHOUT waiting.
+// The wait is 0.949 ms of the 1.306 ms a promotion costs, and nothing needs it to have
+// happened until the bytes are actually read - the caller's own deferred activation already
+// refuses to name an expert resident before its landing is confirmed.
+//
+// The confirmation is ggml_backend_vk_batch_reap. Call it with block=false to poll and
+// block=true to wait; it returns true when the batch has landed (or when none was in flight).
+// Exactly one batch may be in flight, because there is one transfer fence: batch_begin reaps
+// the previous one before opening a new batch.
+//
+// The submitted command buffer comes from a pool of its own that graph_compute never resets,
+// so a batch may outlive any number of graphs. That is the whole reason the pair is safe:
+// resetCommandPool requires its buffers to have completed, and the shared transfer pool is
+// reset at the end of every graph_compute.
+GGML_API GGML_CALL void ggml_backend_vk_batch_submit(ggml_backend_t backend);
+GGML_API GGML_CALL bool ggml_backend_vk_batch_reap(ggml_backend_t backend, bool block);
+
 
 // Fold one readback into the next graph_compute's command buffer, removing a whole
 // submit-and-fence round trip per call. `dst` must be pinned host memory

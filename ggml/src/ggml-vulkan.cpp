@@ -1057,6 +1057,23 @@ struct ggml_backend_vk_context {
     // is a latent race; and an asynchronous end needs a fence that nobody else resets.
     vk::Fence transfer_fence;
 
+    // ASYNCHRONOUS PROMOTION. A command pool that graph_compute never resets, and the submitted
+    // context held alive until its fence passes.
+    //
+    // Why a pool of its own rather than transfer_cmd_pool. ggml_vk_graph_cleanup ends every
+    // graph_compute with resetCommandPool on BOTH compute_cmd_pool and transfer_cmd_pool, and
+    // resetCommandPool requires its buffers to have completed. A batch left in flight across a
+    // graph would be reset mid-execution - which is precisely the invalid use that the deleted
+    // keep-warm poke committed, and the same class of fault as llama.cpp #25195 (racing writes
+    // into a reused device buffer across submits, 45 crashes on Windows+amdvlk).
+    //
+    // batch_owns_ctx distinguishes a batch this module opened from a transfer context somebody
+    // else opened first: only the former may be submitted asynchronously, because only the
+    // former is guaranteed to come from batch_cmd_pool.
+    vk_command_pool batch_cmd_pool;
+    vk_context      batch_inflight;
+    bool            batch_owns_ctx {};
+
     // INSTRUMENT COUNTERS, PER CONTEXT. They used to be function-local statics, which meant one
     // set for the whole process while TWO contexts - attention and experts - run on two different
     // threads. That is a data race, and worse than the race: it mixed the two into one average, so
@@ -4229,6 +4246,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
 
     ctx->compute_cmd_pool.init(ctx->device, &ctx->device->compute_queue);
     ctx->transfer_cmd_pool.init(ctx->device, &ctx->device->transfer_queue);
+    ctx->batch_cmd_pool.init(ctx->device, &ctx->device->transfer_queue);
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
     const char* skip_checks = getenv("GGML_VULKAN_SKIP_CHECKS");
@@ -10077,6 +10095,11 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     }
     ctx->gc.events.clear();
 
+    // Destroying a fence or a pool with work still in flight is invalid; wait it out first.
+    if (ctx->batch_inflight) {
+        (void)ctx->device->device.waitForFences({ ctx->transfer_fence }, true, UINT64_MAX);
+        ctx->batch_inflight.reset();
+    }
     ctx->device->device.destroyFence(ctx->fence);
     ctx->device->device.destroyFence(ctx->almost_ready_fence);
     ctx->device->device.destroyFence(ctx->transfer_fence);
@@ -10089,6 +10112,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->compute_cmd_pool.destroy(ctx->device->device);
     ctx->transfer_cmd_pool.destroy(ctx->device->device);
+    ctx->batch_cmd_pool.destroy(ctx->device->device);
 }
 
 static int ggml_vk_get_device_count() {
@@ -10512,8 +10536,13 @@ GGML_CALL void ggml_backend_vk_batch_begin(ggml_backend_t backend) {
     if (!ctx->transfer_ctx.expired()) {
         return;   // already open; nesting is a no-op so begin/end can bracket loosely
     }
-    vk_context transfer_ctx = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
-    ctx->transfer_ctx = transfer_ctx;
+    // One transfer fence means one batch in flight. Reaping here rather than refusing keeps the
+    // caller's contract unchanged - begin always succeeds - and the wait it may cost is a wait
+    // on a batch submitted at least one dispatch ago, which is the entire point of deferring it.
+    ggml_backend_vk_batch_reap(backend, true);
+    vk_context transfer_ctx = ggml_vk_create_context(ctx, ctx->batch_cmd_pool);
+    ctx->transfer_ctx   = transfer_ctx;
+    ctx->batch_owns_ctx = true;
     ggml_vk_ctx_begin(ctx->device, transfer_ctx);
 }
 
@@ -10593,6 +10622,7 @@ GGML_CALL void ggml_backend_vk_batch_end(ggml_backend_t backend) {
     for (auto& cpy : transfer_ctx->in_memcpys) {
         memcpy(cpy.dst, cpy.src, cpy.n);
     }
+    ctx->batch_owns_ctx = false;
     ggml_vk_submit(transfer_ctx, ctx->transfer_fence);
     // GGML_VK_BATCH_SPIN=1 restores the old behaviour so the two can be compared in ONE binary
     // and one session. A before/after built as two binaries would put the comparison across a
@@ -10645,6 +10675,70 @@ GGML_CALL void ggml_backend_vk_batch_end(ggml_backend_t backend) {
         memcpy(cpy.dst, cpy.src, cpy.n);
     }
     ctx->transfer_ctx.reset();
+    // batch_cmd_pool is ours; nothing else recycles it. The fence has passed, so this is legal.
+    ggml_vk_command_pool_cleanup(ctx->device, ctx->batch_cmd_pool);
+}
+
+// Submit everything recorded and RETURN. The fence is not waited on here; ggml_backend_vk_batch_reap
+// does that, later, from whatever thread called this one.
+//
+// Falls back to the synchronous end when the open transfer context is not ours: it would then be
+// a buffer from transfer_cmd_pool, and graph_compute resets that pool at the end of every graph.
+// Deferring such a batch would reset a command buffer that is still executing.
+GGML_CALL void ggml_backend_vk_batch_submit(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (ctx->transfer_ctx.expired()) {
+        return;
+    }
+    if (!ctx->batch_owns_ctx) {
+        ggml_backend_vk_batch_end(backend);
+        return;
+    }
+    // begin reaps, so this cannot hold - asserted rather than assumed, because a second batch
+    // submitted against a signalled-but-unreset fence would be reported as landed immediately.
+    GGML_ASSERT(!ctx->batch_inflight);
+    vk_context transfer_ctx = ctx->transfer_ctx.lock();
+    ggml_vk_ctx_end(transfer_ctx);
+    // Only pinned sources are accepted, so in_memcpys is empty; drained anyway, as in batch_end.
+    for (auto& cpy : transfer_ctx->in_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    ggml_vk_submit(transfer_ctx, ctx->transfer_fence);
+    // The shared_ptr is what keeps the recorded buffer alive: ggml_vk_graph_cleanup clears
+    // gc.contexts, and gc is the only other owner.
+    ctx->batch_inflight = transfer_ctx;
+    ctx->transfer_ctx.reset();
+    ctx->batch_owns_ctx = false;
+}
+
+// True when nothing is in flight any more. block=false polls and may return false.
+GGML_CALL bool ggml_backend_vk_batch_reap(ggml_backend_t backend, bool block) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->batch_inflight) {
+        return true;
+    }
+    if (block) {
+        VK_CHECK(ctx->device->device.waitForFences({ ctx->transfer_fence }, true, UINT64_MAX),
+                 "ggml_backend_vk_batch_reap waitForFences");
+    } else {
+        const vk::Result r = ctx->device->device.getFenceStatus(ctx->transfer_fence);
+        if (r == vk::Result::eNotReady) {
+            return false;
+        }
+        if (r != vk::Result::eSuccess) {
+            fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(r).c_str(), __FILE__, __LINE__);
+            exit(1);
+        }
+    }
+    ctx->device->device.resetFences({ ctx->transfer_fence });
+    for (auto& cpy : ctx->batch_inflight->out_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    ctx->batch_inflight.reset();
+    ggml_vk_command_pool_cleanup(ctx->device, ctx->batch_cmd_pool);
+    return true;
 }
 
 GGML_CALL void * ggml_backend_vk_tensor_mapped_ptr(const ggml_tensor * tensor) {

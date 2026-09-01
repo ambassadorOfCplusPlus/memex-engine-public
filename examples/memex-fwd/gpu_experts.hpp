@@ -178,6 +178,15 @@ struct GpuExpertsStats {
     uint64_t n_read          = 0;   // read_plain calls: three per promotion
     uint64_t read_bytes      = 0;   // bytes those calls moved
     uint64_t n_fence_calls   = 0;   // batch_end calls that had anything recorded
+    // ASYNCHRONOUS PROMOTION, and these three ARE the result. The hypothesis is that the
+    // 0.949 ms fence wait disappears behind work the same thread has to do anyway. It is
+    // confirmed only if ms_reap_block stays near zero; if the reaps block for the same
+    // 0.949 ms, the batch was submitted too late to hide and the change bought nothing.
+    // n_reap_late counts polls that found the batch still in flight - the healthy sign,
+    // because a poll that always succeeds means the wait had already happened elsewhere.
+    double   ms_reap_block   = 0.0; // time actually spent WAITING inside batch_reap
+    uint64_t n_reap_block    = 0;   // reaps that had to block
+    uint64_t n_reap_late     = 0;   // non-blocking polls that came back not-ready
     // WHAT THE DISPATCH ITSELF IS MADE OF, and it is the largest unexplained term in the token.
     //
     // ms_job measures compute(il) end to end and comes back at ~21.4 ms/token. The bytes that
@@ -250,6 +259,7 @@ class GpuExperts {
     // Whether a batch is closed early as soon as a dispatch is waiting. The fence saving is
     // kept for whatever was already recorded; what is given up is the tail of the batch.
     bool promo_yield()  const { return promo_yield_; }
+    bool promo_async()  const { return promo_async_; }
     bool readback_mapped() const { return !out_mapped_.empty() && out_mapped_.back() != nullptr; }
 
     // Recompute the slot map from the resident set and queue the uploads the change implies.
@@ -424,10 +434,20 @@ class GpuExperts {
     // where take_landed drains it. Separating them is the whole confirmation guarantee: a
     // recorded copy is not a landed one until its fence passes.
     std::vector<uint32_t> batch_landed_;
+    // ASYNCHRONOUS PROMOTION. What a SUBMITTED but not yet confirmed batch recorded. It sits
+    // here, not in landed_, so nothing names those experts resident until the fence passes -
+    // the deferred-activation invariant is unchanged, it just holds for longer.
+    std::vector<uint32_t> inflight_landed_;
+    bool                  promo_async_  = false;  // MEMEX_PROMO_ASYNC=1
+    bool                  batch_flying_ = false;  // a batch is submitted and not yet reaped
     std::vector<uint32_t> landed_;
 
     void batch_begin();
     void batch_end();
+    // Confirm a submitted batch. block=false polls; returns true when nothing is in flight.
+    // Every path that could reach a graph_compute, a shutdown or a new batch must pass through
+    // it, which is why it is called from the worker loop rather than from one place.
+    bool batch_reap(bool block);
 
     // Per compacted width k: the output tensor's mapped host address when the driver put its
     // buffer in host-visible coherent memory, in which case the per-layer readback is a memcpy
