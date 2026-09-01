@@ -2034,7 +2034,20 @@ bool build_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
                 ZonedKvCache* zc = nullptr, bool keep_dbg = false,
                 const memex::ResidentSet* rs = nullptr,
                 memex::GpuExperts* gx = nullptr,
-                memex::GpuStatic* gstat = nullptr) {
+                memex::GpuStatic* gstat = nullptr,
+                // PROBES ON THE DECODE GRAPH, and until now there were none at all.
+                //
+                // qwen3moe's probes live in build() - the PREFILL graph - and the step-by-step
+                // check never uses it. So "--decode-check N --probe all" on qwen3moe iterated an
+                // EMPTY probe list and printed logit L2 beside an empty probe section, which
+                // reads exactly like "every layer agreed". The architecture the optional modules
+                // are actually enabled for was the one with no probe coverage on the graph they
+                // run in. Found in the verification audit.
+                //
+                // Names are the reference's own, taken from build()'s set minus the two the
+                // audit found dead: attn_out_resid (nothing emits it) and ffn_moe_out (the
+                // reference calls it routed_out on this branch).
+                bool keep_probes = false) {
 #ifndef MEMEX_FWD_ZONED
     if (zc) {
         printf("зонный кэш: эта сборка собрана без него (нет дерева MemeX/cpp)\n");
@@ -2137,6 +2150,7 @@ bool build_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
         {
         ggml_tensor* inpSA = cur;
         x = norm(c, cur, L.attn_norm, h.rms_eps);
+        if (keep_probes) g->probes.push_back({"attn_norm-" + std::to_string(il), x});
 
         ggml_tensor* q = ggml_mul_mat(c, L.wq, x);
         ggml_tensor* k = ggml_mul_mat(c, L.wk, x);
@@ -2250,6 +2264,7 @@ bool build_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
 
         ffn_inp = cur;
         x = norm(c, ffn_inp, L.ffn_norm, h.rms_eps);
+        if (keep_probes) g->probes.push_back({"ffn_inp_normed-" + std::to_string(il), x});
         logits_e = ggml_mul_mat(c, L.router, x);
         }
 
@@ -2417,7 +2432,9 @@ bool build_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
                 ggml_build_forward_expand(g->gf, cp);
             }
         }
+        if (keep_probes) g->probes.push_back({"routed_out-" + std::to_string(il), moe});
         cur = ggml_add(c, moe, ffn_inp);
+        if (keep_probes) g->probes.push_back({"l_out-" + std::to_string(il), cur});
     }
 
     // Only the last token's row goes through the output head. The head is 151936 x 2048 -
@@ -2429,8 +2446,12 @@ bool build_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
         cur = ggml_cont(c, cur);
     }
     cur = norm(c, cur, w.out_norm, h.rms_eps);
+    if (keep_probes) g->probes.push_back({"result_norm", cur});
     g->logits = head_matmul(c, w.out, cur, gstat);
     ggml_set_output(g->logits);
+    // set_output on every probe, as the other builders do: without it gallocr is free to reuse
+    // the buffer and the probe reads whatever landed there last - the gemma4 fault, exactly.
+    for (auto& pr : g->probes) ggml_set_output(pr.second);
     ggml_build_forward_expand(g->gf, g->logits);
     g->alloc = ggml_gallocr_new(buft);
     if (!g->alloc) {
@@ -3470,7 +3491,7 @@ struct Generator {
         }
         return build_step(g, buft, *h, *w, kv, n_tokens, n_past, n_kv_max, min_experts,
                           expert_thresh, all_logits, /*zc=*/nullptr, /*keep_dbg=*/false,
-                          /*rs=*/nullptr, /*gx=*/nullptr, gstat);
+                          /*rs=*/nullptr, /*gx=*/nullptr, gstat, want_probes);
     }
 
     // The mask is -inf everywhere and zero only where a query at position past+i may see key
@@ -6572,14 +6593,33 @@ int main(int argc, char** argv) {
 
     if (probe_name == "all") {
         printf("\nсверка по слоям (наш путь против эталонного):\n");
+        // COUNT, AND NAME WHAT WAS NEVER COMPARED. `if (!ref_t) continue` is a silent skip,
+        // and a silent skip is indistinguishable from agreement: we lost coverage that way once
+        // already, on a probe called ffn_moe_out that the reference emits as routed_out, and
+        // nobody knew for weeks. METHODS 74 asked for this counter; METHODS 83 makes it the
+        // difference between "checked" and "not measured".
+        int asked = 0, matched = 0;
+        std::string missing;
         for (const auto& mine : g.probes) {
+            ++asked;
             const std::vector<float>* ref_t = probe.get(mine.first);
-            if (!ref_t) continue;
+            if (!ref_t) {
+                if (missing.size() < 400) { missing += (missing.empty() ? "" : ", ") + mine.first; }
+                continue;
+            }
+            ++matched;
             std::vector<float> got;
             got.resize(size_t(ggml_nelements(mine.second)));
             ggml_backend_tensor_get(mine.second, got.data(), 0,
                                     ggml_nbytes(mine.second));
             report(mine.first.c_str(), got, *ref_t);
+        }
+        printf("  zondov zaprosheno %d, svereno %d, NE SVERENO %d%s%s\n",
+               asked, matched, asked - matched,
+               missing.empty() ? "" : ": ", missing.c_str());
+        if (matched == 0 && asked > 0) {
+            printf("  NI ODIN zond ne sverjalsja - eto NE \"vsjo soshlos\", eto otsutstvie "
+                   "izmerenija: imena nashih uzlov ne sovpadajut s temi, chto vydajot etalon\n");
         }
     } else if (!probe_name.empty()) {
         printf("\nсверка промежуточного тензора %s:\n", probe_name.c_str());
@@ -6649,6 +6689,11 @@ int main(int argc, char** argv) {
         if (!place_layers(n_kv_max)) return 1;
         Generator gen;
         gen.want_probes = (probe_name == "all");
+        // Three states for the per-step probe section, because an empty one used to be
+        // indistinguishable from "every layer agreed" - which is exactly what qwen3moe printed,
+        // its probes living in the prefill graph the step check never builds.
+        bool probe_empty_said = false;
+        long probe_asked = 0, probe_matched = 0;
         gen.gstat = gsp;   // poshagovaja sverka dolzhna proverjat imenno tot put, kotoryj rabotaet
         if (!gen.init(be, buft, &h, arch_q3 ? &w : nullptr, nullptr, n_kv_max, min_experts,
                       expert_thresh, arch_g4 ? &w4 : nullptr,
@@ -6717,9 +6762,16 @@ int main(int argc, char** argv) {
             printf("  шаг %2d (позиция %4d): L2 %7.4f%%  токен наш %6d '%s'%s\n", i, past,
                    l2, am_mine, pm, same ? "" : "  — РАСХОДИТСЯ С ЭТАЛОНОМ");
             if (gen.want_probes) {
+                if (gen.dec.probes.empty() && !probe_empty_said) {
+                    probe_empty_said = true;
+                    printf("    zondov na dekodnom grafe NET - pustoj razdel nizhe oznachaet "
+                           "\"ne izmerjalos\", a ne \"soshlos\"\n");
+                }
                 for (const auto& mineP : gen.dec.probes) {
+                    ++probe_asked;
                     const std::vector<float>* ref_t = probe.get(mineP.first);
                     if (!ref_t) continue;
+                    ++probe_matched;
                     std::vector<float> got(size_t(ggml_nelements(mineP.second)));
                     ggml_backend_tensor_get(mineP.second, got.data(), 0,
                                             ggml_nbytes(mineP.second));
@@ -6735,6 +6787,12 @@ int main(int argc, char** argv) {
                 printf("  (eos на шаге %d)\n", i);
                 break;
             }
+        }
+        if (gen.want_probes) {
+            printf("  zondov za vse shagi: zaprosheno %ld, svereno %ld, NE SVERENO %ld%s\n",
+                   probe_asked, probe_matched, probe_asked - probe_matched,
+                   probe_asked == 0 ? "  (na dekodnom grafe zondov net - razdel pust potomu, "
+                                      "chto nichego ne izmerjalos)" : "");
         }
         printf("  итог: %d из %d шагов дали тот же токен; худший L2 %.4f%% на шаге %d\n",
                n_agree, n_steps, worst_step_l2, worst_step);

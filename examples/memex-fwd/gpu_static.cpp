@@ -539,7 +539,7 @@ bool GpuStatic::verify_layers(const GpuStaticLayer* src, std::string* err) {
                                      "ffn_norm","router","rope_freqs","post_attn_norm",
                                      "gate_inp_s","pre_ffw_norm_2"};
     std::vector<char> tmp;
-    int bad = 0;
+    int bad = 0, cmp_slots = 0;
     for (int il = 0; il < cfg_.n_layer; ++il) {
         ggml_tensor* ss[13]; ggml_tensor* dd[13];
         layer_slots(src[std::size_t(il)], ss);
@@ -565,10 +565,20 @@ bool GpuStatic::verify_layers(const GpuStaticLayer* src, std::string* err) {
                        il, kNames[i], ggml_get_name(dd[i]), ggml_get_name(ss[i]));
                 ++bad;
             }
+            ++cmp_slots;
         }
     }
     if (bad) { char b[96]; snprintf(b, sizeof(b), "rashozhdenij v slotah: %d", bad); *err = b; return false; }
-    printf("  bajty vesov sloev v videopamjati sovpadajut s modelju: %d sloev x 13 slotov" "\n", cfg_.n_layer);
+    // What was COMPARED, not the size of the table walked. Four of the thirteen slots are
+    // gemma4-only and are null on both sides for qwen3moe - skipped correctly, and then
+    // counted in the pass line, which claimed a number it had not verified (rule 83).
+    if (cmp_slots == 0) {
+        *err = "ni odin slot ne sverjalsja - eto ne sovpadenie, a otsutstvie proverki";
+        return false;
+    }
+    printf("  bajty vesov sloev v videopamjati sovpadajut s modelju: svereno %d slotov"
+           " na %d slojah, propushcheno pustyh s oboih storon %d" "\n",
+           cmp_slots, cfg_.n_layer, cfg_.n_layer * 13 - cmp_slots);
     return true;
 }
 
@@ -1700,7 +1710,11 @@ int gpu_static_selftest(int threads) {
                 if (got[k] > got[std::size_t(r) * std::size_t(n_vocab) +
                                  std::size_t(argmax_got)]) argmax_got = i;
             }
-            const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+            // den == 0 means the REFERENCE row is all zeros - there is nothing to be
+            // relative to. Returning 0.0 scored that as a perfect match and fed the
+            // pass/fail directly (rule 11); the sibling helper in gpu_experts.cpp has
+            // always returned 1.0 for the same case.
+            const double rel = den > 0.0 ? std::sqrt(num / den) : 1.0;
             worst_rel = std::max(worst_rel, rel);
             worst_abs = std::max(worst_abs, wabs);
             ++checked;
