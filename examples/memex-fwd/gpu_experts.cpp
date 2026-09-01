@@ -69,7 +69,12 @@ bool device_heap_facts(std::size_t* free_large, std::size_t* smallest_device_hea
     mp2.pNext = has_budget ? (void*)&budget : nullptr;
     vkGetPhysicalDeviceMemoryProperties2(devs[0], &mp2);
 
+    // "svobodno nol" and "ne smog uznat" ARE NOT THE SAME ANSWER, and this function used to
+    // return them both as false. The caller then read the refusal as "cannot check, accept
+    // what we have" - so the one case the check exists for, a heap filled to its budget,
+    // silently disabled the check. Rule 83, in the helper written to enforce it.
     std::size_t best = 0, smallest = 0;
+    bool found_large = false;
     for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; ++i) {
         const VkMemoryHeap& h = mp2.memoryProperties.memoryHeaps[i];
         if (!(h.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
@@ -77,11 +82,14 @@ bool device_heap_facts(std::size_t* free_large, std::size_t* smallest_device_hea
             ? std::size_t(budget.heapBudget[i] > budget.heapUsage[i]
                           ? budget.heapBudget[i] - budget.heapUsage[i] : 0)
             : std::size_t(h.size);
-        if (std::size_t(h.size) > kBarHeapCeiling && avail > best) best = avail;
+        if (std::size_t(h.size) > kBarHeapCeiling) {
+            found_large = true;
+            if (avail > best) best = avail;
+        }
         if (smallest == 0 || std::size_t(h.size) < smallest) smallest = std::size_t(h.size);
     }
     vkDestroyInstance(inst, nullptr);
-    if (best == 0) return false;
+    if (!found_large) return false;   // no large device-local heap at all: genuinely unknown
     *free_large = best;
     *smallest_device_heap = smallest;
     return true;

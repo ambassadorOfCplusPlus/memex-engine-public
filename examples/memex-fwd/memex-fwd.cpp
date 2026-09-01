@@ -6485,25 +6485,48 @@ int main(int argc, char** argv) {
         cp.cb_eval = probe_cb;
         cp.cb_eval_user_data = &probe;
     }
-    llama_context* lctx = llama_init_from_model(model, cp);
-    if (!lctx) {
-        printf("контекст не создался\n");
-        return 1;
-    }
-    const auto t_ref = Clock::now();
-    if (llama_decode(lctx, llama_batch_get_one(toks.data(), n, 0, 0))) {
-        printf("llama_decode не прошёл\n");
-        return 1;
-    }
-    const double ref_ms = ms_since(t_ref);
+    // NOT CREATED AT ALL UNDER --no-ref, and this is worth 1265 MiB of video memory.
+    //
+    // The reference context was built unconditionally, and on a model loaded with GPU offload
+    // its compute buffer lands on the card: `llama_init_from_model: Vulkan0 compute buffer
+    // size = 1265.51 MiB` - 42% of a 4 GB card, held by a decoder that --no-ref then never
+    // calls. It also pins 1024 MiB of host memory.
+    //
+    // That is where the missing 1.3 GB went. gemma4's static half plus its head add up to
+    // 1923 MiB and the heap budget is ~2996, so 1073 MiB should have been free for an expert
+    // cache; the engine reported 0.47 GiB and then zero. The conclusion drawn from that -
+    // "there is no room for experts on this card" - was measured against a card a third of
+    // which was occupied by our own measurement scaffolding.
+    //
+    // `want_ref` used to gate only the COMPARISON. Now it gates the allocation, which is the
+    // thing that costs.
+    llama_context* lctx = nullptr;
+    double ref_ms = 0.0;
     std::vector<float> ref;
     ref.assign(size_t(h.n_vocab), 0.0f);
-    const float* rl = llama_get_logits(lctx);
-    if (!rl) {
-        printf("эталонные логиты недоступны\n");
-        return 1;
+    if (want_ref) {
+        lctx = llama_init_from_model(model, cp);
+        if (!lctx) {
+            printf("контекст не создался\n");
+            return 1;
+        }
+        const auto t_ref = Clock::now();
+        if (llama_decode(lctx, llama_batch_get_one(toks.data(), n, 0, 0))) {
+            printf("llama_decode не прошёл\n");
+            return 1;
+        }
+        ref_ms = ms_since(t_ref);
+        const float* rl = llama_get_logits(lctx);
+        if (!rl) {
+            printf("эталонные логиты недоступны\n");
+            return 1;
+        }
+        std::memcpy(ref.data(), rl, sizeof(float) * size_t(h.n_vocab));
+    } else {
+        printf("--no-ref: etalonnyj kontekst NE sozdajotsja - eto osvobozhdaet ego "
+               "vychislitelnyj bufer na karte (byl 1265 MiB) i 1024 MiB zakrepljonnoj "
+               "hostovoj pamjati\n");
     }
-    std::memcpy(ref.data(), rl, sizeof(float) * size_t(h.n_vocab));
 
     // One of these three is filled; which one is the architecture. Declared together so the
     // graph dispatch below can be a straight three-way branch rather than a cast.
@@ -8123,26 +8146,31 @@ int main(int argc, char** argv) {
         const double gen_ms = ms_since(t_gen);
         if (dec_built) printf("граф декода собран один раз за %.1f мс\n", build_ms);
 
-        // The reference, greedily, from the same prompt.
-        llama_kv_cache_clear(lctx);
+        // The reference, greedily, from the same prompt. Under --no-ref there is no reference
+        // context, so ref_seq stays empty and every line below reports zero for it - our own
+        // numbers, including the STATIC_AB line every bench script parses, are unaffected.
         std::vector<llama_token> ref_seq;
-        if (llama_decode(lctx, llama_batch_get_one(toks.data(), n, 0, 0))) {
-            printf("эталон не декодировал промпт\n");
-            return 1;
+        double ref_gen_ms = 0.0;
+        if (lctx) {
+            llama_kv_cache_clear(lctx);
+            if (llama_decode(lctx, llama_batch_get_one(toks.data(), n, 0, 0))) {
+                printf("эталон не декодировал промпт\n");
+                return 1;
+            }
+            std::vector<float> rlg;
+            rlg.assign(size_t(h.n_vocab), 0.0f);
+            std::memcpy(rlg.data(), llama_get_logits(lctx), sizeof(float) * size_t(h.n_vocab));
+            llama_token rnext = argmax_of(rlg);
+            const auto t_ref_gen = Clock::now();
+            for (int i = 0; i < n_gen; ++i) {
+                ref_seq.push_back(rnext);
+                if (llama_decode(lctx, llama_batch_get_one(&rnext, 1, n + i, 0))) break;
+                std::memcpy(rlg.data(), llama_get_logits(lctx),
+                            sizeof(float) * size_t(h.n_vocab));
+                rnext = argmax_of(rlg);
+            }
+            ref_gen_ms = ms_since(t_ref_gen);
         }
-        std::vector<float> rlg;
-        rlg.assign(size_t(h.n_vocab), 0.0f);
-        std::memcpy(rlg.data(), llama_get_logits(lctx), sizeof(float) * size_t(h.n_vocab));
-        llama_token rnext = argmax_of(rlg);
-        const auto t_ref_gen = Clock::now();
-        for (int i = 0; i < n_gen; ++i) {
-            ref_seq.push_back(rnext);
-            if (llama_decode(lctx, llama_batch_get_one(&rnext, 1, n + i, 0))) break;
-            std::memcpy(rlg.data(), llama_get_logits(lctx),
-                        sizeof(float) * size_t(h.n_vocab));
-            rnext = argmax_of(rlg);
-        }
-        const double ref_gen_ms = ms_since(t_ref_gen);
 
         int same = 0;
         while (same < int(std::min(ours_seq.size(), ref_seq.size())) &&
@@ -8530,7 +8558,7 @@ int main(int argc, char** argv) {
 
     g.free_all();
     ggml_backend_free(be);
-    llama_free(lctx);
+    if (lctx) llama_free(lctx);   // null under --no-ref
     llama_free_model(model);
     llama_backend_free();
     return a_ref == a_our ? 0 : 2;
