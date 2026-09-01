@@ -749,9 +749,51 @@ bool GpuExperts::init(const GpuExpertsConfig& cfg, ggml_tensor* const* up,
     print_queues();
     // A retry rather than a refusal: heapBudget is the driver's opinion at one instant and
     // the desktop can take a few tens of megabytes between the query and the allocation.
+    // ADAPTIVE, and the previous version was not - it only stepped down when the allocation
+    // FAILED, and on this driver a too-large allocation does not fail. It succeeds, and the
+    // overflow is silently backed by system memory that keeps reporting itself device-local at
+    // about a fortieth of the bandwidth. So "vydelilos" and "pomestilos" are two different
+    // statements and the loop was reading the first as the second.
+    //
+    // What that cost: gemma4 auto-sized itself to 25 experts a layer - 2685 MiB of experts on
+    // top of 748 of head and 1175 of static, i.e. 4,6 GB asked of a 3,8 GB card - the
+    // allocation "succeeded", and the device half of the token came back at 282 ms instead of
+    // the ~26 it takes when the same weights actually fit. Four hypotheses about the kernels
+    // were measured and refuted before anyone compared the two numbers on the heap line.
+    //
+    // Now: allocate, then ASK THE DEVICE what it did, and step down until the heap has room
+    // left over. The step is proportional to the overshoot rather than one at a time, because
+    // one at a time from 25 to 10 is fifteen full allocations of a gigabyte each.
+    const std::size_t kRoomAfter = 128ull << 20;   // graph workspace still has to fit
     std::string aerr;
     while (cfg_.capacity > 0) {
-        if (alloc_weights(&aerr)) break;
+        if (alloc_weights(&aerr)) {
+            std::size_t free_after = 0, smallest_after = 0;
+            if (!device_heap_facts(&free_after, &smallest_after)) break;   // cannot check: accept
+            if (free_after >= kRoomAfter) break;                            // genuinely fits
+            free_weights();
+            // How many experts a layer the remaining room can actually hold, from what the
+            // device just told us rather than from what it told us before the allocation.
+            const std::size_t per_layer = std::size_t(cfg_.n_layers) * bpe_;
+            const std::size_t had = std::size_t(cfg_.capacity) * per_layer;
+            const std::size_t want_free = kRoomAfter - free_after;
+            int next = cfg_.capacity - int((want_free + per_layer - 1) / per_layer);
+            if (next >= cfg_.capacity) next = cfg_.capacity - 1;
+            if (next <= 0) {
+                *err = "posle golovy i statiki v videopamjati ne ostajotsja mesta ni pod odnogo "
+                       "rezidentnogo eksperta na sloj";
+                shutdown();
+                return false;
+            }
+            printf("rezidentnye eksperty: %d na sloj VLEZLI po vydeleniju, no kucha zapolnena "
+                   "(svobodno %.1f MiB iz nuzhnyh %.1f) - drajver podlozhil by sistemnuju "
+                   "pamjat; probuem %d\n",
+                   cfg_.capacity, double(free_after) / 1048576.0,
+                   double(kRoomAfter) / 1048576.0, next);
+            (void)had;
+            cfg_.capacity = next;
+            continue;
+        }
         free_weights();
         const int next = cfg_.capacity - 1;
         if (next <= 0) { *err = aerr; shutdown(); return false; }
