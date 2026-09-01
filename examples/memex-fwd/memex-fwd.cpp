@@ -2716,10 +2716,24 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
             // ggml_set_output on a view does not protect the parent's storage. A cont has
             // storage of its own, so set_output pins the bytes the probe will actually read.
             // Three extra nodes a layer, and only when probes are asked for.
+            //
+            // REASSIGNED, not wrapped. The first attempt pushed ggml_cont(...) as the probe and
+            // left attn_out/hd_in/moe_in pointing at the views. Nothing then consumed the conts,
+            // so they never entered gf, gallocr never gave them a buffer, and the first probe
+            // read hit GGML_ASSERT(buf != NULL) - the whole arm died with
+            // STATUS_STACK_BUFFER_OVERRUN before printing one card probe. A tensor that is not
+            // in the graph is not a probe, it is a crash.
+            //
+            // Assigning back puts the copy in the real dataflow - hd_in and moe_in are read by
+            // the two halves below, attn_out by the residual - so it is allocated and computed
+            // like any other node. Three extra copies a layer, only when probes are asked for.
             if (keep_probes) {
-                g->probes.push_back({"attn_out-" + sil, ggml_cont(c, attn_out)});
-                g->probes.push_back({"ffn_norm_1-" + sil, ggml_cont(c, hd_in)});
-                g->probes.push_back({"ffn_norm_2-" + sil, ggml_cont(c, moe_in)});
+                attn_out = ggml_cont(c, attn_out);
+                hd_in    = ggml_cont(c, hd_in);
+                moe_in   = ggml_cont(c, moe_in);
+                g->probes.push_back({"attn_out-" + sil, attn_out});
+                g->probes.push_back({"ffn_norm_1-" + sil, hd_in});
+                g->probes.push_back({"ffn_norm_2-" + sil, moe_in});
             }
         }
 #else
@@ -2846,13 +2860,18 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // ---- the dense half. gelu(gate) * up, which is what LLM_FFN_GELU + LLM_FFN_PAR
         // resolves to; ggml_fused_up_gate is the reference's own op for it.
         if (!card) hd_in = fnorm(c, attn_out, L.ffn_norm, eps);
-        if (keep_probes) g->probes.push_back({"ffn_norm_1-" + sil, hd_in});
+        // !card: on the card path this name was already pushed above, as a copy with storage
+        // of its own. Pushing here as well put the SAME NAME in twice - once safe, once as the
+        // raw view into the reused card_lay buffer - and the second one is the defect. It also
+        // defeated the detector written for it: gemma_card_probe.ps1 counts distinct values per
+        // family, and thirty good values from the copy hide thirty identical ones from the view.
+        if (keep_probes && !card) g->probes.push_back({"ffn_norm_1-" + sil, hd_in});
         ggml_tensor* dense = ggml_mul_mat(c, L.down,
             ggml_fused_up_gate(c, L.up, L.gate, hd_in, GGML_UNARY_OP_GELU));
 
         // ---- the routed half.
         if (!card) moe_in = fnorm(c, attn_out, L.pre_ffw_norm_2, eps);
-        if (keep_probes) g->probes.push_back({"ffn_norm_2-" + std::to_string(il), moe_in});
+        if (keep_probes && !card) g->probes.push_back({"ffn_norm_2-" + std::to_string(il), moe_in});
         // ffn_gate_inp.scale as it sits in the FILE is not the tensor the reference's graph
         // sees. llm_scale_gate_inp_s (llama.cpp:3805) walks every gemma4 layer at LOAD time
         // and multiplies that vector in place by 1/sqrt(n_embd) - 1/53.066 here. Reading the
@@ -7113,8 +7132,18 @@ int main(int argc, char** argv) {
         if (!zopt.on || zopt.check) {
             const auto t_b = Clock::now();
             const bool built_dec = arch_g4
+                // gsp, and it was MISSING. The qwen3moe branch below has always passed it;
+                // gemma4's last argument defaults to nullptr, so `card` in the layer loop was
+                // false on every layer of every decode. place_layers had already run, the byte
+                // verification had already passed, and the loader had already printed
+                // "vnimanie, marshrutizatory i KV-kesh na karte: 30 sloev ... v videopamjati" -
+                // so every gemma4 --gen number taken with --gpu-static-layers was a pure CPU
+                // number sitting under a line that says the layers are on the card. Found in
+                // review. The only path that ever passed gstat was Generator::build_one, and
+                // gen.gstat is set only under --decode-check, which is why the probe comparison
+                // exercised the card and the speed measurement did not.
                 ? build_gemma4_step(&dec, buft, h, w4, kv, 1, n, n_kv_max,
-                                    /*all_logits=*/false, /*keep_probes=*/false)
+                                    /*all_logits=*/false, /*keep_probes=*/false, gsp)
                 : build_step(&dec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
                              /*all_logits=*/false, /*zc=*/nullptr,
                              /*keep_dbg=*/zopt.check || rset != nullptr,
@@ -7125,6 +7154,17 @@ int main(int argc, char** argv) {
             }
             build_ms = ms_since(t_b);
             dec_built = true;
+            // Rule 68, inside the engine rather than the harness: the GRAPH says whether it
+            // actually put the layers on the card. Until now the only evidence was
+            // place_layers' banner - and that reports what was UPLOADED, not what the graph
+            // USES. For gemma4 the two disagreed for as long as the architecture existed, and
+            // nothing could say so: the card was filled, byte-verified, announced, and never
+            // called, because this build site did not pass gsp.
+            if (sopt.layers) {
+                printf("graf dekoda: sloi schitaet %s\n",
+                       dec.on_card ? "KARTA"
+                                   : "processor (karta zapolnena, no graf ejo ne zovjot)");
+            }
         }
 
         // The split decode graph. The exact one above stays built and is what the split is
