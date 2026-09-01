@@ -3006,7 +3006,10 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
     }
     cur = fnorm(c, cur, w.out_norm, eps);
     if (keep_probes) g->probes.push_back({"result_norm", cur});
-    g->logits = ggml_mul_mat(c, w.out, cur);
+    // head_matmul, not ggml_mul_mat: with --gpu-static the 748 MiB of token_embd sit in video
+    // memory and the logits are computed there. The softcap below is unaffected - it runs on
+    // the host, on the result, exactly as before.
+    g->logits = head_matmul(c, w.out, cur, gstat);
     // 30*tanh(x/30). Stated in the file and applied by the reference; without it the top of
     // the distribution is uncapped and every temperature and top-p threshold means something
     // slightly different from what it means in llama-cli.
@@ -4152,6 +4155,14 @@ struct GpuStaticOpt {
     // the routers another 48.0, against the head's 243.4 - but the head is one crossing per
     // token and this is one per LAYER, so it is a different bet and it gets its own flag.
     bool layers   = false;
+    // --gpu-static-nohead: keep the head on the host while the layers go to the card.
+    //
+    // It exists so the head can be an ARM rather than a rebuild. For gemma4 the head is
+    // token_embd.weight (tied), 262144 x 2816 in Q8_0 = 748 MiB, and reading it from host RAM
+    // costs 784 MB / 24.8 GB/s = 31.6 ms of a 112 ms token - 28%. From video memory at
+    // 131 GB/s the same bytes cost 6 ms. That is the largest single term left in gemma4's
+    // token, and it deserves a measurement in one binary rather than a claim.
+    bool nohead   = false;
 };
 
 // Off by default, and it stays off until it is MEASURED faster - not until it looks right.
@@ -5492,6 +5503,7 @@ int main(int argc, char** argv) {
 "                       s ODNIM peresecheniem granicy za tokjen, a ne odnim na sloj\n"
 "  --gpu-static-verify  posle zalivki sverit kazhdyj bajt golovy s modelju\n"
 "  --gpu-static-layers  krome golovy - vsjo vnimanie (510.4 MB), marshrutizatory (48.0)\n"
+"  --gpu-static-nohead  ostavit golovu na hoste, sloi na karte (plecho dlja zamera)\n"
 "                       i KV-kesh na kartu. Odin razrez na sloj: karta schitaet blok\n"
 "                       vnimanija, ostatok i normu FFN, host - ekspertov\n"
 "  --gpu-static-selftest    proverit ves mehanizm na sinteticheskoj golove, bez modeli\n"
@@ -5620,6 +5632,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--gpu-static")) { sopt.on = true; }
         else if (!strcmp(a, "--gpu-static-verify")) { sopt.on = true; sopt.verify = true; }
         else if (!strcmp(a, "--gpu-static-layers")) { sopt.on = true; sopt.layers = true; }
+        else if (!strcmp(a, "--gpu-static-nohead")) { sopt.nohead = true; }
         // Answered here, and it does nothing but exit zero. It is the queue's startability
         // probe (bench/build_safe.ps1, Test-Startable): a binary that fails to load its DLLs
         // dies before printing anything, with -1073741511 or -1073741515, and every log then
@@ -6373,10 +6386,9 @@ int main(int argc, char** argv) {
         // No SLOI - drugoe delo. Postroitel gemma4 ne zovjot head_matmul vovse, tak chto put
         // golovy u nejo prosto ne ispolzuetsja, a zapret na nego zapreshchal zaodno i sloi. Tot
         // zhe sluchaj, chto s --gen: zapret okazalsja shire svoej prichiny.
-        if (!arch_q3 && !(arch_g4 && sopt.layers)) {
-            printf("--gpu-static: poka tolko qwen3moe - drugie arhitektury stroit golovu "
-                   "svoim putjom (fnorm, softcap), i podmena tam ne proverena\n");
-            if (arch_g4) printf("  sloi u gemma4 mozhno: --gpu-static-layers\n");
+        if (!arch_q3 && !arch_g4) {
+            printf("--gpu-static: poka tolko qwen3moe i gemma4 - ostalnye arhitektury strojat "
+                   "golovu svoim putjom, i podmena tam ne proverena\n");
             return 1;
         }
         memex::GpuStaticConfig sc;
@@ -6400,7 +6412,13 @@ int main(int argc, char** argv) {
         // geometrii na tridcat sloev i odin razmer na vse vydelil by chetvert nuzhnogo kesha.
         if (arch_g4) {
             sc.gemma_block = true;
-            sc.head = false;   // ejo postroitel golovu na karte ne zovjot; 748 MiB ne tratim
+            // The head used to be hardcoded off here, with the note "its builder does not call
+            // the card head anyway". That was true and it was self-fulfilling: the builder did
+            // not call it because this line said not to upload it. gemma4's tail is
+            // fnorm -> mul_mat -> softcap and the substitution touches only the mul_mat, so
+            // there was never anything architecture-specific to verify - the refusal was wider
+            // than its reason, the third time that pattern has cost this project a whole lever.
+            sc.head = !sopt.nohead;
             sc.geom.resize(std::size_t(h.n_layer));
             for (int il = 0; il < h.n_layer; ++il) {
                 const LayerGeom& G = h.L(il);
