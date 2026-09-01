@@ -1223,8 +1223,22 @@ void GpuExperts::worker_loop() {
 
 void GpuExperts::flush_layer(int il) {
     // Everything this layer owes goes into one command buffer and costs one fence, instead of
-    // three per promotion. It has to land before compute(il) reads the slots, and batch_end
-    // waits on the fence, so the ordering the old per-write fences gave is preserved exactly.
+    // three per promotion. It has to land before compute(il) reads the slots.
+    //
+    // THIS PATH MUST NOT DEFER, and the reason is not the same as everywhere else. It runs only
+    // when `cfg_.deferred == false`, i.e. without deferred activation, and there the caller
+    // dispatches compute(il) IMMEDIATELY after this returns - reading the very slots just
+    // written. The upload rides the transfer queue and the dispatch rides the compute queue,
+    // and nothing links the two submissions: no semaphore, no barrier. The only thing that ever
+    // ordered them was the CPU-side wait inside batch_end.
+    //
+    // Deferring it would therefore not produce a late landing, it would produce a shader
+    // reading half-written expert weights - silently, with no crash and no error, which is the
+    // worst shape a fault can take here. Dormant today because production sets deferred = true
+    // (memex-fwd.cpp:6787) and the selftest never re-queues a dirty slot mid-loop, so batch_end
+    // has no work when it is reached; one flag flip makes it live. Found in review.
+    const bool was_async = promo_async_;
+    promo_async_ = false;
     batch_begin();
     for (;;) {
         int slot = -1, expert = -1;
@@ -1248,8 +1262,8 @@ void GpuExperts::flush_layer(int il) {
             }
         }
         // Outside the lock: batch_end takes mu_ for its own accounting.
-        if (done) { batch_end(); return; }
-        if (expert >= 0 && !upload(il, slot, expert)) return;
+        if (done) { batch_end(); promo_async_ = was_async; return; }
+        if (expert >= 0 && !upload(il, slot, expert)) { promo_async_ = was_async; return; }
     }
 }
 
@@ -1366,6 +1380,16 @@ bool GpuExperts::slot_dirty(int il, int slot) {
 // staging ring is not pinned, in which case uploads keep their own fences and stay correct.
 void GpuExperts::batch_begin() {
     if (!stage_pinned_ || batching_) return;
+    // Reap HERE, through our own counter, and not by letting ggml_backend_vk_batch_begin do it.
+    //
+    // It reaps too - it has to, there is one transfer fence - but reaching it that way pays the
+    // wait OUTSIDE ms_reap_block, and the first measurement showed exactly what that costs a
+    // reader: submit/zabor 0.000, reap 0.015, and an OSTATOK that jumped from 0.006 to 0.545 ms.
+    // Read literally, the wait had vanished; in fact 0.545 ms of it had moved into the one
+    // column that names nothing. That is rule 83's failure - a channel that cannot say where
+    // the time went will let any hypothesis look confirmed - and it is worse here than a plain
+    // missing number, because the missing number is the whole claim.
+    batch_reap(true);
     ggml_backend_vk_batch_begin(be_);
     batching_   = true;
     batch_used_ = 0;

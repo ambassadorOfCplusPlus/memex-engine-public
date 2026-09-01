@@ -10615,6 +10615,15 @@ GGML_CALL void ggml_backend_vk_batch_end(ggml_backend_t backend) {
     if (ctx->transfer_ctx.expired()) {
         return;
     }
+    // There is ONE transfer fence. Submitting on it while a deferred batch still holds it
+    // would leave two submits sharing one unreset fence, and the first waiter would be told
+    // the second one's work had landed.
+    //
+    // Cannot happen today: batch_begin reaps, and every async entry in the backend interface
+    // below is NULL, so nothing but this module ever opens transfer_ctx. It becomes reachable
+    // the moment somebody enables set_tensor_async - which is a one-line change made for an
+    // unrelated reason, by someone who will not be reading this file's fence discipline.
+    ggml_backend_vk_batch_reap(backend, true);
     vk_context transfer_ctx = ctx->transfer_ctx.lock();
     ggml_vk_ctx_end(transfer_ctx);
     // Only pinned sources are accepted above, so in_memcpys is empty; drained anyway so the
