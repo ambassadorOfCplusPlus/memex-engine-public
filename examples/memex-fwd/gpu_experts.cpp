@@ -144,6 +144,22 @@ void GpuExperts::print_heaps(const char* when) {
             printf("   бюджет %8.2f МиБ   занято %8.2f МиБ",
                    double(budget.heapBudget[i]) / 1048576.0,
                    double(budget.heapUsage[i]) / 1048576.0);
+            // SAY IT, do not merely show it. A heap filled to its budget is not "full up
+            // nicely": on this driver the allocations past the budget still SUCCEED and are
+            // silently backed by system memory, reported as device-local all the same. The
+            // cost is about a fortieth of the bandwidth.
+            //
+            // It cost a whole investigation to notice. gemma4 with head + static layers +
+            // experts asks for 3212 MiB against a 2996 MiB budget, the line read
+            // "zanjato 2995.96 iz 2995.96" - exact to the byte - and nothing flagged it, so
+            // the expert dispatch running at 5.7 GB/s effective looked like a kernel problem.
+            // Four hypotheses (type, shape, q5_1, the down orientation) were measured and
+            // refuted before the two numbers on this line were compared with each other.
+            if (dl && budget.heapUsage[i] + (16u << 20) >= budget.heapBudget[i]) {
+                printf("   <<< KUCHA ZAPOLNENA DO BJUDZHETA: vsjo, chto vyshe, drajver "
+                       "podkladyvaet SISTEMNOJ pamjatju (~1/40 polosy), prodolzhaja nazyvat "
+                       "ejo device-local");
+            }
         }
         printf("\n");
     }
@@ -562,6 +578,15 @@ bool GpuExperts::open_plain_source(std::string* err) {
 const char* GpuExperts::uploaded_type_name() const {
     if (up_.empty() || up_[0] == nullptr) return "(нет)";
     return ggml_type_name(up_[0]->type);
+}
+
+// The DOWN type, which is not the same question and on gemma4 is not the same answer: its
+// gate_up is q4_K and its down is q5_1, because 704 is 22 blocks of 32 and no whole number of
+// 256-element super-blocks. Reporting one of three as "the type" hid a third of the expert work
+// in a legacy format nobody had measured.
+const char* GpuExperts::down_type_name() const {
+    if (down_.empty() || down_[0] == nullptr) return "(нет)";
+    return ggml_type_name(down_[0]->type);
 }
 
 const char* GpuExperts::host_type_name() const {
@@ -1850,9 +1875,19 @@ void op_probe(int threads) {
     // gemma4's device half costing 281 ms against qwen3moe's 22.9 for 1.07x the work: the
     // TYPE (q4_K against IQ4_XS) and the SHAPE (n_embd 2816 against 2048). Measuring only at
     // 2048 would answer half the question and read as if it had answered all of it.
-    const OpProbeShape shapes[2] = {
-        {2048, 256, "forma qwen3moe (n_embd 2048)"},
-        {2816, 704, "forma gemma4   (n_embd 2816)"},
+    // FOUR shapes, and the last two are the ones that were missing.
+    //
+    // A mul_mat_id has two very different orientations in this graph and the probe only ever
+    // measured one of them. up and gate reduce over n_embd and produce n_ff; DOWN reduces over
+    // n_ff and produces n_embd - a SHORT reduction with many outputs, which is the shape that
+    // goes slow when a shape goes slow. That is a third of the expert work, and it had never
+    // been timed. All eight up/gate combinations came back at 94-122 GMAC/s while the engine
+    // shows 9.7, so whatever is lost is not in the orientation that was being measured.
+    const OpProbeShape shapes[4] = {
+        {2048, 256,  "up/gate qwen3moe (svjortka 2048)"},
+        {2816, 704,  "up/gate gemma4   (svjortka 2816)"},
+        { 768, 2048, "DOWN    qwen3moe (svjortka 768)"},
+        { 704, 2816, "DOWN    gemma4   (svjortka 704)"},
     };
     for (const OpProbeShape& sh : shapes) op_probe_one(threads, sh);
 }
@@ -1871,8 +1906,14 @@ void op_probe_one(int threads, const OpProbeShape& shape) {
     // sentence about SUPPORT that has been read as a sentence about the set of usable types.
     // q4_K computes correctly on this device; the open question is what it COSTS, and this
     // probe could not answer that because it never timed anything.
-    const ggml_type types[4] = {GGML_TYPE_F16, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS,
-                                GGML_TYPE_Q4_K};
+    // q5_1 is here because gemma4's ffn_down_exps IS q5_1, and nothing in this engine said so:
+    // the "tip v videopamjati" line reports up_[0]->type only, so a model whose three expert
+    // tensors have three different types was described by one of them. 704 = 22 x 32 divides a
+    // 32-block type and does NOT divide the 256-element super-block of any K-quant, so the down
+    // matrix could never have been q4_K - the arithmetic said so before the histogram did.
+    // q8_0 rides along because the head is q8_0 and the same question will be asked of it.
+    const ggml_type types[6] = {GGML_TYPE_F16, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS,
+                                GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0};
 
     ggml_backend_t cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(cpu, threads);
@@ -1884,6 +1925,15 @@ void op_probe_one(int threads, const OpProbeShape& shape) {
     printf("\n  --- proba po operacijam: odna mul_mat_id, odinakovye bajty, %s ---\n",
            shape.what);
     for (ggml_type qt : types) {
+        // A quantised tensor needs ne0 to be a whole number of blocks. Skipping is the honest
+        // answer for a combination that cannot exist, and saying so is the difference between
+        // "not applicable" and "not measured".
+        const int64_t blk = ggml_blck_size(qt);
+        if (blk > 1 && (n_embd % blk != 0)) {
+            printf("  %-8s propushchen: n_embd %d ne kraten bloku %d - takogo tenzora ne byvaet\n",
+                   ggml_type_name(qt), n_embd, int(blk));
+            continue;
+        }
         // Host copy, quantised once, then the same bytes pushed to the device.
         ggml_init_params ip = {ggml_tensor_overhead() * 16 + 4096, nullptr, true};
         ggml_context* ch = ggml_init(ip);

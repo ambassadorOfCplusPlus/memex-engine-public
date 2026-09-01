@@ -7121,6 +7121,7 @@ int main(int argc, char** argv) {
             ropt.capacity = gx->capacity();
             printf("  устройство: %s\n", gx->device_name().c_str());
             // The single fact that decides whether repacking and the card can coexist.
+            printf("  tip DOWN v videopamjati: %s\n", gx->down_type_name());
             printf("  тип в видеопамяти: %s   (в RAM для CPU-половины: %s)\n",
                    gx->uploaded_type_name(), gx->host_type_name());
             printf("  источник промоушенов: %s\n",

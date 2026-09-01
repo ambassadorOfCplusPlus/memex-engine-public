@@ -257,6 +257,8 @@ class GpuExperts {
     // engine refuses an unsupported type outright, so a successful run is the proof; this is
     // for the operator to see WHICH type made it.
     const char* uploaded_type_name() const;
+    // The down matrix's type, which on gemma4 differs from the gate/up one.
+    const char* down_type_name() const;
     bool        uploads_from_file() const { return plain_on_; }
     // The type the CPU half is computing with, for the contrast.
     const char* host_type_name() const;
