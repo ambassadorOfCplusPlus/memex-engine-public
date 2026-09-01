@@ -716,6 +716,59 @@ ggml_tensor* fnorm(ggml_context* c, ggml_tensor* x, ggml_tensor* w, float eps) {
 // same quantity, from the same input, that ggml_mul_mat would have. `cur` is the already
 // normalised hidden state in both, F32 and contiguous, and the returned tensor is
 // [n_vocab, n_rows] F32 either way - so every consumer of g->logits is unchanged.
+// First non-finite probe in a graph, by name - and TWO of them, because one of the two is
+// routinely a false alarm.
+//
+// `kq-<il>` is the raw Q.K product over the WHOLE cache extent, including positions the prefill
+// never wrote: that memory is not zeroed, so a NaN there is normal and the mask kills it in the
+// softmax that follows. Reporting it as "the first non-finite tensor" sends the reader into the
+// attention block when the fault is three hundred lines further down. So the scan reports the
+// first non-finite overall AND the first among the quantities that MUST be finite.
+//
+// Discovered the hard way: the locator's first use named kq-1 in a graph whose real defect was
+// elsewhere, and the probe counter added the same hour showed why nobody had noticed - kq is one
+// of twelve names the reference never emits, so it had never once been compared.
+static void report_first_nonfinite(const char* what,
+                                   const std::vector<std::pair<std::string, ggml_tensor*>>& probes) {
+    if (probes.empty()) return;
+    auto is_premask_score = [](const std::string& nm) {
+        return nm.rfind("kq-", 0) == 0 || nm.rfind("q-", 0) == 0;
+    };
+    std::vector<float> pv;
+    std::string first_any, first_must;
+    std::size_t idx_any = 0, idx_must = 0, n_any = 0, n_must = 0;
+    float val_any = 0.0f, val_must = 0.0f;
+    for (const auto& pr : probes) {
+        const std::size_t np = std::size_t(ggml_nelements(pr.second));
+        pv.resize(np);
+        ggml_backend_tensor_get(pr.second, pv.data(), 0, np * sizeof(float));
+        for (std::size_t q = 0; q < np; ++q) {
+            if (std::isfinite(pv[q])) continue;
+            if (first_any.empty()) {
+                first_any = pr.first; idx_any = q; n_any = np; val_any = pv[q];
+            }
+            if (first_must.empty() && !is_premask_score(pr.first)) {
+                first_must = pr.first; idx_must = q; n_must = np; val_must = pv[q];
+            }
+            break;
+        }
+        if (!first_must.empty()) break;
+    }
+    if (first_any.empty()) {
+        printf("  %s: vse %zu zondov finitny\n", what, probes.size());
+        return;
+    }
+    printf("  %s: pervyj nefinitnyj VOOBSHCHE - %s (element %zu iz %zu, %g)\n",
+           what, first_any.c_str(), idx_any, n_any, val_any);
+    if (first_must.empty()) {
+        printf("  %s: sredi velichin, OBJAZANNYH byt konechnymi, nefinitnyh net - NaN vyshe "
+               "sidit v syrom kq do maski i eto normalno\n", what);
+    } else {
+        printf("  %s: pervyj nefinitnyj sredi OBJAZATELNYH - %s (element %zu iz %zu, %g)\n",
+               what, first_must.c_str(), idx_must, n_must, val_must);
+    }
+}
+
 ggml_tensor* head_matmul(ggml_context* c, ggml_tensor* out_w, ggml_tensor* cur,
                          memex::GpuStatic* gstat) {
 #ifdef MEMEX_FWD_GPU_EXPERTS
@@ -1514,7 +1567,23 @@ struct Cache {
                                                L.n_head_kv);
         }
         buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
-        return buf != nullptr;
+        if (buf == nullptr) return false;
+        // ZERO IT. The allocator does not, and the decode reads the cache over a PADDED extent
+        // (pad32 of past+1), so it necessarily covers positions nothing has written yet. Those
+        // bytes are whatever the heap last held, and when that happens to be a NaN bit pattern
+        // the mask does NOT save the result: kq is NaN there, and NaN + (-INFINITY) is still
+        // NaN, which poisons the entire softmax row.
+        //
+        // Found through a NaN in gemma4's kq_soft_max_ext-0 that appeared in one graph and not
+        // in an identical other and moved between runs - the signature of uninitialised memory
+        // rather than of arithmetic. Not gemma-specific: every architecture reading a padded
+        // extent has always been exposed, and the only reason it looks new is that nothing had
+        // ever probed the attention scores - kq is one of twelve probe names the reference
+        // never emits, so it had never once been compared.
+        //
+        // One memset at startup. It cannot cost what a fault of this shape does.
+        ggml_backend_buffer_clear(buf, 0);
+        return true;
     }
 
     std::size_t bytes(const HParams& h) const {
@@ -1594,7 +1663,23 @@ struct DeltaState {
                                                     int64_t(state_dim), 1);
         }
         buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
-        return buf != nullptr;
+        if (buf == nullptr) return false;
+        // ZERO IT. The allocator does not, and the decode reads the cache over a PADDED extent
+        // (pad32 of past+1), so it necessarily covers positions nothing has written yet. Those
+        // bytes are whatever the heap last held, and when that happens to be a NaN bit pattern
+        // the mask does NOT save the result: kq is NaN there, and NaN + (-INFINITY) is still
+        // NaN, which poisons the entire softmax row.
+        //
+        // Found through a NaN in gemma4's kq_soft_max_ext-0 that appeared in one graph and not
+        // in an identical other and moved between runs - the signature of uninitialised memory
+        // rather than of arithmetic. Not gemma-specific: every architecture reading a padded
+        // extent has always been exposed, and the only reason it looks new is that nothing had
+        // ever probed the attention scores - kq is one of twelve probe names the reference
+        // never emits, so it had never once been compared.
+        //
+        // One memset at startup. It cannot cost what a fault of this shape does.
+        ggml_backend_buffer_clear(buf, 0);
+        return true;
     }
 
     // Back to no history at all. Called before every prefill, and before any run that is not
@@ -1747,6 +1832,21 @@ struct ZonedKV {
             printf("зонный кэш: буфер бэкенда не выделился\n");
             return false;
         }
+        // ZERO IT. The allocator does not, and the decode reads the cache over a PADDED extent
+        // (pad32 of past+1), so it necessarily covers positions nothing has written yet. Those
+        // bytes are whatever the heap last held, and when that happens to be a NaN bit pattern
+        // the mask does NOT save the result: kq is NaN there, and NaN + (-INFINITY) is still
+        // NaN, which poisons the entire softmax row.
+        //
+        // Found through a NaN in gemma4's kq_soft_max_ext-0 that appeared in one graph and not
+        // in an identical other and moved between runs - the signature of uninitialised memory
+        // rather than of arithmetic. Not gemma-specific: every architecture reading a padded
+        // extent has always been exposed, and the only reason it looks new is that nothing had
+        // ever probed the attention scores - kq is one of twelve probe names the reference
+        // never emits, so it had never once been compared.
+        //
+        // One memset at startup. It cannot cost what a fault of this shape does.
+        ggml_backend_buffer_clear(buf, 0);
         // Uploaded once here, in full: the mask starts as -inf everywhere and the tail is
         // empty, and an unuploaded mask would read as zeros - which is a mask that admits
         // every empty slot, the quietest possible way to be wrong.
@@ -7332,7 +7432,8 @@ int main(int argc, char** argv) {
                 // gen.gstat is set only under --decode-check, which is why the probe comparison
                 // exercised the card and the speed measurement did not.
                 ? build_gemma4_step(&dec, buft, h, w4, kv, 1, n, n_kv_max,
-                                    /*all_logits=*/false, /*keep_probes=*/false, gsp)
+                                    /*all_logits=*/false,
+                                    /*keep_probes=*/probe_name == "all", gsp)
                 : build_step(&dec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
                              /*all_logits=*/false, /*zc=*/nullptr,
                              /*keep_dbg=*/zopt.check || rset != nullptr,
@@ -7878,6 +7979,33 @@ int main(int argc, char** argv) {
                         if (!said) {
                             printf("  vse %zu zondov rasshcheplennogo grafa finitny\n",
                                    rdec.probes.size());
+                        }
+                    }
+                    // The same scan on the UNSPLIT graph. Without it "kq-1 is NaN in the
+                    // split" cannot be told from "kq-1 is NaN in this architecture on this
+                    // text" - and the probe counter has just shown that kq is one of the
+                    // twelve names the reference never emits, so nothing has ever compared it.
+                    if (i == 0 && !dec.probes.empty()) {
+                        std::vector<float> pv;
+                        bool said = false;
+                        for (const auto& pr : dec.probes) {
+                            const std::size_t np = std::size_t(ggml_nelements(pr.second));
+                            pv.resize(np);
+                            ggml_backend_tensor_get(pr.second, pv.data(), 0, np * sizeof(float));
+                            for (std::size_t q = 0; q < np; ++q) {
+                                if (!std::isfinite(pv[q])) {
+                                    printf("  PERVYJ NEFINITNYJ TENZOR v NERASSHCHEPLENNOM grafe: "
+                                           "%s (element %zu iz %zu, znachenie %g)\n",
+                                           pr.first.c_str(), q, np, pv[q]);
+                                    said = true;
+                                    break;
+                                }
+                            }
+                            if (said) break;
+                        }
+                        if (!said) {
+                            printf("  vse %zu zondov NERASSHCHEPLENNOGO grafa finitny\n",
+                                   dec.probes.size());
                         }
                     }
                     const LogitCmp c = compare_logits(lg, ulg);
