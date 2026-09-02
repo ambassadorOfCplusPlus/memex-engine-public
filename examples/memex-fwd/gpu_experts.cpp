@@ -402,6 +402,10 @@ void GpuExperts::free_weights() {
 bool GpuExperts::alloc_weights(std::string* err) {
     const int nl  = cfg_.n_layers;
     const int cap = cfg_.capacity;
+    // per_layer po MAKSIMALNOMU sloju: eto granica dlja gruppirovki i dlja potolka bufera
+    // bekenda, i tam nuzhna imenno verhnjaja ocenka. Nizhe, dlja proverki BAR-kuchi, beryotsja
+    // MINIMALNYJ sloj - potomu chto tam nuzhna nizhnjaja: gruppa iz samyh malenkih sloev i est
+    // ta, kotoraja mozhet sest v BAR-kuchu.
     const std::size_t per_layer = std::size_t(cap) * bpe_;
     const std::size_t max_buf   = ggml_backend_buft_get_max_size(buft_);
 
@@ -423,7 +427,8 @@ bool GpuExperts::alloc_weights(std::string* err) {
     const int base_layers = nl / n_groups;
     const int extra       = nl % n_groups;
 
-    const std::size_t smallest_group_bytes = std::size_t(base_layers) * per_layer;
+    const std::size_t smallest_group_bytes =
+        std::size_t(base_layers) * std::size_t(cap) * (bpe_min_ ? bpe_min_ : bpe_);
     if (smallest_group_bytes <= kBarHeapCeiling) {
         char buf[320];
         snprintf(buf, sizeof(buf),
@@ -709,7 +714,21 @@ bool GpuExperts::init(const GpuExpertsConfig& cfg, ggml_tensor* const* up,
             }
         }
     }
-    bpe_ = desc(0, 0).slab + desc(0, 1).slab + desc(0, 2).slab;
+    // PO SLOJAM, a ne po nulevomu. Sm. kommentarij u slot_bytes_ v zagolovke.
+    bpe_ = 0; bpe_min_ = 0; slot_bytes_ = 0;
+    for (int il = 0; il < cfg_.n_layers; ++il) {
+        const std::size_t b = desc(il, 0).slab + desc(il, 1).slab + desc(il, 2).slab;
+        if (b == 0) { *err = "nulevoj razmer eksperta na sloe"; shutdown(); return false; }
+        slot_bytes_ += b;
+        if (b > bpe_) bpe_ = b;
+        if (bpe_min_ == 0 || b < bpe_min_) bpe_min_ = b;
+    }
+    // Samoidentifikacija (pravilo 68): esli sloi raznogo razmera, eto nado videt v logu, inache
+    // ocenka emkosti vygljadit odinakovo pri vernoj i pri nevernoj arifmetike.
+    printf("rezidentnye eksperty: slot %.1f MiB na %d sloev (na sloj min %.3f, max %.3f MB%s)\n",
+           double(slot_bytes_) / 1048576.0, cfg_.n_layers,
+           double(bpe_min_) / 1e6, double(bpe_) / 1e6,
+           bpe_min_ == bpe_ ? ", sloi odnorodny" : ", sloi RAZNOGO razmera");
 
     be_ = ggml_backend_vk_init(0);
     if (!be_) { *err = "ggml_backend_vk_init(0) не удался"; return false; }
@@ -732,7 +751,7 @@ bool GpuExperts::init(const GpuExpertsConfig& cfg, ggml_tensor* const* up,
                "бюджет принят равным %.2f ГиБ\n", double(heap_free) / 1073741824.0);
     }
     const std::size_t budget = heap_free > cfg_.reserve ? heap_free - cfg_.reserve : 0;
-    const int fits = int(budget / (std::size_t(cfg_.n_layers) * bpe_));
+    const int fits = slot_bytes_ ? int(budget / slot_bytes_) : 0;
     if (cfg_.capacity <= 0) {
         cfg_.capacity = std::min(fits, cfg_.n_experts);
     } else if (cfg_.capacity > fits) {

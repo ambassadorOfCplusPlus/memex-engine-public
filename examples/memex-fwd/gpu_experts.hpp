@@ -401,7 +401,24 @@ class GpuExperts {
     std::vector<GpuExpertsBuffer>       bufs_info_;
     std::vector<ggml_tensor*>           up_, gate_, down_;
     std::vector<ggml_tensor*>           src_up_, src_gate_, src_down_;
-    std::size_t bpe_        = 0;   // bytes one expert occupies, all three matrices
+    std::size_t bpe_        = 0;   // MAKSIMUM bajt na eksperta po slojam (stejdzhing, gruppirovka)
+    // RAZMER SLOTA - summa po slojam, a ne bpe_ * n_layers.
+    //
+    // Ranshe emkost schitalas kak budget / (n_layers * bpe_), gde bpe_ beryotsja s NULEVOGO
+    // sloja. U kvantov so smeshannoj tochnostju eto neverno, i imenno tak i byvaet: u
+    // Qwen3-Coder-30B-A3B-UD-Q6_K_XL sloj 0 - q8_0 (5,014 MB na eksperta), a 124 tenzora iz 144 -
+    // q6_K (3,871). Ocenka davala 48 x 5,014 = 240,7 MB na slot protiv nastojashchih 193,4, to est
+    // +42%, i v svobodnye 1956 MiB dvizhok kladet SHEST slotov vmesto vosmi.
+    //
+    // Pochemu defekt ne zamechali: u mx1 vse sloi iq4_xs, tak chto ocenka po nulevomu verna, a u
+    // gemma4 povyshennaja tochnost u POSLEDNEGO sloja (29: q5_K + q8_0), i ocenka po nulevomu
+    // oshibaetsja na 1% v bezopasnuju storonu. Zametno tolko na smeshannyh kvantah.
+    //
+    // Tenzory i tak sozdajutsja s SVOIMI tipami po slojam (desc(il, k).type), poetomu v
+    // videopamjati kazhdyj sloj uzhe zanimaet svojo - ispravljat nado tolko OCENKU i razmer
+    // bufera, a ne razmeshchenie.
+    std::size_t slot_bytes_ = 0;   // summa bajt odnogo eksperta so VSEH sloev
+    std::size_t bpe_min_    = 0;   // minimum po slojam - dlja chestnoj proverki BAR-kuchi
     std::size_t vram_bytes_ = 0;
 
     // ---- the pre-repack source of truth for everything that reaches the device ----------
