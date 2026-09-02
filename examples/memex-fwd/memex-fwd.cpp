@@ -7790,8 +7790,27 @@ int main(int argc, char** argv) {
                                 const double d = double(u) - double(w1);
                                 rn += d * d; rd += double(w1) * double(w1);
                             }
-                            printf("    ETALON stroka %d protiv shaga %d: L2 %.4f%%%s\n", r, r,
+                            // TOKEN, a ne tolko L2 - i eto pravilnyj kriterij, kotorym dvizhok
+                            // prinimaet kartu voobshche (192/192 u Kvina). Karta rashoditsja s
+                            // processorom na 5,57% po L2 UZHE PRI SHIRINE 1: kesh f16 i slitye
+                            // normy dajut drugie poslednie bity, i eto normalno. Vopros ne "nol
+                            // li L2", a "tot li token i s kakim otryvom" - blizkaja nichja mozhet
+                            // upast v druguju storonu bez edinoj oshibki v arifmetike.
+                            int aw = 0, a1 = 0;
+                            for (int t = 1; t < h.n_vocab; ++t) {
+                                if (wide[off + size_t(t)] > wide[off + size_t(aw)]) aw = t;
+                                if (one[size_t(t)] > one[size_t(a1)]) a1 = t;
+                            }
+                            float b1v = -INFINITY, b2v = -INFINITY;
+                            for (int t = 0; t < h.n_vocab; ++t) {
+                                const float q = one[size_t(t)];
+                                if (q > b1v) { b2v = b1v; b1v = q; } else if (q > b2v) { b2v = q; }
+                            }
+                            printf("    ETALON stroka %d: L2 %.4f%%  token %s (%d protiv %d), "
+                                   "otryv etalona %.4f%s\n", r,
                                    rd > 0.0 ? 100.0 * std::sqrt(rn / rd) : -1.0,
+                                   aw == a1 ? "SOVPAL" : "RAZOSHELSJA", aw, a1,
+                                   double(b1v) - double(b2v),
                                    bad ? "  <<< est nekonechnye" : "");
                         }
                         g1.free_all();

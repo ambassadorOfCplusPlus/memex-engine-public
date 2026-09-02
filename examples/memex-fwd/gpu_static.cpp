@@ -927,6 +927,29 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
     return true;
 }
 
+// Norma sloja: fused libo para rms_norm+mul, po klyuchu MEMEX_FUSED_NORM.
+//
+// ZACHEM KLYUCH. ggml_fused_rms_norm - operacija samogo ik_llama, a ne mainline ggml, i ejo
+// realizacija na Vulkan mozhet byt verna tolko dlja odnogo tokena. Pri shirine sloja 2 i 4
+// kartochnyj put rashoditsja s etalonom (K odinochnyh shagov) na 6..24% NA VSEH strokah, vklyuchaja
+// nulevuju - a nulevaja stroka ne zavisit ni ot zapisi chuzhih pozicij v kesh, ni ot maski
+// sosednih tokenov. Znachit vinovato chto-to OBSHCHEE dlja shiriny, i fused norma - pervyj
+// kandidat: pri W == 1 tenzor [n_embd, 1], pri W > 1 - [n_embd, W], i shejder mozhet schitat
+// normu po vsemu tenzoru vmesto stolbca.
+//
+// Klyuch, a ne zamena: pri MEMEX_FUSED_NORM=1 (po umolchaniju) put ostajotsja tem, chto byl
+// verificirovan na shirine 1. Para daet drugie poslednie bity (fused schitaet (scale*w)*x, para
+// (scale*x)*w), poetomu vkljuchat ejo bez nuzhdy nelzja.
+static ggml_tensor* lnorm(ggml_context* c, ggml_tensor* t, ggml_tensor* w, float eps) {
+    static const int fused = getenv("MEMEX_FUSED_NORM")
+                                 ? atoi(getenv("MEMEX_FUSED_NORM")) : 1;
+    static bool said = false;
+    if (!said) { said = true;
+        fprintf(stderr, "FUSED_NORM %d\n", fused); fflush(stderr); }
+    if (fused) return ggml_fused_rms_norm(c, t, w, eps);
+    return ggml_mul(c, ggml_rms_norm(c, t, eps), w);
+}
+
 bool GpuStatic::build_layer_graphs(std::string* err) {
     const int nl = cfg_.n_layer;
     const int ne = cfg_.n_embd;
@@ -954,7 +977,13 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         if (!ctx_lin_) { *err = "ggml_init dlja vhodov sloja ne udalsja"; return false; }
         t_lx_   = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, ne, W);
         t_pos_  = ggml_new_tensor_1d(ctx_lin_, GGML_TYPE_I32, W);
-        t_mask_ = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, cfg_.n_kv_max, W);
+        // Strok u maski - vyravnennoe chislo, a ne rovno W. Trebovanie GGML_KQ_MASK_PAD
+        // otnositsja k flash-attention, a ne k soft_max_ext (tam tolko mask->ne[1] >= a->ne[1]),
+        // no shejder mozhet chitat masku blokami, i lishnie stroki nichego ne stojat: eto
+        // n_kv_max*15 float odin raz na vsju zhizn processa. Zapolnjajutsja oni minus
+        // beskonechnostju pri progreve, tak chto dazhe prochitannye ne dobavjat vesa.
+        t_mask_ = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, cfg_.n_kv_max,
+                                     W > 1 ? GGML_PAD(W, GGML_KQ_MASK_PAD) : 1);
         ggml_set_name(t_lx_, "vk.layer.x");
         ggml_set_name(t_pos_, "vk.layer.pos");
         ggml_set_name(t_mask_, "vk.layer.mask");
@@ -1020,7 +1049,7 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         // the two paths differ here and why this is a place to be explicit rather than clever.
         // Bit-identical, and four of the most byte-moving nodes in the layer.
         ggml_tensor* cur = t_lx_;
-        ggml_tensor* x = ggml_fused_rms_norm(c, cur, L.attn_norm, cfg_.rms_eps);
+        ggml_tensor* x = lnorm(c, cur, L.attn_norm, cfg_.rms_eps);
 
         ggml_tensor* q = ggml_mul_mat(c, L.wq, x);
         ggml_tensor* k = ggml_mul_mat(c, L.wk, x);
@@ -1042,7 +1071,7 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         }
 
         q = ggml_reshape_3d(c, q, hd, nh, W);
-        q = ggml_fused_rms_norm(c, q, L.q_norm, cfg_.rms_eps);
+        q = lnorm(c, q, L.q_norm, cfg_.rms_eps);
         // MEMEX_NO_ROPE=1 drops both rope nodes from this graph. The OUTPUT IS THEN WRONG and
         // that is the point: device time does not depend on the values, so an arm whose
         // arithmetic is deliberately broken still measures the cost of the nodes that were
@@ -1071,7 +1100,7 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
                                   cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         }
         k = ggml_reshape_3d(c, k, hd, nkvh, W);
-        k = ggml_fused_rms_norm(c, k, L.k_norm, cfg_.rms_eps);
+        k = lnorm(c, k, L.k_norm, cfg_.rms_eps);
         if (!no_rope) {
             k = cfg_.gemma_block
                 ? ggml_rope_ext(c, k, t_pos_, L.rope_freqs, gm.n_rot, gm.rope_type,
@@ -1133,14 +1162,14 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         ggml_tensor* rl      = nullptr;   // logity marshrutizatora, syrye
         if (cfg_.gemma_block) {
             ggml_tensor* kqv_out = ggml_mul_mat(c, L.wo, kqv);
-            ggml_tensor* attn    = ggml_fused_rms_norm(c, kqv_out, L.post_attn_norm, cfg_.rms_eps);
+            ggml_tensor* attn    = lnorm(c, kqv_out, L.post_attn_norm, cfg_.rms_eps);
             ffn_inp = ggml_add(c, attn, cur);
-            xf      = ggml_fused_rms_norm(c, ffn_inp, L.ffn_norm, cfg_.rms_eps);
-            xm      = ggml_fused_rms_norm(c, ffn_inp, L.pre_ffw_norm_2, cfg_.rms_eps);
+            xf      = lnorm(c, ffn_inp, L.ffn_norm, cfg_.rms_eps);
+            xm      = lnorm(c, ffn_inp, L.pre_ffw_norm_2, cfg_.rms_eps);
             // Marshrutizator ot vyhoda vnimanija, cherez svoj ves. Masshtab 1/sqrt(n_embd) uzhe
             // vnutri etogo tenzora - etalon perestavljaet ego data na masshtabirovannuju kopiju
             // pri zagruzke, i primenit ego vtoroj raz znachit podelit logity na 53 eshchjo raz.
-            ggml_tensor* tmp = ggml_fused_rms_norm(c, ffn_inp, L.gate_inp_s, cfg_.rms_eps);
+            ggml_tensor* tmp = lnorm(c, ffn_inp, L.gate_inp_s, cfg_.rms_eps);
             rl = ggml_mul_mat(c, L.router, tmp);
             // THE DENSE HALF, on the card, in the slot xf used to occupy.
             //
@@ -1165,7 +1194,7 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
             }
         } else {
             ffn_inp = ggml_add(c, ggml_mul_mat(c, L.wo, kqv), cur);
-            xf      = ggml_fused_rms_norm(c, ffn_inp, L.ffn_norm, cfg_.rms_eps);
+            xf      = lnorm(c, ffn_inp, L.ffn_norm, cfg_.rms_eps);
             rl      = ggml_mul_mat(c, L.router, xf);
         }
 
