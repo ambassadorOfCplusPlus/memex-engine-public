@@ -1350,10 +1350,27 @@ struct Graph {
 void set_graph_inputs(Graph& gr, const HParams& h, const llama_token* tk, int nt, int past,
                       std::vector<int32_t>* ps, std::vector<float>* mk) {
     const int nkv = int(gr.mask->ne[0]);
-    ps->assign(std::size_t(nt), 0);
-    for (int i = 0; i < nt; ++i) (*ps)[std::size_t(i)] = past + i;
+    // SKOLKO SEKCIJ POZICIJ - govorit sam tenzor, a ne otdelnyj flag. Modeli s mnogomernym rope
+    // (MROPE/IMROPE, i qwen35moe iz nih) chitajut CHETYRE pozicii na token: rope indeksiruet
+    // pos[i], pos[i+n], pos[i+2n], pos[i+3n], i dlja teksta eto t, t, t, 0. ggml proverjaet eto
+    // utverzhdeniem `a->ne[2] * 4 == b->ne[0]`, i imenno na njom padal zapusk Qwen3.6-35B.
+    //
+    // Otnoshenie razmerov vmesto flaga - potomu chto flag mozhno zabyt prokinut v odnom iz pjati
+    // stroitelej grafov, a razmer tenzora vsegda tot, s kotorym graf realno postroen.
+    const int pt = nt > 0 ? int(gr.positions->ne[0] / nt) : 1;
+    ps->assign(std::size_t(nt) * std::size_t(pt > 0 ? pt : 1), 0);
+    for (int i = 0; i < nt; ++i) {
+        const int32_t pv = int32_t(past + i);
+        (*ps)[std::size_t(i)] = pv;
+        if (pt == 4) {
+            (*ps)[std::size_t(nt + i)]     = pv;
+            (*ps)[std::size_t(2 * nt + i)] = pv;
+            (*ps)[std::size_t(3 * nt + i)] = 0;   // chetvjortaja sekcija u teksta pustaja
+        }
+    }
     ggml_backend_tensor_set(gr.tokens, tk, 0, sizeof(int32_t) * std::size_t(nt));
-    ggml_backend_tensor_set(gr.positions, ps->data(), 0, sizeof(int32_t) * std::size_t(nt));
+    ggml_backend_tensor_set(gr.positions, ps->data(), 0,
+                            sizeof(int32_t) * ps->size());
 
     mk->assign(std::size_t(nkv) * std::size_t(nt), -INFINITY);
     for (int i = 0; i < nt; ++i) {
@@ -3445,7 +3462,13 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
     ggml_context* c = g->ctx;
 
     g->tokens = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tokens);
-    g->positions = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tokens);
+    // CHETYRE pozicii na token pri mnogomernom rope. qwen35moe zajavljaet sekcii {11,11,10,0},
+    // to est MROPE, i ggml_rope_multi trebuet `a->ne[2] * 4 == b->ne[0]`. S odnoj poziciej na
+    // token zapusk padal na etom utverzhdenii do pervogo tokena. Raskladka - ta zhe, chto u
+    // etalona (src/llama.cpp): pos[i], pos[n+i], pos[2n+i], pos[3n+i] = t, t, t, 0.
+    const int pos_per_token =
+        (h.rope_type & GGML_ROPE_TYPE_MROPE) || (h.rope_type & GGML_ROPE_TYPE_IMROPE) ? 4 : 1;
+    g->positions = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_tokens * pos_per_token);
     g->mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, n_kv, n_tokens);
     // ggml_ssm_conv takes the state slot per token as an input tensor, so it has to live in
     // the writable input buffer even though every entry of it is zero for us.
@@ -7761,13 +7784,19 @@ int main(int argc, char** argv) {
                 // 13,89 tok/s. I eto ROVNO uslovie, na kotorom stoit spekuljativnoe
                 // dekodirovanie: esli prohod na K tokenov ne vosproizvodit K shagov, lomaetsja
                 // ne kartochnyj put, a zateja.
-                if (K > 1 && alllog && getenv("MEMEX_SPEC_SEQ")) {
+                if (K >= 1 && (alllog || K == 1) && getenv("MEMEX_SPEC_SEQ")) {
+                    // ETALON - PROCESSORNYJ VSEGDA (gstat = nullptr). Ranshe zdes stojal gsp, i
+                    // pri shirine 1 eto bylo "karta protiv samoj sebja": sravnenie, kotoroe
+                    // vsegda dajot nol i ne proverjaet nichego. Imenno poetomu soglasie karty s
+                    // processorom po tokenam u gemma4 nikto ni razu ne izmeril - a ono, kak
+                    // vyjasnilos, rashoditsja posle trjoh tokenov.
                     Graph g1;
                     const bool b1 = arch_g4
                         ? build_gemma4_step(&g1, buft, h, w4, kv, 1, n, n_kv_max, false,
-                                            false, gsp, nullptr, nullptr)
+                                            false, nullptr, nullptr, nullptr)
                         : build_step(&g1, buft, h, w, kv, 1, n, n_kv_max, min_experts,
-                                     expert_thresh, false, nullptr, false, nullptr, nullptr, gsp);
+                                     expert_thresh, false, nullptr, false, nullptr, nullptr,
+                                     nullptr);
                     if (!b1) {
                         printf("    odinochnyj graf ne sobralsja - NE SVERENO\n");
                     } else {
