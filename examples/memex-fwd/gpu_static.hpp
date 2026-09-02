@@ -415,6 +415,21 @@ class GpuStatic {
         ggml_tensor*   vdst = nullptr;
         ggml_tensor*   kcpy = nullptr;   // and the copy node that carries the same offset
         ggml_tensor*   vcpy = nullptr;
+        // SUZHENIE CHTENIJA U OKONNYH SLOEV.
+        //
+        // Dvadcat pjat sloev iz tridcati u gemma4 okonnye: pozicija i smotrit tolko na
+        // [i - n_swa + 1, i], vsego 1024 pozicii. A graf chital VES zanjatyj kesh i vybrasyval
+        // lishnee maskoj - v kommentarii k vyboru maski tak i napisano, chto suzhenie chtenija
+        // eto "real'naja ekonomija i otdelnaja pravka". Vot ona.
+        //
+        // Skolko stoit: lishnie bajty = (n_kv - n_swa) * 8192 na sloj (K i V, f16, 8 golov po
+        // 256). Pri kontekste 1900 eto 7,2 MB na sloj i 1,4 ms na token; pri 8192 - 58,6 MB i
+        // 11,6 ms, to est shestnadcat procentov. Sejchas malo, na dlinnom promte krupno.
+        //
+        // n_swa == 0 znachit "sloj vidit ves kesh", i togda vsjo ostajotsja kak bylo.
+        int            n_swa = 0;    // okno etogo sloja v pozicijah, 0 - bez okna
+        int            kv_lo = 0;    // pervaja chitaemaja pozicija (kratna 32)
+        int            kv_len = 0;   // skolko pozicij chitaetsja
         ggml_tensor*   K = nullptr;      // the read views, aimed at n_kv
         ggml_tensor*   V = nullptr;
         ggml_tensor*   kq = nullptr;
@@ -488,7 +503,15 @@ class GpuStatic {
     ggml_backend_buffer_t buf_lin_ = nullptr;
     ggml_tensor*          t_lx_   = nullptr;   // [n_embd, 1] F32
     ggml_tensor*          t_pos_  = nullptr;   // [1] I32
-    ggml_tensor*          t_mask_ = nullptr;   // [n_kv_max, 1] F32
+    ggml_tensor*          t_mask_ = nullptr;   // [n_kv_max, W] F32 - dlja POLNYH sloev
+    // Otdelnaja maska dlja okonnyh sloev. Dva tenzora, a ne odin, potomu chto dlina stroki u
+    // nih RAZNAJA: polnyj sloj chitaet n_kv pozicij, okonnyj - tolko okno. Shejder softmax
+    // shagaet imenno po ne[0] svoej maski, tak chto odnim tenzorom oboih ne obsluzhit.
+    ggml_tensor*          t_mask_sw_ = nullptr;
+    const void*           step_mask_sw_src_ = nullptr;  // chej srez uzhe lezhit v t_mask_sw_
+    // Suzhat li chtenie u okonnyh sloev. Reshaetsja pri POSTROENII grafa (ot etogo zavisit
+    // ekstent vidov), poetomu klyuch chitaetsja odin raz i zapominaetsja.
+    bool                  swa_narrow_ = false;
 
     // A node's userdata has to carry both the object and the layer, and ggml_map_custom takes
     // one void*. One of these per layer, addresses stable for the object's lifetime.

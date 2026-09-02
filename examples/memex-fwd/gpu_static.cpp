@@ -958,6 +958,12 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
     // perestanovka s ekstentom 1 est te zhe bajty po tem zhe smeshchenijam.
     const int W = cfg_.layer_width > 0 ? cfg_.layer_width : 1;
     if (W < 1 || W > 16) { *err = "shirina sloja vne 1..16"; return false; }
+    // Suzhenie chtenija u okonnyh sloev. Klyuch, a ne bezuslovno: ekstent vidov K i V
+    // zavisit ot etogo resheniya, poetomu ono prinimaetsja odin raz na postroenii, i
+    // staryj put ostajotsja dostupnym dlja A/B.
+    swa_narrow_ = getenv("MEMEX_SWA_NARROW")
+                      ? atoi(getenv("MEMEX_SWA_NARROW")) != 0 : false;
+    fprintf(stderr, "SWA_NARROW %d\n", swa_narrow_ ? 1 : 0); fflush(stderr);
     // Samoidentifikacija (pravilo 68): graf objazan skazat, na kakuju shirinu on sobran. Bez
     // etoj stroki simptom "karta schitaet odin token tam, gde graf podajot chetyre" vygljadel
     // kak oshibka arifmetiki - a chislo uzlov 38 pri shirine 4 i pri shirine 1 sovpadalo.
@@ -971,6 +977,19 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
     // The per-step inputs. Small, so they land in the BAR window, which is exactly where a
     // host-written input wants to be: ggml_vk_buffer_write takes the plain memcpy branch when
     // the buffer is HOST_VISIBLE and pays a staging hop when it is not.
+    // Potolok srezа okonnyh sloev. Nuzhen ZDES, do sozdanija maski okna: ggml_soft_max_ext
+    // trebuet mask->ne[0] == a->ne[0] TOCHNO, i proverjaet eto pri postroenii uzla. Maska na
+    // n_kv_max protiv vhoda na 1120 valila process na etom utverzhdenii.
+    int swa_cap = 0;
+    if (swa_narrow_) {
+        for (int il = 0; il < nl; ++il) {
+            const int nsw = cfg_.at(il).n_swa;
+            if (nsw <= 0) continue;
+            const int cap = std::min(cfg_.n_kv_max, GGML_PAD(nsw + W + 64, 32));
+            if (cap > swa_cap) swa_cap = cap;
+        }
+    }
+    if (swa_cap == 0) swa_cap = cfg_.n_kv_max;
     {
         ggml_init_params ip = {ggml_tensor_overhead() * 8 + 4096, nullptr, true};
         ctx_lin_ = ggml_init(ip);
@@ -982,8 +1001,10 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         // no shejder mozhet chitat masku blokami, i lishnie stroki nichego ne stojat: eto
         // n_kv_max*15 float odin raz na vsju zhizn processa. Zapolnjajutsja oni minus
         // beskonechnostju pri progreve, tak chto dazhe prochitannye ne dobavjat vesa.
-        t_mask_ = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, cfg_.n_kv_max,
-                                     W > 1 ? GGML_PAD(W, GGML_KQ_MASK_PAD) : 1);
+        const int64_t mrows = W > 1 ? GGML_PAD(W, GGML_KQ_MASK_PAD) : 1;
+        t_mask_ = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, cfg_.n_kv_max, mrows);
+        t_mask_sw_ = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, swa_cap, mrows);
+        ggml_set_name(t_mask_sw_, "vk.layer.mask.swa");
         ggml_set_name(t_lx_, "vk.layer.x");
         ggml_set_name(t_pos_, "vk.layer.pos");
         ggml_set_name(t_mask_, "vk.layer.mask");
@@ -1134,14 +1155,39 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         ggml_tensor* kcpy = ggml_cpy(c, Kc, kdst);
         ggml_tensor* vcpy = ggml_cpy(c, Vc, vdst);
 
+        // Skolko pozicij etot sloj voobshche mozhet potrebovat. U okonnogo sloja eto okno plus
+        // W novyh pozicij, okruglennoe vverh do 32 (dlina svjortki f16-matmula dolzhna byt
+        // kratna chetyrjom, a shag kesha my derzhim kratnym 32). U polnogo - ves kesh.
+        const int kv_cap = (swa_narrow_ && gm.n_swa > 0) ? swa_cap : cfg_.n_kv_max;
+        G.n_swa = (swa_narrow_ && gm.n_swa > 0) ? gm.n_swa : 0;
+
         ggml_tensor* Q = (W == 1) ? ggml_reshape_3d(c, q, hd, 1, nh)
                                   : ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3)); // [hd, W, nh]
-        ggml_tensor* K = ggml_view_3d(c, kcache, hd, cfg_.n_kv_max, nkvh,
+        ggml_tensor* K = ggml_view_3d(c, kcache, hd, kv_cap, nkvh,
                                       kcache->nb[1], kcache->nb[2], 0);
-        ggml_tensor* V = ggml_view_3d(c, vcache, cfg_.n_kv_max, hd, nkvh,
+        ggml_tensor* V = ggml_view_3d(c, vcache, kv_cap, hd, nkvh,
                                       vcache->nb[1], vcache->nb[2], 0);
         ggml_tensor* kq = ggml_mul_mat(c, K, Q);
-        ggml_tensor* p = ggml_soft_max_ext(c, kq, t_mask_, kq_scale, 0.0f);
+        // MEMEX_NO_SOFTMAX=1 UBIRAET odin dispatch iz sloja, ostavljaja formu toj zhe.
+        //
+        // ZACHEM. Vsja moja ocenka "karta platit ~30 mks za dispatch" byla poluchena OSTATKOM:
+        // iz 0,934 ms ustrojstva na peresechenie vychel bajty bolshih umnozhenij i zapusk po
+        // 7,2 mks, a ostatok podelil na chislo melkih operacij. Ostatok - ne izmerenie. Zdes
+        // odin dispatch ubiraetsja nasovsem, i esli cena dispatcha okolo 30 mks, token
+        // dolzhen upast na 30 sloev x 30 mks = 0,9 ms. Esli ne upadjot - ocenka neverna, i
+        // vsja arifmetika slijanij operacij vmeste s nej.
+        //
+        // Vyhod pri etom NEVEREN, i eto razreshaet pravilo 73: vremja ustrojstva ne zavisit ot
+        // znachenij. Forma sohranena tochno - kq i probs odinakovy po forme, - poetomu nizhe
+        // nichego ne menjaetsja i graf ostajotsja polnym grafom, a ne usechjonnym.
+        static const int no_sm = getenv("MEMEX_NO_SOFTMAX")
+                                     ? atoi(getenv("MEMEX_NO_SOFTMAX")) : 0;
+        static bool sm_said = false;
+        if (!sm_said) { sm_said = true;
+            fprintf(stderr, "NO_SOFTMAX %d\n", no_sm); fflush(stderr); }
+        // Maska - svoja u okonnogo sloja: u nejo drugaja dlina stroki.
+        ggml_tensor* mtens = G.n_swa > 0 ? t_mask_sw_ : t_mask_;
+        ggml_tensor* p = no_sm ? kq : ggml_soft_max_ext(c, kq, mtens, kq_scale, 0.0f);
         ggml_tensor* kqv = ggml_mul_mat(c, V, p);
         // TOCHNOST JADRA VNIMANIJA PRI SHIRINE > 1, i eto ne dogadka, a chtenie dispetchera.
         //
@@ -1400,11 +1446,38 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
         t->nb[3] = t->nb[2] * std::size_t(t->ne[2]);
     };
     if (int(t_mask_->ne[0]) != n_kv) restride(t_mask_, n_kv);
+    // SREZ OKONNYH SLOEV. Pozicija i smotrit na [i - n_swa + 1, i]; graf schitaet pozicii
+    // n_past..n_past+W-1, znachit nuzhen diapazon [n_past - n_swa + 1, n_past + W - 1].
+    // Nizhnjaja granica okrugljaetsja VNIZ do 32: dlina svjortki f16-matmula dolzhna byt
+    // kratna chetyrjom, a shag v 32 my derzhim vezde. Lishnie do 31 pozicij snizu zakryty
+    // maskoj - oni stojat bajtov, no ne stojat korrektnosti.
+    //
+    // Vse okonnye sloi u gemma4 imejut ODNO okno (1024), poetomu srez u nih obshchij, i odnoj
+    // maski t_mask_sw_ hvataet na vseh. Esli kogda-nibud okna stanut raznymi, eto perestanet
+    // byt verno - poetomu nizhe stoit proverka, a ne predpolozhenie.
+    int sw_lo = -1, sw_len = 0;
     for (LayerGraph& G : lg_) {
-        G.K->ne[1] = n_kv;    // strides belong to the cache, so only the extent moves
-        G.V->ne[0] = n_kv;
-        restride(G.kq, n_kv);
-        restride(G.probs, n_kv);
+        int lo = 0, len = n_kv;
+        if (G.n_swa > 0) {
+            lo = n_past - G.n_swa + 1;
+            if (lo < 0) lo = 0;
+            lo = (lo / 32) * 32;
+            len = n_kv - lo;
+            if (sw_lo < 0) { sw_lo = lo; sw_len = len; }
+            else if (sw_lo != lo || sw_len != len) return false;   // raznye okna - ne podderzhano
+        }
+        G.kv_lo = lo; G.kv_len = len;
+        G.K->ne[1] = len;    // strides belong to the cache, so only the extent moves
+        G.V->ne[0] = len;
+        restride(G.kq, len);
+        restride(G.probs, len);
+    }
+    if (sw_lo > 0 && t_mask_sw_) {
+        if (int(t_mask_sw_->ne[0]) != sw_len) restride(t_mask_sw_, sw_len);
+        step_mask_sw_src_ = nullptr;   // srez smenilsja - maska okna ustarela
+    } else if (t_mask_sw_ && int(t_mask_sw_->ne[0]) != n_kv) {
+        restride(t_mask_sw_, n_kv);
+        step_mask_sw_src_ = nullptr;
     }
     if (step_past_ != n_past) {
         for (std::size_t il = 0; il < lg_.size(); ++il) {
@@ -1421,6 +1494,15 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
             G.vdst->data = (char*)vc->data + vo;
             G.vcpy->view_offs = vo;
             G.vcpy->data = G.vdst->data;
+            // I VIDY CHTENIJA tozhe: u okonnogo sloja oni nachinajutsja ne s nulja.
+            if (G.n_swa > 0) {
+                const std::size_t kro = std::size_t(G.kv_lo) * kc->nb[1];
+                const std::size_t vro = std::size_t(G.kv_lo) * ggml_element_size(vc);
+                G.K->view_offs = kro;
+                G.K->data = (char*)kc->data + kro;
+                G.V->view_offs = vro;
+                G.V->data = (char*)vc->data + vro;
+            }
         }
         int32_t pos[16];
         for (int j = 0; j < W; ++j) pos[j] = int32_t(n_past + j);
@@ -1519,7 +1601,28 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
         // nih raznye maski. Sravnenie ukazatelja dajot to zhe samoe dlja qwen3moe (odna otpravka na
         // shag) i pravilnoe dlja gemma4 (dve). Dispatchi idut posledovatelno, po odnomu na sloj,
         // tak chto otpravit nuzhnuju masku pered dispatchem sloja - dostatochno.
-        if (step_mask_src_ != (mask ? mask->data : nullptr)) {
+        // OKONNYJ SLOJ: svoj tenzor maski i svoj srez. Sravnenie po ukazatelju zdes tozhe
+        // rabotaet - mezhdu smenami sreza (a on menjaetsja raz na shag) zagruzka odna.
+        LayerGraph& Gm = lg_[std::size_t(il)];
+        if (Gm.n_swa > 0 && t_mask_sw_) {
+            if (step_mask_sw_src_ != (mask ? mask->data : nullptr)) {
+                if (!mask || mask->type != GGML_TYPE_F32 ||
+                    mask->ne[0] < int64_t(Gm.kv_lo + Gm.kv_len) || mask->ne[1] < W) {
+                    fail_msg_ = "maska okna uzhe, chem srez sloja";
+                    std::memset(dst->data, 0, ggml_nbytes(dst));
+                    return;
+                }
+                for (int r = 0; r < W; ++r) {
+                    ggml_backend_tensor_set(
+                        t_mask_sw_,
+                        (const char*)mask->data + std::size_t(r) * mask->nb[1]
+                            + std::size_t(Gm.kv_lo) * sizeof(float),
+                        std::size_t(r) * std::size_t(Gm.kv_len) * sizeof(float),
+                        std::size_t(Gm.kv_len) * sizeof(float));
+                }
+                step_mask_sw_src_ = mask->data;
+            }
+        } else if (step_mask_src_ != (mask ? mask->data : nullptr)) {
             if (!mask || mask->type != GGML_TYPE_F32 || mask->ne[0] < step_nkv_ ||
                 mask->ne[1] < W) {
                 fail_msg_ = "maska vnimanija uzhe, chem naceleno pozicij ili strok";
