@@ -961,8 +961,14 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
     // Suzhenie chtenija u okonnyh sloev. Klyuch, a ne bezuslovno: ekstent vidov K i V
     // zavisit ot etogo resheniya, poetomu ono prinimaetsja odin raz na postroenii, i
     // staryj put ostajotsja dostupnym dlja A/B.
+    // PO UMOLCHANIJU VKLJUCHENO. Izmereno: pri kontekste 1900 +3,6%, a pri 5500 - v 6,7 raza
+    // (peresechenie 35,423 -> 4,653 ms, 0,581 -> 3,911 tok/s), potomu chto na dlinnom kontekste
+    // kesh karty perestajot vlezat v videopamjat i drajver podkladyvaet sistemnuju; suzhennoe
+    // chtenie pochti ne popadaet v podlozhennuju chast. Korrektnost sverena s CHISTO
+    // processornym etalonom: token sovpadaet, L2 dazhe nizhe (7,05 protiv 7,28).
+    // MEMEX_SWA_NARROW=0 vozvrashchaet staroe povedenie dlja A/B.
     swa_narrow_ = getenv("MEMEX_SWA_NARROW")
-                      ? atoi(getenv("MEMEX_SWA_NARROW")) != 0 : false;
+                      ? atoi(getenv("MEMEX_SWA_NARROW")) != 0 : true;
     fprintf(stderr, "SWA_NARROW %d\n", swa_narrow_ ? 1 : 0); fflush(stderr);
     // Samoidentifikacija (pravilo 68): graf objazan skazat, na kakuju shirinu on sobran. Bez
     // etoj stroki simptom "karta schitaet odin token tam, gde graf podajot chetyre" vygljadel
