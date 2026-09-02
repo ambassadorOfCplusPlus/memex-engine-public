@@ -684,6 +684,40 @@ bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::str
         return false;
     }
     cfg_.n_kv_max = n_kv_max;
+    // KOLCO reshaetsja ZDES: ot nego zavisjat i podschjot bajtov, i vydelenie, i reshenie o
+    // golove. Klyuch, potomu chto put trebuet svoej sverki, a odnotokennyj bez kolca uzhe
+    // proveren.
+    //
+    // Razmer kolca: okno plus shirina grafa plus 64 pozicii zapasa. Zapas nuzhen potomu, chto
+    // nizhnjaja granica sreza okrugljaetsja vniz do 32, a n_kv - vverh do 32, i bez zapasa
+    // ekstent vida ne pokryl by nuzhnyj diapazon.
+    {
+        const int Wl = cfg_.layer_width > 0 ? cfg_.layer_width : 1;
+        swa_ring_ = getenv("MEMEX_SWA_RING")
+                        ? atoi(getenv("MEMEX_SWA_RING")) != 0 : false;
+        ring_ = 0;
+        if (swa_ring_) {
+            int mx = 0;
+            for (int il = 0; il < cfg_.n_layer; ++il) {
+                const int nsw = cfg_.at(il).n_swa;
+                if (nsw > mx) mx = nsw;
+            }
+            if (mx > 0) {
+                ring_ = std::min(cfg_.n_kv_max, GGML_PAD(mx + Wl + 64, 32));
+                // Kolco imeet smysl tolko esli ono MEN'SHE kesha: inache eto tot zhe kesh s
+                // lishnim ostatkom po modulju.
+                if (ring_ >= cfg_.n_kv_max) { ring_ = 0; swa_ring_ = false; }
+            } else {
+                swa_ring_ = false;
+            }
+        }
+        fprintf(stderr, "SWA_RING %d razmer %d\n", swa_ring_ ? 1 : 0, ring_);
+        fflush(stderr);
+        if (swa_ring_) {
+            printf("kolcevoj kesh okonnyh sloev: %d pozicij vmesto %d (okno %d)\n",
+                   ring_, cfg_.n_kv_max, ring_ - (cfg_.layer_width > 0 ? cfg_.layer_width : 1) - 64);
+        }
+    }
     // rb_ is the pinned readback staging, allocated for a block of logits. The layer output is
     // far smaller, but "far smaller" is an argument and this is a bounds check.
     if (!rb_ || std::size_t(cfg_.n_vocab) * std::size_t(cfg_.max_rows) <
@@ -814,9 +848,10 @@ bool GpuStatic::layer_bytes(const GpuStaticLayer* src, std::vector<std::size_t>*
     // na vse sloi dal by libo chetvert nuzhnogo, libo vchetvero bolshe.
     for (int il = 0; il < nl; ++il) {
         const GpuStaticGeom gk = cfg_.at(il);
+        const int rr = ring_of(il);
         const std::size_t kv_one = padded(std::size_t(ggml_type_size(GGML_TYPE_F16)) *
                                           std::size_t(gk.head_dim) *
-                                          std::size_t(cfg_.n_kv_max) *
+                                          std::size_t(rr > 0 ? rr : cfg_.n_kv_max) *
                                           std::size_t(gk.n_head_kv));
         ggml_tensor* s[16];
         layer_slots(src[std::size_t(il)], s);
@@ -950,9 +985,11 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
             // odin razmer na vse sloi vydelil by libo chetvert nuzhnogo, libo vchetvero bolshe -
             // i pervoe ne dalo by nikakoj oshibki formy, prosto nevernyj otvet.
             const GpuStaticGeom gk = cfg_.at(il);
+            const int rr = ring_of(il);
+            const int64_t kvlen = rr > 0 ? rr : cfg_.n_kv_max;
             kv_k_[std::size_t(il)] = ggml_new_tensor_3d(cx, GGML_TYPE_F16, gk.head_dim,
-                                                        cfg_.n_kv_max, gk.n_head_kv);
-            kv_v_[std::size_t(il)] = ggml_new_tensor_3d(cx, GGML_TYPE_F16, cfg_.n_kv_max,
+                                                        kvlen, gk.n_head_kv);
+            kv_v_[std::size_t(il)] = ggml_new_tensor_3d(cx, GGML_TYPE_F16, kvlen,
                                                         gk.head_dim, gk.n_head_kv);
         }
         if (pad > 0) {
@@ -1076,7 +1113,9 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
     // trebuet mask->ne[0] == a->ne[0] TOCHNO, i proverjaet eto pri postroenii uzla. Maska na
     // n_kv_max protiv vhoda na 1120 valila process na etom utverzhdenii.
     int swa_cap = 0;
-    if (swa_narrow_) {
+    if (swa_ring_ && ring_ > 0) {
+        swa_cap = ring_;          // pri kolce vidy chitajut VSJO kolco
+    } else if (swa_narrow_) {
         for (int il = 0; il < nl; ++il) {
             const int nsw = cfg_.at(il).n_swa;
             if (nsw <= 0) continue;
@@ -1253,8 +1292,10 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         // Skolko pozicij etot sloj voobshche mozhet potrebovat. U okonnogo sloja eto okno plus
         // W novyh pozicij, okruglennoe vverh do 32 (dlina svjortki f16-matmula dolzhna byt
         // kratna chetyrjom, a shag kesha my derzhim kratnym 32). U polnogo - ves kesh.
-        const int kv_cap = (swa_narrow_ && gm.n_swa > 0) ? swa_cap : cfg_.n_kv_max;
-        G.n_swa = (swa_narrow_ && gm.n_swa > 0) ? gm.n_swa : 0;
+        const bool win = gm.n_swa > 0 && (swa_ring_ || swa_narrow_);
+        const int kv_cap = win ? swa_cap : cfg_.n_kv_max;
+        G.n_swa = win ? gm.n_swa : 0;
+        G.ring  = (swa_ring_ && gm.n_swa > 0) ? ring_ : 0;
 
         ggml_tensor* Q = (W == 1) ? ggml_reshape_3d(c, q, hd, 1, nh)
                                   : ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3)); // [hd, W, nh]
@@ -1550,10 +1591,19 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
     // Vse okonnye sloi u gemma4 imejut ODNO okno (1024), poetomu srez u nih obshchij, i odnoj
     // maski t_mask_sw_ hvataet na vseh. Esli kogda-nibud okna stanut raznymi, eto perestanet
     // byt verno - poetomu nizhe stoit proverka, a ne predpolozhenie.
-    int sw_lo = -1, sw_len = 0;
+    int sw_lo = -1, sw_len = 0, sw_win = 0;
     for (LayerGraph& G : lg_) {
         int lo = 0, len = n_kv;
-        if (G.n_swa > 0) {
+        if (G.ring > 0) {
+            // KOLCO: chitaem vsjo kolco s nulja. Do zapolnenija lishnie sloty zakryty maskoj,
+            // kotoruju my zhe i stroim nizhe - hostovaja maska ob raskladke kolca ne znaet.
+            lo = 0;
+            len = std::min(G.ring, n_kv > 0 ? GGML_PAD(n_past + W, 32) : G.ring);
+            if (len > G.ring) len = G.ring;
+            if (len < 32) len = std::min(32, G.ring);
+            if (sw_lo < 0) { sw_lo = 0; sw_len = len; sw_win = G.n_swa; }
+            else if (sw_len != len) return false;
+        } else if (G.n_swa > 0) {
             lo = n_past - G.n_swa + 1;
             if (lo < 0) lo = 0;
             lo = (lo / 32) * 32;
@@ -1567,20 +1617,49 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
         restride(G.kq, len);
         restride(G.probs, len);
     }
-    if (sw_lo > 0 && t_mask_sw_) {
+    if (t_mask_sw_ && sw_len > 0) {
         if (int(t_mask_sw_->ne[0]) != sw_len) restride(t_mask_sw_, sw_len);
         step_mask_sw_src_ = nullptr;   // srez smenilsja - maska okna ustarela
     } else if (t_mask_sw_ && int(t_mask_sw_->ne[0]) != n_kv) {
         restride(t_mask_sw_, n_kv);
         step_mask_sw_src_ = nullptr;
     }
+
+    // MASKU KOLCA STROIT KARTA. Hostovaja maska indeksirovana POZICIJAMI, a v kolce dannye
+    // lezhat po slotam p % ring - host ob etoj raskladke ne znaet i znat ne dolzhen.
+    //
+    // Kakaja pozicija lezhit v slote s: samaja svezhaja p <= B s p = s (mod ring), gde B -
+    // novejshaja zapisannaja pozicija (n_past + W - 1, potomu chto zapisi grafa idut PERED
+    // chteniem). Slot goden dlja stroki r (pozicija n_past + r), esli ego pozicija ne iz
+    // budushchego i ne vypala iz okna. Otricatelnaja pozicija znachit, chto slot eshchjo ni razu
+    // ne zapisan - takoe byvaet, poka kolco ne zapolnilos.
+    if (swa_ring_ && ring_ > 0 && t_mask_sw_ && sw_len > 0 && sw_win > 0) {
+        const int B = n_past + W - 1;
+        std::vector<float> m(std::size_t(sw_len) * std::size_t(W), -INFINITY);
+        for (int r = 0; r < W; ++r) {
+            const int pos = n_past + r;
+            for (int s = 0; s < sw_len; ++s) {
+                int d = (B - s) % ring_;
+                if (d < 0) d += ring_;
+                const int ps = B - d;
+                if (ps < 0 || ps > pos || ps < pos - sw_win + 1) continue;
+                m[std::size_t(r) * std::size_t(sw_len) + std::size_t(s)] = 0.0f;
+            }
+        }
+        ggml_backend_tensor_set(t_mask_sw_, m.data(), 0, m.size() * sizeof(float));
+        // Pometka "uzhe zagruzhena etim shagom": do_layer ne dolzhen ejo perezapisyvat
+        // hostovym srezom.
+        step_mask_sw_src_ = (const void*)t_mask_sw_;
+    }
     if (step_past_ != n_past) {
         for (std::size_t il = 0; il < lg_.size(); ++il) {
             LayerGraph& G = lg_[il];
             ggml_tensor* kc = kv_k_[il];
             ggml_tensor* vc = kv_v_[il];
-            const std::size_t ko = std::size_t(n_past) * kc->nb[1];
-            const std::size_t vo = std::size_t(n_past) * ggml_element_size(vc);
+            // Slot zapisi: pri kolce eto pozicija po modulju, inache sama pozicija.
+            const int wslot = G.ring > 0 ? (n_past % G.ring) : n_past;
+            const std::size_t ko = std::size_t(wslot) * kc->nb[1];
+            const std::size_t vo = std::size_t(wslot) * ggml_element_size(vc);
             G.kdst->view_offs = ko;
             G.kdst->data = (char*)kc->data + ko;
             G.kcpy->view_offs = ko;
@@ -1598,6 +1677,10 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
                 G.V->view_offs = vro;
                 G.V->data = (char*)vc->data + vro;
             }
+            // Pri kolce zapis mozhet perejti granicu, esli graf shirinoj bolshe odnogo tokena
+            // popadjot na konec kolca. Odna kopija etogo ne vyrazhaet, poetomu otkaz - a ne
+            // tihaja zapis mimo.
+            if (G.ring > 0 && W > 1 && (n_past % G.ring) + W > G.ring) return false;
         }
         int32_t pos[16];
         for (int j = 0; j < W; ++j) pos[j] = int32_t(n_past + j);
@@ -1616,7 +1699,7 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
 }
 
 bool GpuStatic::upload_kv(ggml_tensor* const* k, ggml_tensor* const* v, int n_layer,
-                          std::string* err) {
+                          int n_valid, std::string* err) {
     if (!cfg_.layers || lg_.empty()) { *err = "sloi ne na karte"; return false; }
     if (n_layer != cfg_.n_layer) { *err = "chislo sloev ne sovpadaet"; return false; }
     auto t0 = std::chrono::steady_clock::now();
@@ -1626,6 +1709,64 @@ bool GpuStatic::upload_kv(ggml_tensor* const* k, ggml_tensor* const* v, int n_la
         ggml_tensor* dk = kv_k_[std::size_t(il)];
         ggml_tensor* dv = kv_v_[std::size_t(il)];
         if (!sk || !sv || !dk || !dv) { *err = "kesh sloja otsutstvuet"; return false; }
+
+        // KOLCEVOJ SLOJ: perekladka pozicij v sloty. Hostovyj kesh indeksirovan pozicijami,
+        // kolco - slotami p % ring, i tolko POSLEDNIE ring pozicij voobshche nuzhny okonnomu
+        // sloju. Sobiraem ves tenzor sloja v hostovom bufere obychnym memcpy i otdajom odnim
+        // vyzovom: pooperacionnaja zagruzka dala by desjatki tysjach vyzovov na sloj.
+        //
+        // Nepreryvnyj diapazon pozicij perehodit v nepreryvnyj diapazon slotov s odnim
+        // perehodom cherez granicu kolca - to est ne bolee dvuh memcpy na kazhduju stroku.
+        const int rr = ring_of(il);
+        if (rr > 0) {
+            const GpuStaticGeom gk = cfg_.at(il);
+            const int hd = gk.head_dim, nh = gk.n_head_kv;
+            const int L  = std::min(n_valid, rr);
+            if (L <= 0) continue;                    // pustoj promt - nechego perekladyvat
+            const int p0 = n_valid - L;
+            const int s0 = p0 % rr;
+            const int c1 = std::min(L, rr - s0);     // do granicy kolca
+            const int c2 = L - c1;                   // posle perehoda
+            // K: [hd, ring, nh]; nepreryvnyj blok na poziciju
+            {
+                std::vector<char> stg(std::size_t(ggml_nbytes(dk)), 0);
+                for (int h = 0; h < nh; ++h) {
+                    const char* sp = (const char*)sk->data + std::size_t(h) * sk->nb[2];
+                    char* dp = stg.data() + std::size_t(h) * dk->nb[2];
+                    std::memcpy(dp + std::size_t(s0) * dk->nb[1],
+                                sp + std::size_t(p0) * sk->nb[1],
+                                std::size_t(c1) * sk->nb[1]);
+                    if (c2 > 0) {
+                        std::memcpy(dp, sp + std::size_t(p0 + c1) * sk->nb[1],
+                                    std::size_t(c2) * sk->nb[1]);
+                    }
+                }
+                ggml_backend_tensor_set(dk, stg.data(), 0, stg.size());
+            }
+            // V: [ring, hd, nh]; pozicija - element, poetomu po dve kopii na kazhduju paru
+            // (golova, izmerenie)
+            {
+                const std::size_t es = ggml_type_size(GGML_TYPE_F16);
+                std::vector<char> stg(std::size_t(ggml_nbytes(dv)), 0);
+                for (int h = 0; h < nh; ++h) {
+                    for (int d = 0; d < hd; ++d) {
+                        const char* sp = (const char*)sv->data + std::size_t(h) * sv->nb[2]
+                                       + std::size_t(d) * sv->nb[1];
+                        char* dp = stg.data() + std::size_t(h) * dv->nb[2]
+                                 + std::size_t(d) * dv->nb[1];
+                        std::memcpy(dp + std::size_t(s0) * es, sp + std::size_t(p0) * es,
+                                    std::size_t(c1) * es);
+                        if (c2 > 0) {
+                            std::memcpy(dp, sp + std::size_t(p0 + c1) * es,
+                                        std::size_t(c2) * es);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(dv, stg.data(), 0, stg.size());
+            }
+            continue;
+        }
+
         if (ggml_nbytes(sk) != ggml_nbytes(dk) || ggml_nbytes(sv) != ggml_nbytes(dv) ||
             sk->type != dk->type || sv->type != dv->type) {
             char m[240];
@@ -1699,7 +1840,10 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
         // OKONNYJ SLOJ: svoj tenzor maski i svoj srez. Sravnenie po ukazatelju zdes tozhe
         // rabotaet - mezhdu smenami sreza (a on menjaetsja raz na shag) zagruzka odna.
         LayerGraph& Gm = lg_[std::size_t(il)];
-        if (Gm.n_swa > 0 && t_mask_sw_) {
+        if (Gm.ring > 0) {
+            // Maska kolca uzhe postroena i zagruzhena v set_step - hostovyj srez zdes ne
+            // nuzhen i byl by NEVEREN: on indeksirovan pozicijami, a ne slotami.
+        } else if (Gm.n_swa > 0 && t_mask_sw_) {
             if (step_mask_sw_src_ != (mask ? mask->data : nullptr)) {
                 if (!mask || mask->type != GGML_TYPE_F32 ||
                     mask->ne[0] < int64_t(Gm.kv_lo + Gm.kv_len) || mask->ne[1] < W) {

@@ -3786,7 +3786,7 @@ struct Generator {
         // it is copied rather than assumed, once per prompt, and the failure is fatal.
         if (gstat && gstat->layers_on()) {
             std::string uerr;
-            if (!gstat->upload_kv(kv.k.data(), kv.v.data(), h->n_layer, &uerr)) {
+            if (!gstat->upload_kv(kv.k.data(), kv.v.data(), h->n_layer, past, &uerr)) {
                 printf("кэш промпта не уехал на карту: %s\n", uerr.c_str());
                 return false;
             }
@@ -7433,7 +7433,7 @@ int main(int argc, char** argv) {
         if (gsp && gsp->layers_on()) {
             std::string uerr;
             const auto t_kv = Clock::now();
-            if (!gsp->upload_kv(kv.k.data(), kv.v.data(), h.n_layer, &uerr)) {
+            if (!gsp->upload_kv(kv.k.data(), kv.v.data(), h.n_layer, n, &uerr)) {
                 printf("кэш промпта не уехал на карту: %s\n", uerr.c_str());
                 return 1;
             }

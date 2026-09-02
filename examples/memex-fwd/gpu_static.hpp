@@ -360,7 +360,10 @@ class GpuStatic {
     // It is the one piece of state that has to cross in that direction, and getting it wrong
     // is invisible: an empty device cache still produces fluent text, because attention over
     // zeros is attention over something. So the shapes are compared rather than assumed.
-    bool upload_kv(ggml_tensor* const* k, ggml_tensor* const* v, int n_layer,
+    // n_valid - skolko pozicij hostovogo kesha zapolneno. Nuzhno dlja kolcevyh sloev: v
+    // kolco perekladyvajutsja tolko POSLEDNIE ring pozicij, i chtoby uznat, kakie imenno,
+    // nado znat, gde promt konchaetsja. Bez kolca parametr ne ispolzuetsja.
+    bool upload_kv(ggml_tensor* const* k, ggml_tensor* const* v, int n_layer, int n_valid,
                    std::string* err);
 
     int  n_kv_max() const { return cfg_.n_kv_max; }
@@ -436,6 +439,7 @@ class GpuStatic {
         //
         // n_swa == 0 znachit "sloj vidit ves kesh", i togda vsjo ostajotsja kak bylo.
         int            n_swa = 0;    // okno etogo sloja v pozicijah, 0 - bez okna
+        int            ring  = 0;    // razmer kolca, 0 - kesh na vsju dlinu
         int            kv_lo = 0;    // pervaja chitaemaja pozicija (kratna 32)
         int            kv_len = 0;   // skolko pozicij chitaetsja
         ggml_tensor*   K = nullptr;      // the read views, aimed at n_kv
@@ -520,6 +524,21 @@ class GpuStatic {
     // Suzhat li chtenie u okonnyh sloev. Reshaetsja pri POSTROENII grafa (ot etogo zavisit
     // ekstent vidov), poetomu klyuch chitaetsja odin raz i zapominaetsja.
     bool                  swa_narrow_ = false;
+    // KOLCEVOJ KESH OKONNYH SLOEV. Suzhenie CHTENIJA (swa_narrow_) ekonomit polosu, a kolco
+    // ekonomit MESTO: okonnomu sloju nikogda ne nuzhno bolshe okna pozicij, znachit i hranit
+    // bolshe ne nado. Pri kontekste 5504 kesh karty padaet s 1,15 GB do 0,30, pri 16384 -
+    // s 3,44 GB do 0,51, to est dlinnyj kontekst voobshche stanovitsja vozmozhen.
+    //
+    // Slot pozicii p est p % ring. Porjadok slotov ne vazhen: vnimanie eto summa po
+    // pozicijam, a rope uzhe primenjon pri ZAPISI, tak chto pozicija zashita v samih
+    // znachenijah. Vazhno tolko znat, kakaja pozicija lezhit v kakom slote - dlja maski.
+    bool                  swa_ring_ = false;
+    int                   ring_ = 0;    // razmer kolca v pozicijah, 0 - kolca net
+    // Razmer kolca dlja sloja: 0 znachit "sloj hranit ves kesh".
+    int ring_of(int il) const {
+        if (!swa_ring_ || ring_ <= 0) return 0;
+        return cfg_.at(il).n_swa > 0 ? ring_ : 0;
+    }
 
     // A node's userdata has to carry both the object and the layer, and ggml_map_custom takes
     // one void*. One of these per layer, addresses stable for the object's lifetime.
