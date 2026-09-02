@@ -691,6 +691,51 @@ bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::str
         *err = "bufer zabora menshe vyhoda sloja";
         return false;
     }
+    // NE DAT DRAJVERU PODLOZHIT SISTEMNUJU PAMJAT. Izmereno na kontekste 5500: kesh s golovoj
+    // trebuet 3647,6 MiB iz 3824 svobodnyh, drajver nachinaet podkladyvat sistemnuju pamjat, i
+    // peresechenie stoit 35,423 ms vmesto 1,115 - to est 0,581 tok/s vmesto 7,280.
+    // Dvenadcatikratnaja poterja, i pri etom KAZHDYJ otchjot po-prezhnemu nazyvaet pamjat
+    // device-local. Poetomu reshenie prinimaetsja ZDES, po chislam, a ne otdajotsja drajveru.
+    //
+    // Golova otdajotsja pervoj: ona samaja krupnaja snimaemaja veshch (748 MiB u gemma4) i ejo
+    // cena izvestna - 25,5% skorosti na korotkom kontekste, chto neizmerimo men'she
+    // dvenadcatikratnoj poteri na dlinnom.
+    //
+    // Zapas 224 MiB: grafam sloev nuzhno rabochee mesto, i ego ggml vydeljaet posle etoj
+    // proverki. Bez zapasa my by vlezli rovno i upali by v podkachku na pervom zhe grafе.
+    if (cfg_.head) {
+        std::vector<std::size_t> per;
+        std::size_t need = 0;
+        std::string e2;
+        if (layer_bytes(layers, &per, &need, &e2)) {
+            std::size_t vk_free = 0, vk_total = 0;
+            ggml_backend_vk_get_device_memory(0, &vk_free, &vk_total);
+            const std::size_t margin = 224ull << 20;
+            // PECHATAETSJA VSEGDA, a ne tolko pri srabatyvanii. Pervaja popytka etoj proverki
+            // molcha ne srabotala, i po logu nelzja bylo skazat, chto imenno ona uvidela -
+            // nol, ves objom ili chestnyj ostatok. Kanal objazan govorit, chto on izmeril.
+            // SCHITAEM PO SVOEMU UCHJOTU, a ne po "svobodno" ot drajvera: on vozvrashchaet
+            // free == total == 3824 MiB, to est ves objom ustrojstva, a ne ostatok.
+            // Pervaja versija etoj proverki sravnivala s konstantoj i ne mogla srabotat
+            // nikogda; vidno eto stalo tolko potomu, chto pechat postavlena BEZUSLOVNO.
+            const std::size_t placed = vram_bytes_;
+            const std::size_t budget = vk_total ? vk_total : (3824ull << 20);
+            printf("sloi na kartu: razmeshcheno %.1f MiB, nuzhno eshchjo %.1f, bjudzhet "
+                   "%.1f, zapas %.0f\n",
+                   double(placed) / 1048576.0, double(need) / 1048576.0,
+                   double(budget) / 1048576.0, double(margin) / 1048576.0);
+            if (placed + need + margin > budget) {
+                printf("sloi na kartu: %.1f + %.1f + zapas %.0f prevyshaet bjudzhet %.1f "
+                       "MiB - GOLOVA SNIMAETSJA S KARTY\n",
+                       double(placed) / 1048576.0, double(need) / 1048576.0,
+                       double(margin) / 1048576.0, double(budget) / 1048576.0);
+                printf("  prichina: pri perepolnenii drajver podkladyvaet sistemnuju pamjat, i "
+                       "ona v sorok raz medlennee, prodolzhaja nazyvatsja device-local. Izmereno "
+                       "na kontekste 5500: 0,581 tok/s s golovoj protiv 7,280 bez nejo.\n");
+                free_head_only();
+            }
+        }
+    }
     if (!alloc_layers(layers, err)) return false;
     if (!build_layer_graphs(err)) return false;
     // The same for every layer graph, and for the same three reasons: the pipelines for the
@@ -730,27 +775,49 @@ bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::str
     return true;
 }
 
-bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
-    const int nl = cfg_.n_layer;
-    // hd i nkv_heads zdes tolko dlja proverok i pechati; sam kesh vydeljaetsja po
-    // POSLOJNOJ geometrii nizhe - u gemma4 golovy 16/2 po 512 i 16/8 po 256 v odnoj modeli,
-    // i odin razmer na vse sloi vydelil by chetvert nuzhnogo libо vchetvero bolshe.
-    const int hd = cfg_.head_dim;
-    const int nkv_heads = cfg_.n_head_kv;
-    const std::size_t align = ggml_backend_buft_get_alignment(buft_);
-    const std::size_t max_buf = ggml_backend_buft_get_max_size(buft_);
-    auto padded = [&](std::size_t n) { return (n + align - 1) / align * align; };
+void GpuStatic::free_head_only() {
+    for (ggml_gallocr_t g : ga_) {
+        if (g) ggml_gallocr_free(g);
+    }
+    ga_.clear();
+    gf_.clear();
+    n_out_.clear();
+    if (ctx_g_) { ggml_free(ctx_g_); ctx_g_ = nullptr; }
+    if (buf_in_) { ggml_backend_buffer_free(buf_in_); buf_in_ = nullptr; }
+    if (ctx_in_) { ggml_free(ctx_in_); ctx_in_ = nullptr; }
+    t_x_ = nullptr;
+    if (buf_w_) { ggml_backend_buffer_free(buf_w_); buf_w_ = nullptr; }
+    if (ctx_w_) { ggml_free(ctx_w_); ctx_w_ = nullptr; }
+    d_out_ = nullptr; d_pad_ = nullptr;
+    // rb_ NE osvobozhdaetsja: ego ispolzuet i put sloev.
+    cfg_.head = false;
+    // Bufery golovy uhodjat iz otchjota o razmeshchenii - inache summa perestanet sxoditsja s
+    // tem, chto realno lezhit na karte.
+    for (std::size_t i = 0; i < bufs_info_.size();) {
+        if (bufs_info_[i].what.find("golova") != std::string::npos) {
+            vram_bytes_ -= std::min(vram_bytes_, bufs_info_[i].bytes);
+            bufs_info_.erase(bufs_info_.begin() + long(i));
+        } else {
+            ++i;
+        }
+    }
+}
 
-    // Per-layer bytes: nine weights plus the two halves of that layer's cache. Weights and
-    // cache share a buffer deliberately - keeping them apart would leave the cache at 201 MB
-    // for a 2048 context, which is UNDER the 256 MiB BAR window and would therefore be backed
-    // by system memory at 3.1 GB/s while every report still called it device-local.
-    std::vector<std::size_t> per_layer(std::size_t(nl), 0);
+bool GpuStatic::layer_bytes(const GpuStaticLayer* src, std::vector<std::size_t>* per,
+                            std::size_t* total_out, std::string* err) const {
+    const int nl = cfg_.n_layer;
+    const std::size_t align = ggml_backend_buft_get_alignment(buft_);
+    auto padded = [&](std::size_t n) { return (n + align - 1) / align * align; };
+    per->assign(std::size_t(nl), 0);
     std::size_t total = 0;
-    const std::size_t kv_one = padded(std::size_t(ggml_type_size(GGML_TYPE_F16)) *
-                                      std::size_t(hd) * std::size_t(cfg_.n_kv_max) *
-                                      std::size_t(nkv_heads));
+    // Kesh - POSLOJNO: u gemma4 golovy 16/2 po 512 i 16/8 po 256 v odnoj modeli, i odin razmer
+    // na vse sloi dal by libo chetvert nuzhnogo, libo vchetvero bolshe.
     for (int il = 0; il < nl; ++il) {
+        const GpuStaticGeom gk = cfg_.at(il);
+        const std::size_t kv_one = padded(std::size_t(ggml_type_size(GGML_TYPE_F16)) *
+                                          std::size_t(gk.head_dim) *
+                                          std::size_t(cfg_.n_kv_max) *
+                                          std::size_t(gk.n_head_kv));
         ggml_tensor* s[16];
         layer_slots(src[std::size_t(il)], s);
         std::size_t b = 0;
@@ -779,9 +846,31 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
             b += padded(ggml_nbytes(s[i]));
         }
         b += 2 * kv_one;
-        per_layer[std::size_t(il)] = b;
+        (*per)[std::size_t(il)] = b;
         total += b;
     }
+    *total_out = total;
+    return true;
+}
+
+bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
+    const int nl = cfg_.n_layer;
+    // hd i nkv_heads zdes tolko dlja proverok i pechati; sam kesh vydeljaetsja po
+    // POSLOJNOJ geometrii nizhe - u gemma4 golovy 16/2 po 512 i 16/8 po 256 v odnoj modeli,
+    // i odin razmer na vse sloi vydelil by chetvert nuzhnogo libо vchetvero bolshe.
+    const int hd = cfg_.head_dim;
+    const int nkv_heads = cfg_.n_head_kv;
+    const std::size_t align = ggml_backend_buft_get_alignment(buft_);
+    const std::size_t max_buf = ggml_backend_buft_get_max_size(buft_);
+    auto padded = [&](std::size_t n) { return (n + align - 1) / align * align; };
+
+    // Per-layer bytes: nine weights plus the two halves of that layer's cache. Weights and
+    // cache share a buffer deliberately - keeping them apart would leave the cache at 201 MB
+    // for a 2048 context, which is UNDER the 256 MiB BAR window and would therefore be backed
+    // by system memory at 3.1 GB/s while every report still called it device-local.
+    std::vector<std::size_t> per_layer;
+    std::size_t total = 0;
+    if (!layer_bytes(src, &per_layer, &total, err)) return false;
 
     // Grouping, and the whole rule is: every buffer must come out STRICTLY larger than the BAR
     // window. find_properties accepts a memory type only if heap.size >= the buffer size, so a

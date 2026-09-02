@@ -392,6 +392,14 @@ class GpuStatic {
                          const ggml_tensor* mask, int ith, int nth, void* ud);
     void do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur, const ggml_tensor* mask);
     bool alloc_layers(const GpuStaticLayer* src, std::string* err);
+    // Skolko videopamjati zajmut vnimanie i kesh. Vynesen otdelno, chtoby init mog sprosit ob
+    // etom DO togo, kak vydelit golovu - inache golova vydeljaetsja pervoj, a uznajot, chto
+    // mesta net, uzhe kesh, i togda drajver molcha podkladyvaet sistemnuju pamjat.
+    bool layer_bytes(const GpuStaticLayer* src, std::vector<std::size_t>* per,
+                     std::size_t* total, std::string* err) const;
+    // Osvobodit TOLKO golovu, ostaviv ustrojstvo podnjatym. Nuzhno, chtoby ne dat drajveru
+    // podlozhit sistemnuju pamjat: esli kesh s golovoj ne vlezaet, luchshe otdat golovu.
+    void free_head_only();
     bool build_layer_graphs(std::string* err);
 
     // One layer's device graph and the four tensors a step has to re-aim in it. The names are
