@@ -7601,6 +7601,140 @@ int main(int argc, char** argv) {
             // K tokenov idjot v SVOI eksperty, i prohod chitaet OBEDINENIE. rsel uzhe derzhit
             // top-k marshrutizatora dlja kazhdogo tokena kazhdogo sloja, tak chto eto chistaja
             // arifmetika po prochitannomu massivu - nikakoj novoj grafy i nikakogo vremeni.
+            // KRIVAJA POKRYTIJA: kakaja dolja OBRASHCHENIJ k ekspertam popadaet v srez iz
+            // N samyh chastyh. Eto reshajushchee chislo dlja idei "derzhat 30 GB iz 40 i
+            // ostalnoe ne chitat": esli raspredelenie ispolzovanija koso, to nebolshoj srez
+            // pokryvaet pochti vse chtenija, i podkachka voobshche ne nuzhna.
+            //
+            // Pochemu eto vazhnee predskazatelja: podkachku po predskazaniju ubivaet polosa
+            // diska (D: - HDD, 0,07 GB/s na sluchajnyh chtenijah bloka eksperta), i dazhe
+            // idealnoe predskazanie ne perenesjot 200 MB na token. A srez vybiraetsja ODIN
+            // raz, ofljajn, i v rabote diska net vovse.
+            //
+            // Schitaetsja POSLOJNO i po vsej modeli: u kazhdogo sloja svoj marshrutizator, i
+            // koncentracija u nih raznaja - obshchee srednee ejo skryvaet.
+            if (getenv("MEMEX_EXPERT_COVERAGE")) {
+                printf("KRIVAJA POKRYTIJA: dolja obrashchenij, popadajushchih v srez iz N samyh chastyh\n");
+                printf("  (promt %d tokenov, %d sloev, top-%d iz %d)\n",
+                       n, h.n_layer, h.n_expert_used, h.n_expert);
+                const long long total_hits = (long long)n * h.n_expert_used * h.n_layer;
+                std::vector<long long> cnt(size_t(h.n_expert), 0);
+                // Poslojnye doli dlja neskolkih srezov, plus hudshij sloj - potomu chto
+                // hudshij sloj i reshaet, gde poterjaetsja kachestvo.
+                const int cuts[] = {8, 16, 32, 48, 64, 96};
+                double cov_sum[6] = {0,0,0,0,0,0};
+                double cov_min[6] = {2,2,2,2,2,2};
+                for (int il = 0; il < h.n_layer; ++il) {
+                    std::fill(cnt.begin(), cnt.end(), 0LL);
+                    const int32_t* bs = rsel.data() +
+                        size_t(il) * size_t(h.n_expert_used) * size_t(n);
+                    long long tot = 0;
+                    for (int t = 0; t < n; ++t) {
+                        for (int sx = 0; sx < h.n_expert_used; ++sx) {
+                            const int32_t id = bs[size_t(t) * size_t(h.n_expert_used) + size_t(sx)];
+                            if (id >= 0 && id < h.n_expert) { ++cnt[size_t(id)]; ++tot; }
+                        }
+                    }
+                    if (tot == 0) continue;
+                    std::vector<long long> srt(cnt);
+                    std::sort(srt.begin(), srt.end(), std::greater<long long>());
+                    for (int ci = 0; ci < 6; ++ci) {
+                        const int N = std::min(cuts[ci], h.n_expert);
+                        long long acc = 0;
+                        for (int j = 0; j < N; ++j) acc += srt[size_t(j)];
+                        const double f = double(acc) / double(tot);
+                        cov_sum[ci] += f;
+                        if (f < cov_min[ci]) cov_min[ci] = f;
+                    }
+                }
+                for (int ci = 0; ci < 6; ++ci) {
+                    const int N = std::min(cuts[ci], h.n_expert);
+                    printf("  srez %3d iz %3d (%4.1f%% modeli): pokrytie v srednem %5.2f%%, "
+                           "u hudshego sloja %5.2f%%\n", N, h.n_expert,
+                           100.0 * double(N) / double(h.n_expert),
+                           100.0 * cov_sum[ci] / double(h.n_layer), 100.0 * cov_min[ci]);
+                }
+                printf("  vsego obrashchenij %lld; nepokrytoe - eto libo chtenie s diska, libo "
+                       "propushchennyj ekspert, to est POTERJA KACHESTVA\n", total_hits);
+                // VYGRUZKA SCHJOTOV, chtoby sravnit teksty mezhdu soboj. Bez etogo krivaja
+                // pokrytija govorit tolko o koncentracii, a glavnyj vopros drugoj: te zhe li
+                // eksperty naverhu na DRUGOM tekste. Srez, vybrannyj po odnomu tekstu i
+                // primenjonnyj k drugomu, mozhet pokryvat sushchestvenno men'she.
+                if (const char* dump = getenv("MEMEX_EXPERT_DUMP")) {
+                    FILE* f = fopen(dump, "wb");
+                    if (!f) {
+                        printf("  vygruzka schjotov: fajl %s ne otkrylsja - NE VYGRUZHENO\n", dump);
+                    } else {
+                        fprintf(f, "layers %d experts %d used %d tokens %d\n",
+                                h.n_layer, h.n_expert, h.n_expert_used, n);
+                        for (int il = 0; il < h.n_layer; ++il) {
+                            std::fill(cnt.begin(), cnt.end(), 0LL);
+                            const int32_t* bs2 = rsel.data() +
+                                size_t(il) * size_t(h.n_expert_used) * size_t(n);
+                            for (int t = 0; t < n; ++t) {
+                                for (int sx = 0; sx < h.n_expert_used; ++sx) {
+                                    const int32_t id = bs2[size_t(t) * size_t(h.n_expert_used) + size_t(sx)];
+                                    if (id >= 0 && id < h.n_expert) ++cnt[size_t(id)];
+                                }
+                            }
+                            fprintf(f, "%d", il);
+                            for (int e = 0; e < h.n_expert; ++e) fprintf(f, " %lld", cnt[size_t(e)]);
+                            fprintf(f, "\n");
+                        }
+                        fclose(f);
+                        printf("  schjota vygruzheny v %s\n", dump);
+                    }
+                }
+                // PERENOS VNUTRI ODNOGO DOKUMENTA. Eto glavnoe chislo dlja rabochego
+                // mnozhestva: srez vybiraetsja po PERVOJ polovine promta i primenjaetsja ko
+                // VTOROJ. Mezhdu RAZNYMI tekstami perenos ploh (izmereno: 81,4% pri sreze 75%
+                // protiv 99,7% na svojom tekste), no predskazatel i ne dolzhen ugadyvat chuzhoj
+                // tekst - on chitaet tekushchij. Vopros v tom, uspevaet li on za nim.
+                if (n >= 64) {
+                    const int half = n / 2;
+                    printf("  PERENOS VNUTRI DOKUMENTA (srez po pervoj polovine -> vtoraja):\n");
+                    for (int ci = 0; ci < 6; ++ci) {
+                        const int N = std::min(cuts[ci], h.n_expert);
+                        double c1 = 0.0, c2 = 0.0;
+                        int nl_ok = 0;
+                        for (int il = 0; il < h.n_layer; ++il) {
+                            std::vector<long long> a(size_t(h.n_expert), 0), b(size_t(h.n_expert), 0);
+                            const int32_t* bs3 = rsel.data() +
+                                size_t(il) * size_t(h.n_expert_used) * size_t(n);
+                            for (int t = 0; t < n; ++t) {
+                                for (int sx = 0; sx < h.n_expert_used; ++sx) {
+                                    const int32_t id = bs3[size_t(t) * size_t(h.n_expert_used) + size_t(sx)];
+                                    if (id < 0 || id >= h.n_expert) continue;
+                                    if (t < half) ++a[size_t(id)]; else ++b[size_t(id)];
+                                }
+                            }
+                            long long sa = 0, sb = 0;
+                            for (int e = 0; e < h.n_expert; ++e) { sa += a[size_t(e)]; sb += b[size_t(e)]; }
+                            if (sa == 0 || sb == 0) continue;
+                            std::vector<int> idx(size_t(h.n_expert));
+                            for (int e = 0; e < h.n_expert; ++e) idx[size_t(e)] = e;
+                            std::sort(idx.begin(), idx.end(),
+                                      [&](int x, int y) { return a[size_t(x)] > a[size_t(y)]; });
+                            long long accA = 0, accB = 0;
+                            for (int j = 0; j < N; ++j) {
+                                accA += a[size_t(idx[size_t(j)])];
+                                accB += b[size_t(idx[size_t(j)])];
+                            }
+                            c1 += double(accA) / double(sa);
+                            c2 += double(accB) / double(sb);
+                            ++nl_ok;
+                        }
+                        if (!nl_ok) continue;
+                        printf("    srez %3d: pervaja polovina %5.2f%%, vtoraja tem zhe srezom "
+                               "%5.2f%% (poterja %5.2f punkta)\n", N,
+                               100.0 * c1 / nl_ok, 100.0 * c2 / nl_ok,
+                               100.0 * (c1 - c2) / nl_ok);
+                    }
+                }
+                printf("  VNIMANIE: eto raspredelenie NASHEGO prompta. Na drugom tekste chastoty "
+                       "drugie, i srez, vybrannyj po odnomu tekstu, na drugom budet huzhe\n");
+            }
+
             if (getenv("MEMEX_MTP_OVERLAP")) {
                 printf("MTP: perekrytie naborov ekspertov u sosednih tokenov\n");
                 printf("  (prefill, %d tokenov, %d sloev, top-k %d iz %d)\n",
