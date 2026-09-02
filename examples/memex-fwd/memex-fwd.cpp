@@ -2819,7 +2819,11 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // perenaceljivat zapisi. Bez etogo flaga aim_cache_writes ne nahodit, chto celit, i
         // vozvrashchaet lozh - otkaz chestnyj, no prichina ego v tom, chto pisat uzhe nechego.
 #ifdef MEMEX_FWD_GPU_EXPERTS
-        const bool card = gstat && gstat->layers_on() && n_tokens == 1;
+        // SHIRINA, a ne edinica. Karta stroit svoi grafy pod odnu opredeljonnuju shirinu, i
+        // graf dekoda objazan SPROSIT ejo, a ne predpolozhit. Ranshe zdes stojalo n_tokens == 1,
+        // i imenno poetomu ljuboj zamer shirinoj bolshe odnogo MOLCHA merjal chisto processornyj
+        // put, nazyvaja ego kartochnym.
+        const bool card = gstat && gstat->layers_on() && n_tokens == gstat->layer_width();
         if (card) {
             ggml_tensor* msk = (G.kind == LayerKind::ATTN_SWA && g->mask_swa) ? g->mask_swa
                                                                               : g->mask;
@@ -2829,14 +2833,23 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
             // off the card the host still computes it from that slot.
             card_dense = gstat->dense_on();
             card_lay = gstat->layer(c, il, cur, msk);
-            const size_t ne = size_t(h.n_embd);
-            attn_out = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, h.n_embd, 0), h.n_embd, 1);
-            hd_in    = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, h.n_embd, ne * sizeof(float)),
-                                       h.n_embd, 1);
-            moe_in   = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, h.n_embd, 2 * ne * sizeof(float)),
-                                       h.n_embd, 1);
-            rlogits  = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, h.n_expert, 3 * ne * sizeof(float)),
-                                       h.n_expert, 1);
+            // Sklejka idjot PO VELICHINAM, a ne po stolbcam: [ostatok x W][ffn_norm x W]
+            // [pre_ffw_norm_2 x W][logity x W]. Tak zhe skladyvaet ejo do_layer, i dva
+            // smeshchenija objazany sovpadat - inache karta vernjot pravilnye chisla, a graf
+            // prochtjot ih ne s togo mesta.
+            const size_t neW = size_t(h.n_embd) * size_t(n_tokens);
+            attn_out = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, int64_t(neW), 0),
+                                       h.n_embd, n_tokens);
+            hd_in    = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, int64_t(neW),
+                                                       neW * sizeof(float)),
+                                       h.n_embd, n_tokens);
+            moe_in   = ggml_reshape_2d(c, ggml_view_1d(c, card_lay, int64_t(neW),
+                                                       2 * neW * sizeof(float)),
+                                       h.n_embd, n_tokens);
+            rlogits  = ggml_reshape_2d(c, ggml_view_1d(c, card_lay,
+                                                       int64_t(h.n_expert) * int64_t(n_tokens),
+                                                       3 * neW * sizeof(float)),
+                                       h.n_expert, n_tokens);
 
             // Te zhe zondy, chto u processornogo puti, i s temi zhe imenami. Bez nih sverka
             // vidit tolko logity v konce i govorit "gde-to v tridcati slojah", a s nimi nazyvaet
@@ -4364,6 +4377,16 @@ struct GpuStaticOpt {
     // q8_0 is 569 MB every token, 22.9 ms of 86.6 - and unlike an expert it is read whether
     // or not any router picks it, which makes it the best MiB-for-MiB resident in the model.
     bool dense    = false;
+    // --gpu-static-width K: skolko tokenov kartochnyj graf sloja schitaet za odin dispatch.
+    //
+    // Odin - vsjo, chto bylo do MTP. Bolshe odnogo nuzhno spekuljativnomu prohodu, i imenno zdes
+    // zhivjot vsja ego vygoda: prohod na 4 tokena BEZ karty izmeren v 207,8 ms, chto pri prijomke
+    // 0,72 dajot 12,6 tok/s - HUZHE nyneshnih 13,89. S kartoj tot zhe prohod - 149,2 ms.
+    //
+    // PO UMOLCHANIJU 1, i menjat eto nelzja, poka ne sojdjotsja sverka "K odinochnyh shagov
+    // protiv odnogo prohoda shiriny K": pri K=4 karta rashoditsja s processornym grafom na
+    // 10,9% po logitam, i kotoryj iz dvuh putej neveren - poka NE ustanovleno.
+    int  width    = 1;
 };
 
 // Off by default, and it stays off until it is MEASURED faster - not until it looks right.
@@ -5835,6 +5858,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--gpu-static-layers")) { sopt.on = true; sopt.layers = true; }
         else if (!strcmp(a, "--gpu-static-nohead")) { sopt.nohead = true; }
         else if (!strcmp(a, "--gpu-static-dense")) { sopt.on = true; sopt.layers = true; sopt.dense = true; }
+        else if (!strcmp(a, "--gpu-static-width")) { if (want_val(i, a)) sopt.width = atoi(argv[++i]); }
         // Answered here, and it does nothing but exit zero. It is the queue's startability
         // probe (bench/build_safe.ps1, Test-Startable): a binary that fails to load its DLLs
         // dies before printing anything, with -1073741511 or -1073741515, and every log then
@@ -6632,6 +6656,7 @@ int main(int argc, char** argv) {
         sc.reserve = std::size_t(sopt.reserve_mib) << 20;
         sc.verify  = sopt.verify;
         sc.layers  = sopt.layers;
+        sc.layer_width = sopt.width;
         sc.n_layer = h.n_layer;
         sc.n_head  = h.n_head;
         sc.n_head_kv = h.n_head_kv;
