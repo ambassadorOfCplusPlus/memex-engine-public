@@ -302,8 +302,14 @@ bool GpuStatic::init(const GpuStaticConfig& cfg, ggml_tensor* out, std::string* 
     // up in the pinned registry (ggml_vk_host_get) and copies straight into it when it finds
     // it, and pays one more hop through the backend's shared staging buffer when it does not.
     {
-        const std::size_t need =
+        const std::size_t need_head =
             std::size_t(cfg_.n_vocab) * std::size_t(cfg_.max_rows) * sizeof(float);
+        // Pol po sloju: pri --gpu-static-nohead golova ne vydeljaetsja, i n_vocab*max_rows
+        // bolshe ne objazan pokryvat vyhod sloja - a chitaem my v tot zhe bufer.
+        const std::size_t need_lay =
+            std::size_t(3 * cfg_.n_embd + cfg_.n_expert)
+            * std::size_t(cfg_.layer_width > 0 ? cfg_.layer_width : 1) * sizeof(float);
+        const std::size_t need = std::max(need_head, need_lay) + 4096;
         ggml_backend_buffer_type_t hb = ggml_backend_vk_host_buffer_type();
         if (hb) buf_rb_ = ggml_backend_buft_alloc_buffer(hb, need);
         if (buf_rb_) rb_ = (float*)ggml_backend_buffer_get_base(buf_rb_);
@@ -692,20 +698,20 @@ bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::str
     // allocator has already run, and a backend that has no pipeline for one of these types
     // aborts rather than returning an error - so it must abort at init, not at token one.
     if (cfg_.layers) {
-        std::vector<float> zx(std::size_t(cfg_.n_embd), 0.0f);
+        const int Wi = cfg_.layer_width > 0 ? cfg_.layer_width : 1;
+        std::vector<float> zx(std::size_t(cfg_.n_embd) * std::size_t(Wi), 0.0f);
         // A one-position step against a 32-position window: the smallest aim that is legal.
         if (!set_step(0, 32)) {
             *err = "sloi na kartu: probnyj shag ne nacelilsja";
             shutdown();
             return false;
         }
-        std::vector<float> zmask(32, 0.0f);
-        ggml_backend_tensor_set(t_mask_, zmask.data(), 0, 32 * sizeof(float));
+        std::vector<float> zmask(std::size_t(32) * std::size_t(Wi), 0.0f);
+        ggml_backend_tensor_set(t_mask_, zmask.data(), 0, zmask.size() * sizeof(float));
         step_mask_sent_ = true;
         for (int il = 0; il < cfg_.n_layer; ++il) {
             try {
-                ggml_backend_tensor_set(t_lx_, zx.data(), 0,
-                                        std::size_t(cfg_.n_embd) * sizeof(float));
+                ggml_backend_tensor_set(t_lx_, zx.data(), 0, zx.size() * sizeof(float));
                 ggml_backend_graph_compute(be_, lg_[std::size_t(il)].gf);
             } catch (const std::exception& e) {
                 *err = std::string("probnyj prohod sloja ") + std::to_string(il) + ": " +
@@ -924,6 +930,15 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
 bool GpuStatic::build_layer_graphs(std::string* err) {
     const int nl = cfg_.n_layer;
     const int ne = cfg_.n_embd;
+    // Shirina: skolko tokenov graf schitaet za dispatch. Pri W == 1 nizhe rabotaet tot zhe kod,
+    // chto rabotal do MTP - vetki po W stojat tolko tam, gde odnotokennyj put polzuetsja tem, chto
+    // perestanovka s ekstentom 1 est te zhe bajty po tem zhe smeshchenijam.
+    const int W = cfg_.layer_width > 0 ? cfg_.layer_width : 1;
+    if (W < 1 || W > 16) { *err = "shirina sloja vne 1..16"; return false; }
+    // Samoidentifikacija (pravilo 68): graf objazan skazat, na kakuju shirinu on sobran. Bez
+    // etoj stroki simptom "karta schitaet odin token tam, gde graf podajot chetyre" vygljadel
+    // kak oshibka arifmetiki - a chislo uzlov 38 pri shirine 4 i pri shirine 1 sovpadalo.
+    fprintf(stderr, "LAYER_WIDTH %d\n", W); fflush(stderr);
     // GEOMETRIJA TEPER POSLOJNAJA. Ranshe hd/nh/nkvh brались odin raz na vsju model, potomu chto
     // u qwen3moe ona odna. U gemma4 ih dve: dvadcat pjat okonnyh sloev s golovami 16/8 po 256 i
     // pjat polnyh s 16/2 po 512, s raznym osnovaniem povorota i masshtabom softmax. cfg_.at(il)
@@ -937,9 +952,9 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         ggml_init_params ip = {ggml_tensor_overhead() * 8 + 4096, nullptr, true};
         ctx_lin_ = ggml_init(ip);
         if (!ctx_lin_) { *err = "ggml_init dlja vhodov sloja ne udalsja"; return false; }
-        t_lx_   = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, ne, 1);
-        t_pos_  = ggml_new_tensor_1d(ctx_lin_, GGML_TYPE_I32, 1);
-        t_mask_ = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, cfg_.n_kv_max, 1);
+        t_lx_   = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, ne, W);
+        t_pos_  = ggml_new_tensor_1d(ctx_lin_, GGML_TYPE_I32, W);
+        t_mask_ = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, cfg_.n_kv_max, W);
         ggml_set_name(t_lx_, "vk.layer.x");
         ggml_set_name(t_pos_, "vk.layer.pos");
         ggml_set_name(t_mask_, "vk.layer.mask");
@@ -953,7 +968,12 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
     // ('needed 74464, available 74400'), i otkaz pri etom ne diagnostiruemyj: ggml_new_object
     // vozvrashchaet nol posredi postroenija, a padaet potom i v drugom meste.
     // +4 a layer for the dense half (up, gate, gelu*mul, down) when it is on the card.
-    const std::size_t nodes = cfg_.gemma_block ? (cfg_.dense_ffn ? 96 : 72) : 48;
+    // Pri W > 1 chetyre "besplatnyh" reshape prevrashchajutsja v perestanovki, a odna iz nih
+    // eshchjo i v cont - to est uzlov stanovitsja bolshe, i zapas objazan eto uchest. Otkaz
+    // ggml_new_object ne diagnostiruem (vozvrashchaet nol posredi postroenija, padaet potom i v
+    // drugom meste), poetomu luchshe pereplatit pamjatju na deskriptory.
+    const std::size_t nodes = (cfg_.gemma_block ? (cfg_.dense_ffn ? 96 : 72) : 48)
+                            + (W > 1 ? 16 : 0);
     ggml_init_params ip = {
         (ggml_tensor_overhead() * (nodes + 24) + ggml_graph_overhead_custom(nodes, false))
             * std::size_t(nl) + 8192,
@@ -1018,10 +1038,10 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
             // Bez nejo karta pishet v kesh nenormirovannoe V, i vnimanie nevernо s PERVOGO shaga
             // dekoda - rovno tot priznak, chto nabljudalsja: L2 16,5% na pozicii 4 i odin
             // sovpavshij tokjen iz shesti.
-            v = ggml_rms_norm(c, ggml_reshape_3d(c, v, hd, nkvh, 1), cfg_.rms_eps);
+            v = ggml_rms_norm(c, ggml_reshape_3d(c, v, hd, nkvh, W), cfg_.rms_eps);
         }
 
-        q = ggml_reshape_3d(c, q, hd, nh, 1);
+        q = ggml_reshape_3d(c, q, hd, nh, W);
         q = ggml_fused_rms_norm(c, q, L.q_norm, cfg_.rms_eps);
         // MEMEX_NO_ROPE=1 drops both rope nodes from this graph. The OUTPUT IS THEN WRONG and
         // that is the point: device time does not depend on the values, so an arm whose
@@ -1050,7 +1070,7 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
                 : ggml_rope_multi(c, q, t_pos_, L.rope_freqs, gm.n_rot, sections, gm.rope_type,
                                   cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         }
-        k = ggml_reshape_3d(c, k, hd, nkvh, 1);
+        k = ggml_reshape_3d(c, k, hd, nkvh, W);
         k = ggml_fused_rms_norm(c, k, L.k_norm, cfg_.rms_eps);
         if (!no_rope) {
             k = cfg_.gemma_block
@@ -1060,21 +1080,33 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
                                   cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         }
 
-        // [hd, n_head_kv, 1] -> [hd, 1, n_head_kv], same bytes at the same offsets.
-        ggml_tensor* Kc = ggml_reshape_3d(c, k, hd, 1, nkvh);
-        // v is [n_head_kv*hd, 1]; the host writes it as permute(reshape(v,hd,nkvh,1),1,2,0,3),
-        // which for one token is [1, hd, n_head_kv] over the same contiguous bytes.
-        ggml_tensor* Vc = ggml_reshape_3d(c, v, 1, hd, nkvh);
+        // Pri W == 1 eto te zhe bajty po tem zhe smeshchenijam, i togda reshape deshevle
+        // perestanovki. Pri W > 1 perestanovka REALNA, i togda nado delat to zhe, chto delaet
+        // processornyj stroitel - on i est etalon, protiv kotorogo eta shirina sverjaetsja.
+        ggml_tensor* Kc = (W == 1)
+            ? ggml_reshape_3d(c, k, hd, 1, nkvh)               // [hd, nkvh, 1] -> [hd, 1, nkvh]
+            // ggml_cont OBJAZATELEN, i eto vzjato u etalona bukvalno: processornyj stroitel
+            // pishet cont(permute(...)) vo vseh trjoh mestah. Bez nego Vulkan poluchaet
+            // NEPLOTNYJ istochnik tam, gde etalon dajot plotnyj - i attn_out rashodilsja na 23%
+            // uzhe na nulevom sloe.
+            : ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));    // [hd, nkvh, W] -> [hd, W, nkvh]
+        // v u gemma4 uzhe trjohmernyj (posle bezvesovoj normy), u qwen3moe - dvumernyj.
+        ggml_tensor* v3 = (v->ne[2] == W && v->ne[1] == nkvh)
+                              ? v : ggml_reshape_3d(c, v, hd, nkvh, W);
+        ggml_tensor* Vc = (W == 1)
+            ? ggml_reshape_3d(c, v, 1, hd, nkvh)               // [1, hd, nkvh]
+            : ggml_cont(c, ggml_permute(c, v3, 1, 2, 0, 3));   // [W, hd, nkvh]
         ggml_tensor* kcache = kv_k_[std::size_t(il)];
         ggml_tensor* vcache = kv_v_[std::size_t(il)];
-        ggml_tensor* kdst = ggml_view_3d(c, kcache, hd, 1, nkvh,
+        ggml_tensor* kdst = ggml_view_3d(c, kcache, hd, W, nkvh,
                                          kcache->nb[1], kcache->nb[2], 0);
-        ggml_tensor* vdst = ggml_view_3d(c, vcache, 1, hd, nkvh,
+        ggml_tensor* vdst = ggml_view_3d(c, vcache, W, hd, nkvh,
                                          vcache->nb[1], vcache->nb[2], 0);
         ggml_tensor* kcpy = ggml_cpy(c, Kc, kdst);
         ggml_tensor* vcpy = ggml_cpy(c, Vc, vdst);
 
-        ggml_tensor* Q = ggml_reshape_3d(c, q, hd, 1, nh);
+        ggml_tensor* Q = (W == 1) ? ggml_reshape_3d(c, q, hd, 1, nh)
+                                  : ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3)); // [hd, W, nh]
         ggml_tensor* K = ggml_view_3d(c, kcache, hd, cfg_.n_kv_max, nkvh,
                                       kcache->nb[1], kcache->nb[2], 0);
         ggml_tensor* V = ggml_view_3d(c, vcache, cfg_.n_kv_max, hd, nkvh,
@@ -1082,9 +1114,10 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         ggml_tensor* kq = ggml_mul_mat(c, K, Q);
         ggml_tensor* p = ggml_soft_max_ext(c, kq, t_mask_, kq_scale, 0.0f);
         ggml_tensor* kqv = ggml_mul_mat(c, V, p);
-        // [hd, 1, n_head] -> [n_head*hd, 1]: the host's cont_2d(permute(...)) over the same
-        // contiguous bytes, for one token.
-        kqv = ggml_reshape_2d(c, kqv, dq, 1);
+        // Pri W == 1 eto host's cont_2d(permute(...)) po tem zhe nepreryvnym bajtam. Pri W > 1
+        // nuzhen nastojashchij cont - rovno tot, chto stoit v processornom stroitele.
+        kqv = (W == 1) ? ggml_reshape_2d(c, kqv, dq, 1)
+                       : ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), dq, W);
 
         // DVA BLOKA, a ne odin s raznymi razmerami. U gemma4 mezhdu wo i ostatkom stoit norma,
         // kotoroj u qwen3moe net, a marshrutizator chitaet VYHOD VNIMANIJA cherez svoj sobstvennyj
@@ -1303,8 +1336,11 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
     // The padding positions are read and multiplied by the zero the -inf mask puts into probs,
     // so they cost bytes and never correctness. Everything is validated before anything is
     // patched, so a refusal leaves the graphs reading the whole allocation - slow and right.
+    const int W = cfg_.layer_width > 0 ? cfg_.layer_width : 1;
     if (n_kv <= 0 || n_kv % 32 != 0 || n_kv > cfg_.n_kv_max) return false;
-    if (n_past < 0 || n_past >= n_kv) return false;
+    // W pozicij, a ne odna: prohod na chetyre tokena pishet chetyre pozicii, i poslednjaja iz
+    // nih objazana byt vnutri okna vnimanija - inache karta pishet za predel kesha.
+    if (n_past < 0 || n_past + W > n_kv) return false;
 
     auto restride = [](ggml_tensor* t, int64_t n0) {
         t->ne[0] = n0;
@@ -1335,8 +1371,9 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
             G.vcpy->view_offs = vo;
             G.vcpy->data = G.vdst->data;
         }
-        const int32_t pos = int32_t(n_past);
-        ggml_backend_tensor_set(t_pos_, &pos, 0, sizeof(int32_t));
+        int32_t pos[16];
+        for (int j = 0; j < W; ++j) pos[j] = int32_t(n_past + j);
+        ggml_backend_tensor_set(t_pos_, pos, 0, std::size_t(W) * sizeof(int32_t));
     }
     step_past_ = n_past;
     step_nkv_  = n_kv;
@@ -1395,9 +1432,10 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
     // Tri velichiny u qwen3moe (ostatok, ego norma, logity) i CHETYRE u gemma4: u nejo dve raznye
     // pre-normy nad odnim i tem zhe ostatkom - ffn_norm dlja plotnoj poloviny i pre_ffw_norm_2 dlja
     // marshrutiziruemoj - i vernut obe deshevle, chem zastavit host schitat odnu zanovo.
-    const std::size_t out_floats = cfg_.gemma_block
+    const int W = cfg_.layer_width > 0 ? cfg_.layer_width : 1;
+    const std::size_t out_floats = (cfg_.gemma_block
         ? std::size_t(3 * cfg_.n_embd + cfg_.n_expert)
-        : std::size_t(2 * cfg_.n_embd + cfg_.n_expert);
+        : std::size_t(2 * cfg_.n_embd + cfg_.n_expert)) * std::size_t(W);
 
     if (!fail_msg_.empty()) { std::memset(dst->data, 0, ggml_nbytes(dst)); return; }
     if (step_nkv_ <= 0) {
@@ -1406,13 +1444,14 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
         return;
     }
     if (cur->type != GGML_TYPE_F32 || !ggml_is_contiguous(cur) ||
-        cur->ne[0] != cfg_.n_embd || ggml_nelements(cur) != cfg_.n_embd) {
-        fail_msg_ = "vhod sloja ne nepreryvnyj F32 [n_embd, 1]";
+        cur->ne[0] != cfg_.n_embd ||
+        ggml_nelements(cur) != int64_t(cfg_.n_embd) * int64_t(W)) {
+        fail_msg_ = "vhod sloja ne nepreryvnyj F32 [n_embd, shirina]";
         std::memset(dst->data, 0, ggml_nbytes(dst));
         return;
     }
     if (std::size_t(ggml_nelements(dst)) != out_floats || !ggml_is_contiguous(dst)) {
-        fail_msg_ = "vyhod sloja ne [2*n_embd + n_expert, 1]";
+        fail_msg_ = "vyhod sloja ne [(2..3)*n_embd + n_expert, shirina]";
         std::memset(dst->data, 0, ggml_nbytes(dst));
         return;
     }
@@ -1430,18 +1469,31 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
         // shag) i pravilnoe dlja gemma4 (dve). Dispatchi idut posledovatelno, po odnomu na sloj,
         // tak chto otpravit nuzhnuju masku pered dispatchem sloja - dostatochno.
         if (step_mask_src_ != (mask ? mask->data : nullptr)) {
-            if (!mask || mask->type != GGML_TYPE_F32 || mask->ne[0] < step_nkv_) {
-                fail_msg_ = "maska vnimanija uzhe, chem naceleno pozicij";
+            if (!mask || mask->type != GGML_TYPE_F32 || mask->ne[0] < step_nkv_ ||
+                mask->ne[1] < W) {
+                fail_msg_ = "maska vnimanija uzhe, chem naceleno pozicij ili strok";
                 std::memset(dst->data, 0, ggml_nbytes(dst));
                 return;
             }
-            ggml_backend_tensor_set(t_mask_, mask->data, 0,
-                                    std::size_t(step_nkv_) * sizeof(float));
+            // Odnim memcpy tolko kogda stroka hosta rovno nasha. Pri W > 1 i bolee shirokoj
+            // stroke ploskaja kopija vzjala by masku sosednego tokena so sdvigom - oshibka,
+            // kotoraja dajot rabotajushchee vnimanie po chuzhim pozicijam.
+            if (mask->ne[0] == step_nkv_) {
+                ggml_backend_tensor_set(t_mask_, mask->data, 0,
+                                        std::size_t(step_nkv_) * std::size_t(W) * sizeof(float));
+            } else {
+                for (int r = 0; r < W; ++r) {
+                    ggml_backend_tensor_set(
+                        t_mask_, (const char*)mask->data + std::size_t(r) * mask->nb[1],
+                        std::size_t(r) * std::size_t(step_nkv_) * sizeof(float),
+                        std::size_t(step_nkv_) * sizeof(float));
+                }
+            }
             step_mask_src_ = mask->data;
             step_mask_sent_ = true;
         }
         ggml_backend_tensor_set(t_lx_, cur->data, 0,
-                                std::size_t(cfg_.n_embd) * sizeof(float));
+                                std::size_t(cfg_.n_embd) * std::size_t(W) * sizeof(float));
         // Fold the readback into the graph's own command buffer, so this layer costs ONE
         // round trip to the device instead of two. Measured on the expert path first: the
         // separate read there was 113 us a layer for 46 KB, i.e. two submit-and-fence round
@@ -1471,9 +1523,10 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
             } else {
                 // Three copies into the same pinned buffer at the offsets the concatenated
                 // layout used, so the host side downstream is byte-for-byte what it was.
-                const std::size_t ne = std::size_t(cfg_.n_embd);
-                // Poriadok tot zhe, chto davala sklejka: ostatok, normy, logity. Host nizhe chitaet
-                // rb_ po tem zhe smeshchenijam, poetomu menjat ih nelzja bez pravki obeih storon.
+                // ne - eto uzhe n_embd*W: kazhdyj vyhod nesjot W stolbcov, i sklejka idjot
+                // PO VYHODAM, a ne po stolbcam. Host nizhe rezhet rb_ po tem zhe smeshchenijam,
+                // poetomu menjat ih nelzja bez pravki obeih storon.
+                const std::size_t ne = std::size_t(cfg_.n_embd) * std::size_t(W);
                 bool ok = ggml_backend_vk_arm_readback(be_, G.o_res, rb_,      0, ne * sizeof(float));
                 ok = ok && ggml_backend_vk_arm_readback(be_, G.o_xf, rb_ + ne, 0, ne * sizeof(float));
                 std::size_t off = 2 * ne;
@@ -1482,7 +1535,8 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
                     off += ne;
                 }
                 ok = ok && ggml_backend_vk_arm_readback(be_, G.o_rl, rb_ + off, 0,
-                                                        std::size_t(cfg_.n_expert) * sizeof(float));
+                                                        std::size_t(cfg_.n_expert)
+                                                            * std::size_t(W) * sizeof(float));
                 folded = ok;
             }
         }
@@ -1519,7 +1573,7 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
             if (G.out) {
                 ggml_backend_tensor_get(G.out, rb_, 0, out_floats * sizeof(float));
             } else {
-                const std::size_t ne = std::size_t(cfg_.n_embd);
+                const std::size_t ne = std::size_t(cfg_.n_embd) * std::size_t(W);
                 ggml_backend_tensor_get(G.o_res, rb_,      0, ne * sizeof(float));
                 ggml_backend_tensor_get(G.o_xf,  rb_ + ne, 0, ne * sizeof(float));
                 std::size_t off = 2 * ne;
@@ -1528,7 +1582,8 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
                     off += ne;
                 }
                 ggml_backend_tensor_get(G.o_rl, rb_ + off, 0,
-                                        std::size_t(cfg_.n_expert) * sizeof(float));
+                                        std::size_t(cfg_.n_expert)
+                                            * std::size_t(W) * sizeof(float));
             }
         }
         if (!truncated) {
@@ -1579,9 +1634,14 @@ ggml_tensor* GpuStatic::layer(ggml_context* c, int il, ggml_tensor* cur, ggml_te
     // Tri velichiny u qwen3moe i CHETYRE u gemma4 - u nejo dve raznye pre-normy nad odnim
     // ostatkom. Razmer dolzhen sovpadat s tem, chto realno chitaetsja obratno (out_floats v
     // do_layer), inache vid vyhodit za predely istochnika i ggml.c:5427 lovit eto utverzhdeniem.
+    // Odnomernyj po dline i shirine srazu: sklejka idjot PO VYHODAM (ostatok, normy, logity),
+    // i kazhdyj iz nih nesjot W stolbcov, tak chto vyhody NE lezhat stolbcami odnogo [X, W]
+    // tenzora. Graf dekoda rezhet eto ggml_view_2d po smeshcheniju - ono dolzhno sovpadat s tem,
+    // po kakomu do_layer skladyvaet rb_.
+    const int Wp = cfg_.layer_width > 0 ? cfg_.layer_width : 1;
     ggml_tensor* proto = ggml_new_tensor_2d(c, GGML_TYPE_F32,
-                                            (cfg_.gemma_block ? 3 : 2) * cfg_.n_embd
-                                                + cfg_.n_expert, 1);
+                                            ((cfg_.gemma_block ? 3 : 2) * cfg_.n_embd
+                                                + cfg_.n_expert) * Wp, 1);
     return ggml_map_custom3(c, proto, cur, mask, layer_op, /*n_tasks=*/1,
                             &sites_[std::size_t(il)]);
 }

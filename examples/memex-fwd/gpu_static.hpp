@@ -140,6 +140,15 @@ struct GpuStaticConfig {
     // path is built for n_tokens == 1 and the engine keeps the exact CPU graph for everything
     // else. That also means the KV cache the card owns is written one position at a time.
     bool layers = false;
+    // SHIRINA sloja - skolko tokenov graf karty schitaet za odin dispatch. Odin - eto vsjo, chto
+    // bylo do MTP, i pri edinice graf sobiraetsja TEM ZHE kodom, chto i ranshe: vetka po W stoit
+    // vokrug vosmi mest, gde odnotokennyj put polzuetsja tem, chto perestanovka s ekstentom 1 -
+    // eto te zhe bajty po tem zhe smeshchenijam. Pri W > 1 perestanovki stanovjatsja realnymi, i
+    // togda eto uzhe drugoj graf - poetomu verificirovannyj put nelzja bylo pravit na meste.
+    //
+    // Zachem: prohod na K tokenov izmeren (bench/spec_width.ps1) i bez karty on delaet HUZHE
+    // (12,6 tok/s protiv 13,57), a s kartoj dajot ~18. To est vsja vygoda MTP zhivjot imenno zdes.
+    int   layer_width = 1;
     int   n_layer    = 0;
     int   n_head     = 0;
     int   n_head_kv  = 0;
@@ -338,6 +347,10 @@ class GpuStatic {
     // Returns false and changes nothing if the numbers are not usable, in which case the
     // previous aim still stands: reading the whole allocation is slow and right.
     bool set_step(int n_past, int n_kv);
+    // Skolko tokenov zhdjot graf karty. Grafu decoda nado sprosit, a ne predpolagat: pri
+    // nesovpadenii shiriny karta objazana ustupit processornomu puti, inache ona posчitaet
+    // odin token tam, gde graf zhdjot chetyre, i oshibka vyjdet tihoj.
+    int layer_width() const { return cfg_.layers ? cfg_.layer_width : 0; }
 
     // The prompt is computed on the host - a prefill is a different graph shape and is
     // compute-bound rather than bandwidth-bound, so moving it buys nothing - which leaves the

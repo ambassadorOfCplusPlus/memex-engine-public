@@ -7327,19 +7327,25 @@ int main(int argc, char** argv) {
             }
             // Whatever the read side ended up at, the mask has to agree with it: it is the
             // mask's own row length, not n_kv_max, that the softmax steps through.
-            const int nkv = int(gr.mask->ne[0]);
-            ps.resize(size_t(nt));
-            for (int i = 0; i < nt; ++i) ps[size_t(i)] = past + i;
-            mk.assign(size_t(nkv) * size_t(nt), -INFINITY);
-            for (int i = 0; i < nt; ++i) {
-                for (int j = 0; j <= past + i && j < nkv; ++j) {
-                    mk[size_t(i) * size_t(nkv) + size_t(j)] = 0.0f;
-                }
-            }
-            ggml_backend_tensor_set(gr.tokens, tk, 0, sizeof(int32_t) * size_t(nt));
-            ggml_backend_tensor_set(gr.positions, ps.data(), 0,
-                                    sizeof(int32_t) * size_t(nt));
-            ggml_backend_tensor_set(gr.mask, mk.data(), 0, ggml_nbytes(gr.mask));
+            // CHEREZ OBSHCHUJU FUNKCIJU, a ne svoej kopiej - ispravlenie realnogo defekta.
+            //
+            // Zdes stojal urezannyj dublikat set_graph_inputs: on zapolnjal tokeny, pozicii i
+            // masku, no NE mask_swa i NE seq_ids. U qwen3moe okonnoj maski net, poetomu defekt
+            // nikogda ne projavljalsja. U gemma4 DVADCAT PJAT sloev iz tridcati chitajut imenno
+            // mask_swa - i chitali to, chto ostalos v bufere.
+            //
+            // Priznak: odinakovye progony davali to NaN, to konechnye no nevernye chisla. Ja
+            // pol nochi prinimal eto za oshibku v perenose kartochnogo sloja na K tokenov.
+            //
+            // Skorost eto ne menjaet (te zhe operacii nad temi zhe bajtami), no ljuboe
+            // utverzhdenie o KORREKTNOSTI gemma4, poluchennoe cherez vetku --gen do etoj pravki,
+            // nedejstvitelno. Zondy "vse 0,0000%" byli polucheny odnorazovym sravneniem v main,
+            // kotoroe zovjot set_graph_inputs, - oni v sile.
+            //
+            // Odna funkcija na vseh: ona i byla sdelana svobodnoj so slovami "three callers
+            // need identical bytes", i chetvjortyj vyzyvajushchij dolzhen byl zvat ejo, a ne
+            // perepisyvat.
+            set_graph_inputs(gr, h, tk, nt, past, &ps, &mk);
 #ifdef MEMEX_FWD_GPU_EXPERTS
             // The device graphs carry the same two numbers and are aimed by the same call, in
             // the same place. A step aimed on one side only reads the cache at one length and
