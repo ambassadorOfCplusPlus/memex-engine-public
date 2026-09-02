@@ -693,8 +693,15 @@ bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::str
     // ekstent vida ne pokryl by nuzhnyj diapazon.
     {
         const int Wl = cfg_.layer_width > 0 ? cfg_.layer_width : 1;
+        // PO UMOLCHANIJU VKLJUCHENO. Na korotkom kontekste otklyuchaetsja SAMO (kolco ne
+        // men'she kesha - znachit smysla net), poetomu riska tam net po postroeniju. Na
+        // kontekste 5500 izmereno: kesh 1120 pozicij vmesto 5536, karta 2785,1 MiB vmesto
+        // 3647,6, GOLOVA OSTAJOTSJA na meste, i 9,466 tok/s protiv 7,088 bez kolca i 0,581
+        // do vsej etoj raboty. Token sverjen s chisto processornym etalonom na kontekste 1900,
+        // gde perehod cherez granicu kolca dejstvitelno zadejstvovan.
+        // MEMEX_SWA_RING=0 vozvrashchaet staroe povedenie.
         swa_ring_ = getenv("MEMEX_SWA_RING")
-                        ? atoi(getenv("MEMEX_SWA_RING")) != 0 : false;
+                        ? atoi(getenv("MEMEX_SWA_RING")) != 0 : true;
         ring_ = 0;
         if (swa_ring_) {
             int mx = 0;
