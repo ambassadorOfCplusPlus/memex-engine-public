@@ -1143,6 +1143,28 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         ggml_tensor* kq = ggml_mul_mat(c, K, Q);
         ggml_tensor* p = ggml_soft_max_ext(c, kq, t_mask_, kq_scale, 0.0f);
         ggml_tensor* kqv = ggml_mul_mat(c, V, p);
+        // TOCHNOST JADRA VNIMANIJA PRI SHIRINE > 1, i eto ne dogadka, a chtenie dispetchera.
+        //
+        // ggml_vk_mul_mat vybiraet jadro po dst->ne[1]:
+        //     ne[1] == 1  -> mul_mat_vec_p021_f16_f32  (nash kq)   nakoplenie f32
+        //     ne[1] == 1  -> mul_mat_vec_nc_f16_f32    (nash kqv)  nakoplenie f32
+        //     inache      -> ggml_vk_mul_mat_q_f16     obshchij GEMM
+        // Uslovie `dst->ne[1] <= 8 && src1->ne[2]*ne[3] == 1` ne spasaet: u Q tret'ja os - eto
+        // golovy, ih 16. A obshchij GEMM po umolchaniju berjot f16acc-konvejer i perevodit src1
+        // v f16 (a pri integer_dot_product - voobshche v Q8_1).
+        //
+        // Otsjuda i bralos rashozhdenie s etalonom na VSEH strokah pri shirine 2 i 4, kotoroe
+        // vygljadelo kak oshibka perenosa: chetyre gipotezy o forme grafa byli oprovergnuty
+        // bitovo imenno potomu, chto forma byla vernoj - menjalos JADRO.
+        //
+        // GGML_PREC_F32 perevodit vybor na f32acc (ggml_vk_get_mul_mat_mat_pipeline: prec !=
+        // GGML_PREC_DEFAULT -> .f32acc), a dlja f16-vesa s f32-vhodom est otdelnyj
+        // pipeline_matmul_f16_f32.f32acc - to est i vhod ostajotsja f32. Pri W == 1 nichego ne
+        // stavim: tam rabotajut specializirovannye jadra, i put verificirovan kak est.
+        if (W > 1) {
+            ggml_mul_mat_set_prec(kq,  GGML_PREC_F32);
+            ggml_mul_mat_set_prec(kqv, GGML_PREC_F32);
+        }
         // Pri W == 1 eto host's cont_2d(permute(...)) po tem zhe nepreryvnym bajtam. Pri W > 1
         // nuzhen nastojashchij cont - rovno tot, chto stoit v processornom stroitele.
         kqv = (W == 1) ? ggml_reshape_2d(c, kqv, dq, 1)
