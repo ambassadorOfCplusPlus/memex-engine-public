@@ -1598,12 +1598,25 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
     // Vse okonnye sloi u gemma4 imejut ODNO okno (1024), poetomu srez u nih obshchij, i odnoj
     // maski t_mask_sw_ hvataet na vseh. Esli kogda-nibud okna stanut raznymi, eto perestanet
     // byt verno - poetomu nizhe stoit proverka, a ne predpolozhenie.
+    // PLAN SCHITAETSJA I PROVERJAETSJA DO LJUBOJ MUTACII.
+    //
+    // Etot metod dokumentiruet sebja kak "vozvrashchaet false i NICHEGO ne menjaet". Ranshe eto
+    // bylo nepravdoj dlja kolcevogo puti: ohrana perehoda cherez granicu kolca stojala v
+    // SEREDINE cikla perenacelivanija zapisej, i k momentu `return false` chast sloev uzhe byla
+    // perenacelena, maska kolca uzhe perezalita, a t_pos_ i step_past_ ostavalis starymi - to
+    // est nesoglasovannaja smes vmesto "nichego ne izmenilos". Najdeno revju.
+    //
+    // Teper: pervyj prohod tolko SCHITAET srez kazhdogo sloja i proverjaet vsjo, chto mozhet ne
+    // sojtis; vtoroj prohod primenjaet uzhe proverennyj plan i ne mozhet otkazat.
+    std::vector<int> plan_lo(lg_.size(), 0), plan_len(lg_.size(), n_kv);
     int sw_lo = -1, sw_len = 0, sw_win = 0;
-    for (LayerGraph& G : lg_) {
+    for (std::size_t pi = 0; pi < lg_.size(); ++pi) {
+        const LayerGraph& G = lg_[pi];
         int lo = 0, len = n_kv;
         if (G.ring > 0) {
-            // KOLCO: chitaem vsjo kolco s nulja. Do zapolnenija lishnie sloty zakryty maskoj,
-            // kotoruju my zhe i stroim nizhe - hostovaja maska ob raskladke kolca ne znaet.
+            // Zapis shirinoj W ne dolzhna perehodit granicu kolca: odna kopija etogo ne
+            // vyrazhaet. Proverjaem ZDES, do mutacij.
+            if (W > 1 && (n_past % G.ring) + W > G.ring) return false;
             lo = 0;
             len = std::min(G.ring, n_kv > 0 ? GGML_PAD(n_past + W, 32) : G.ring);
             if (len > G.ring) len = G.ring;
@@ -1616,8 +1629,15 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
             lo = (lo / 32) * 32;
             len = n_kv - lo;
             if (sw_lo < 0) { sw_lo = lo; sw_len = len; }
-            else if (sw_lo != lo || sw_len != len) return false;   // raznye okna - ne podderzhano
+            else if (sw_lo != lo || sw_len != len) return false;
         }
+        plan_lo[pi] = lo; plan_len[pi] = len;
+    }
+
+    // Ot etoj stroki i nizhe otkazov byt ne mozhet - vsjo proverено vyshe.
+    for (std::size_t pi = 0; pi < lg_.size(); ++pi) {
+        LayerGraph& G = lg_[pi];
+        const int lo = plan_lo[pi], len = plan_len[pi];
         G.kv_lo = lo; G.kv_len = len;
         G.K->ne[1] = len;    // strides belong to the cache, so only the extent moves
         G.V->ne[0] = len;
@@ -1684,10 +1704,9 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
                 G.V->view_offs = vro;
                 G.V->data = (char*)vc->data + vro;
             }
-            // Pri kolce zapis mozhet perejti granicu, esli graf shirinoj bolshe odnogo tokena
-            // popadjot na konec kolca. Odna kopija etogo ne vyrazhaet, poetomu otkaz - a ne
-            // tihaja zapis mimo.
-            if (G.ring > 0 && W > 1 && (n_past % G.ring) + W > G.ring) return false;
+            // Perehod cherez granicu kolca proverjen v pervom prohode, do mutacij - zdes
+            // otkazyvat nelzja: chast sloev uzhe perenacelena, i vyhod otsjuda ostavil by
+            // nesoglasovannoe sostojanie. Imenno tak i bylo do ispravlenija.
         }
         int32_t pos[16];
         for (int j = 0; j < W; ++j) pos[j] = int32_t(n_past + j);

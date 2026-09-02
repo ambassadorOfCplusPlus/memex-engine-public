@@ -7362,6 +7362,7 @@ int main(int argc, char** argv) {
         std::vector<float> mk;
 
         bool aim_warned = false;
+        int  step_aim_fail = 0;   // otkazy naceliyanija shaga na karte - svoj schjot
         auto set_inputs = [&](Graph& gr, const llama_token* tk, int nt, int past) {
             // Narrow the step to the positions that are actually occupied, rounded up to 32
             // for the F16 matmul's sake. This is where the context-length dependence used to
@@ -7398,9 +7399,19 @@ int main(int argc, char** argv) {
             // The device graphs carry the same two numbers and are aimed by the same call, in
             // the same place. A step aimed on one side only reads the cache at one length and
             // the mask at another, which is a wrong answer rather than an error.
-            if (gr.on_card && gsp && !gsp->set_step(past, want) && !aim_warned) {
-                aim_warned = true;
-                printf("не удалось нацелить шаг на карте: past %d, n_kv %d\n", past, want);
+            if (gr.on_card && gsp && !gsp->set_step(past, want)) {
+                // OTDELNAJA ZASHCHJOLKA i slyshnyj otkaz. Ranshe eto delilo `aim_warned` s
+                // nesvjazannym otkazom aim_kv_reads, tak chto na ves process prihodilos ODNO
+                // soobshchenie, a graf schitalsja vsjo ravno. Otkaz naceljivanija znachit, chto
+                // shag NE naceljen: vyhod posle nego doverija ne stoit, i ob etom nado govorit
+                // kazhdyj raz, a ne odin.
+                ++step_aim_fail;
+                if (step_aim_fail <= 3) {
+                    printf("SHAG NE NACELEN na karte: past %d, n_kv %d - vyhod etogo shaga "
+                           "nedostoveren (otkaz %d)\n", past, want, step_aim_fail);
+                } else if (step_aim_fail == 4) {
+                    printf("SHAG NE NACELEN: dalshe ne pechataju kazhdyj, itog budet nizhe\n");
+                }
             }
 #endif
         };
