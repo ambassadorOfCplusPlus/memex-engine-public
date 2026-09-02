@@ -6842,6 +6842,30 @@ int main(int argc, char** argv) {
     // computation with the keys parked in a cache on the way past. That is deliberate:
     // it means the graph the comparison validates is the SAME graph the generation uses,
     // rather than a second one written for the comparison and never run again.
+    // ODNORAZOVYJ PROHOD PO PROMTU: nuzhen ne vsegda, i eto izmerimo.
+    //
+    // Ego rezultat chitajut ROVNO tri potrebitelja: sverka s etalonom (want_ref), zondy
+    // (--probe) i vetki bez --gen. Pri `--gen --no-ref` ego ne chitaet NIKTO - a stoit on
+    // polnogo prohoda po promtu, to est promt schitaetsja DVAZHDY (zdes i v prefille
+    // harnessa).
+    //
+    // Dokazatelstvo, a ne dogadka: pri `--tokens 16000 --prefill-chunk 512` padenie prishlo
+    // IMENNO otsjuda - "graf ne razmestilsja (n_tokens 16000)", - do kusochnogo prefilla, i
+    // gallocr zaprosil 129 GB. To est etot prohod ne tolko lishnij, no i on odin derzhal
+    // predel dliny konteksta.
+    //
+    // cmp_kv, cmp_ds, logit_row, g i ours dalshe ne ispolzujutsja - proverено poiskom, -
+    // poetomu blok zamknut i ego mozhno ne vypolnjat celikom.
+    // Luchshij token s obeih storon. Objavleny SNARUZHI: kod vozvrata v konce main sravnivaet
+    // ih, i pri propushchennom prohode oba ostajutsja -1, to est ravny - "sravnenija ne bylo"
+    // dajot 0, a ne lozhnoe rashozhdenie.
+    int a_ref = -1, a_our = -1;
+    const bool need_oneshot = want_ref || !probe_name.empty() || n_gen <= 0 || decode_check > 0;
+    if (!need_oneshot) {
+        printf("odnorazovyj prohod po promtu PROPUSHCHEN: pri --gen s --no-ref ego rezultat ne "
+               "chitaet nikto, a stoit on vtorogo prohoda po promtu\n");
+    }
+    if (need_oneshot) {
     Cache cmp_kv;
     DeltaState cmp_ds;
     // Which row of g.logits holds the last token. build() keeps every row; the step
@@ -6916,7 +6940,7 @@ int main(int argc, char** argv) {
     auto argmax = [&](const std::vector<float>& v) {
         return int(std::max_element(v.begin(), v.end()) - v.begin());
     };
-    const int a_ref = argmax(ref), a_our = argmax(ours);
+    a_ref = argmax(ref); a_our = argmax(ours);
     char buf_r[64] = {0}, buf_o[64] = {0};
     llama_token_to_piece(model, a_ref, buf_r, sizeof(buf_r) - 1, 0, true);
     llama_token_to_piece(model, a_our, buf_o, sizeof(buf_o) - 1, 0, true);
@@ -6974,6 +6998,7 @@ int main(int argc, char** argv) {
            a_ref, buf_r, a_our, buf_o, a_ref == a_our ? "совпал" : "РАСХОДЯТСЯ");
     printf("\nвремя префилла: эталон %.0f мс, наш %.0f мс (%d токенов, %d потоков)\n",
            ref_ms, our_ms, n, threads);
+    }   // konec odnorazovogo prohoda po promtu
 
     // ------------------------------------------------------------------------------------
     // Step-by-step decode against the reference.
