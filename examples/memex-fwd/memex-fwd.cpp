@@ -5628,6 +5628,7 @@ int main(int argc, char** argv) {
     // in rather than the arm we happen to imitate.
     bool ref_fa = false;
     int n_predict = 256;           // chat mode's own budget; --gen drives the harness path
+    int pre_chunk = 0;             // --prefill-chunk: 0 znachit odnim grafom, kak bylo
     bool want_ref = true;
     std::string draft_path;
     int draft_max = 0;
@@ -5882,6 +5883,17 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--gpu-static-nohead")) { sopt.nohead = true; }
         else if (!strcmp(a, "--gpu-static-dense")) { sopt.on = true; sopt.layers = true; sopt.dense = true; }
         else if (!strcmp(a, "--gpu-static-width")) { if (want_val(i, a)) sopt.width = atoi(argv[++i]); }
+        // --prefill-chunk N: obrabatyvat promt kuskami po N tokenov vmesto odnogo grafa.
+        //
+        // ZACHEM. Promezhutochnyj kq v prefille imeet formu [n_kv, n_tokens, n_head], to est
+        // rastjot KVADRATICHNO ot dliny promta. Pri 5500 tokenov eto ~2 GB i vlezaet, pri
+        // 16000 - desjatki gigabajt: izmereno, gallocr zaprosil 129 GB i graf ne razmestilsja.
+        // Kuskami po 512 tot zhe 16k trebuet ~0,5 GB.
+        //
+        // Karta v prefille ne uchastvuet po postroeniju (`card` trebuet n_tokens ==
+        // gstat->layer_width(), a v prefille shirina - dlina kuska), tak chto vyverennyj
+        // kartochnyj put eto ne zatragivaet vovse.
+        else if (!strcmp(a, "--prefill-chunk")) { if (want_val(i, a)) pre_chunk = atoi(argv[++i]); }
         // Answered here, and it does nothing but exit zero. It is the queue's startability
         // probe (bench/build_safe.ps1, Test-Startable): a binary that fails to load its DLLs
         // dies before printing anything, with -1073741511 or -1073741515, and every log then
@@ -7327,7 +7339,19 @@ int main(int argc, char** argv) {
                    h.n_layer);
         }
 
+        // SHIRINA GRAFA PREFILLA: ves promt ili kusok. Ostatok idjot svoim grafom - dvuh
+        // grafov hvataet na ljubuju dlinu, i eto chestnee, chem dopolnjat poslednij kusok
+        // fiktivnymi tokenami i zakryvat ih maskoj.
+        const int pre_w = (pre_chunk > 0 && pre_chunk < n) ? pre_chunk : n;
+        const int pre_tail_w = (pre_w < n) ? (n % pre_w) : 0;
+        if (pre_w < n) {
+            printf("prefill kuskami: %d tokenov po %d, ostatok %d - promezhutochnyj kq "
+                   "kvadratichen po SHIRINE KUSKA, a ne po dline promta\n", n, pre_w, pre_tail_w);
+        }
         Graph pre;
+        Graph pre_tail;
+        bool  pre_tail_built = false;
+        bool  rsel_filled = false;
         // Диспетчер по архитектуре вместо жёсткого вызова. Цикл генерации звал build_step
         // напрямую, минуя build_one, который все три архитектуры умеет, - и это была
         // единственная причина, по которой gemma4 не могла генерировать. Необязательные модули
@@ -7337,12 +7361,25 @@ int main(int argc, char** argv) {
             // first generated token - rwarm, not rsplit: with n_tokens > 1 the mask has one
             // row per layer and not per token, so the prefill stays on the unsplit path.
             // gsp too: the prefill's head is the same 748 MiB.
-            ? build_gemma4_step(&pre, buft, h, w4, kv, n, 0, n_kv_max,
+            ? build_gemma4_step(&pre, buft, h, w4, kv, pre_w, 0, n_kv_max,
                                 /*all_logits=*/false, /*keep_probes=*/false, gsp,
                                 rset.get(), /*gx=*/nullptr)
-            : build_step(&pre, buft, h, w, kv, n, 0, n_kv_max, min_experts, expert_thresh,
+            : build_step(&pre, buft, h, w, kv, pre_w, 0, n_kv_max, min_experts, expert_thresh,
                          /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/false,
                          rset.get(), /*gx=*/nullptr, gsp);
+        if (built_pre && pre_tail_w > 0) {
+            pre_tail_built = arch_g4
+                ? build_gemma4_step(&pre_tail, buft, h, w4, kv, pre_tail_w, 0, n_kv_max,
+                                    /*all_logits=*/false, /*keep_probes=*/false, gsp,
+                                    rset.get(), /*gx=*/nullptr)
+                : build_step(&pre_tail, buft, h, w, kv, pre_tail_w, 0, n_kv_max, min_experts,
+                             expert_thresh, /*all_logits=*/false, /*zc=*/nullptr,
+                             /*keep_dbg=*/false, rset.get(), /*gx=*/nullptr, gsp);
+            if (!pre_tail_built) {
+                printf("graf ostatka prefilla (%d tokenov) ne sobralsja\n", pre_tail_w);
+                return 1;
+            }
+        }
         if (!built_pre) {
             printf("граф префилла не собрался\n");
             return 1;
@@ -7433,10 +7470,53 @@ int main(int argc, char** argv) {
         std::vector<double> gaps;
 
         std::vector<llama_token> ours_seq;
-        set_inputs(pre, toks.data(), n, 0);
-        ggml_backend_graph_compute(be, pre.gf);
-        ggml_backend_synchronize(be);
-        ggml_backend_tensor_get(pre.logits, lg.data(), 0, sizeof(float) * size_t(h.n_vocab));
+        // Objavlenie perenesено SJUDA: prohod kuskami sobiraet rsel po kuskam, a ranshe ono
+        // stojalo NIZHE prefilla - tam, gde ego chital tolko blok progreva.
+        std::vector<int32_t> rsel, rres, roth, rmerged;
+        // PROHOD KUSKAMI. Pri pre_w == n eto ROVNO odin kusok, to est byloe povedenie
+        // bajt v bajt: odin graf, odno set_inputs s n_past = 0, odin compute.
+        //
+        // Marshrutizacija dlja progreva rezidentnogo nabora sobiraetsja PO KUSKAM: kazhdyj
+        // kusok vozvrashchaet svoi n_expert_used * cnt identifikatorov, i oni lozhatsja v
+        // rsel po smeshcheniju off. Blok progreva nizhe eto vidit po rsel_filled i ne chitaet
+        // sel_ids zanovo - inache on prochital by tolko poslednij kusok i nazval by ego
+        // vsem promtom.
+        if (rset) rsel.assign(size_t(h.n_layer) * size_t(h.n_expert_used) * size_t(n), 0);
+        for (int off = 0; off < n; off += pre_w) {
+            const int cnt = std::min(pre_w, n - off);
+            Graph& gp = (cnt == pre_w) ? pre : pre_tail;
+            if (!gp.aim_cache_writes(off)) {
+                printf("prefill kuskami: zapis v kesh ne nacelilas na %d\n", off);
+                return 1;
+            }
+            set_inputs(gp, toks.data() + off, cnt, off);
+            ggml_backend_graph_compute(be, gp.gf);
+            ggml_backend_synchronize(be);
+            if (off + cnt >= n) {
+                ggml_backend_tensor_get(gp.logits, lg.data(), 0,
+                                        sizeof(float) * size_t(h.n_vocab));
+            }
+            if (rset && !gp.sel_ids.empty()) {
+                if (int(gp.sel_ids.size()) != h.n_layer) {
+                    printf("prefill kuskami: kusok vernul %zu sloev marshrutizacii vmesto %d\n",
+                           gp.sel_ids.size(), h.n_layer);
+                    return 1;
+                }
+                for (int il = 0; il < h.n_layer; ++il) {
+                    ggml_tensor* t = gp.sel_ids[size_t(il)];
+                    if (ggml_nelements(t) != int64_t(h.n_expert_used) * int64_t(cnt)) {
+                        printf("prefill kuskami: sloj %d vernul %lld id vmesto %d\n", il,
+                               (long long)ggml_nelements(t), h.n_expert_used * cnt);
+                        return 1;
+                    }
+                    ggml_backend_tensor_get(t,
+                        rsel.data() + size_t(il) * size_t(h.n_expert_used) * size_t(n)
+                                    + size_t(off) * size_t(h.n_expert_used),
+                        0, ggml_nbytes(t));
+                }
+                rsel_filled = true;
+            }
+        }
 #ifdef MEMEX_FWD_GPU_EXPERTS
         // The prompt ran on the host, so the card's cache is empty - and an empty cache still
         // produces fluent text, because attention over zeros is attention over something. So
@@ -7456,7 +7536,6 @@ int main(int argc, char** argv) {
         // Scratch for the resident set, allocated once: the residency mask the graph reads and
         // the two id lists it writes back. Sized here so no step allocates.
         std::vector<float> rmask;
-        std::vector<int32_t> rsel, rres, roth, rmerged;
         if (rset) {
             rmask.assign(size_t(h.n_expert) * size_t(h.n_layer), 0.0f);
             rres.assign(size_t(h.n_expert_used), 0);
@@ -7475,17 +7554,22 @@ int main(int argc, char** argv) {
                        "маршрутизации вместо %d\n", pre.sel_ids.size(), h.n_layer);
                 return 1;
             }
-            rsel.assign(size_t(h.n_layer) * size_t(h.n_expert_used) * size_t(n), 0);
-            for (int il = 0; il < h.n_layer; ++il) {
-                ggml_tensor* t = pre.sel_ids[size_t(il)];
-                if (ggml_nelements(t) != int64_t(h.n_expert_used) * int64_t(n)) {
-                    printf("прогрев: слой %d вернул %lld идентификаторов вместо %d\n", il,
-                           (long long)ggml_nelements(t), h.n_expert_used * n);
-                    return 1;
+            // Pri prohode kuskami rsel uzhe sobran po kuskam vyshe. Perechitat ego zdes
+            // znachilo by vzjat TOLKO poslednij kusok i nazvat ego vsem promtom - i nikakoj
+            // oshibki formy pri pre_w == n eto by ne dalo, poetomu proverka po flagu.
+            if (!rsel_filled) {
+                rsel.assign(size_t(h.n_layer) * size_t(h.n_expert_used) * size_t(n), 0);
+                for (int il = 0; il < h.n_layer; ++il) {
+                    ggml_tensor* t = pre.sel_ids[size_t(il)];
+                    if (ggml_nelements(t) != int64_t(h.n_expert_used) * int64_t(n)) {
+                        printf("прогрев: слой %d вернул %lld идентификаторов вместо %d\n", il,
+                               (long long)ggml_nelements(t), h.n_expert_used * n);
+                        return 1;
+                    }
+                    ggml_backend_tensor_get(t,
+                        rsel.data() + size_t(il) * size_t(h.n_expert_used) * size_t(n), 0,
+                        ggml_nbytes(t));
                 }
-                ggml_backend_tensor_get(t,
-                    rsel.data() + size_t(il) * size_t(h.n_expert_used) * size_t(n), 0,
-                    ggml_nbytes(t));
             }
             // MTP: perekrytie naborov ekspertov u sosednih tokenov. Plotnaja model chitaet
             // vesa odin raz na prohod, i mnozhitel raven K. Razrezhennaja MoE - net: kazhdyj iz
