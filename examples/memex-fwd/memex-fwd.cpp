@@ -7453,6 +7453,50 @@ int main(int argc, char** argv) {
                     rsel.data() + size_t(il) * size_t(h.n_expert_used) * size_t(n), 0,
                     ggml_nbytes(t));
             }
+            // MTP: perekrytie naborov ekspertov u sosednih tokenov. Plotnaja model chitaet
+            // vesa odin raz na prohod, i mnozhitel raven K. Razrezhennaja MoE - net: kazhdyj iz
+            // K tokenov idjot v SVOI eksperty, i prohod chitaet OBEDINENIE. rsel uzhe derzhit
+            // top-k marshrutizatora dlja kazhdogo tokena kazhdogo sloja, tak chto eto chistaja
+            // arifmetika po prochitannomu massivu - nikakoj novoj grafy i nikakogo vremeni.
+            if (getenv("MEMEX_MTP_OVERLAP")) {
+                printf("MTP: perekrytie naborov ekspertov u sosednih tokenov\n");
+                printf("  (prefill, %d tokenov, %d sloev, top-k %d iz %d)\n",
+                       n, h.n_layer, h.n_expert_used, h.n_expert);
+                std::vector<uint8_t> seen(size_t(h.n_expert) > 0 ? size_t(h.n_expert) : 1, 0);
+                for (int K = 2; K <= 6; ++K) {
+                    if (n < K) break;
+                    double sum_union = 0.0; long long wins = 0;
+                    for (int il = 0; il < h.n_layer; ++il) {
+                        const int32_t* bs = rsel.data() +
+                            size_t(il) * size_t(h.n_expert_used) * size_t(n);
+                        for (int t = 0; t + K <= n; ++t) {
+                            int u = 0;
+                            for (int j = 0; j < K; ++j)
+                                for (int sx = 0; sx < h.n_expert_used; ++sx) {
+                                    const int32_t id = bs[size_t(t + j) * size_t(h.n_expert_used) + size_t(sx)];
+                                    if (id < 0 || id >= h.n_expert) continue;
+                                    if (!seen[size_t(id)]) { seen[size_t(id)] = 1; ++u; }
+                                }
+                            for (int j = 0; j < K; ++j)
+                                for (int sx = 0; sx < h.n_expert_used; ++sx) {
+                                    const int32_t id = bs[size_t(t + j) * size_t(h.n_expert_used) + size_t(sx)];
+                                    if (id >= 0 && id < h.n_expert) seen[size_t(id)] = 0;
+                                }
+                            sum_union += double(u); ++wins;
+                        }
+                    }
+                    if (!wins) continue;
+                    const double un = sum_union / double(wins);
+                    const double serial = double(K) * double(h.n_expert_used);
+                    printf("  K=%d  obedinenie %6.2f iz %5.1f  bajt na token x%5.3f  "
+                           "potolok uskorenija processornoj poloviny x%5.3f\n",
+                           K, un, serial, un / serial, serial / un);
+                }
+                printf("  VNIMANIE: eto marshrutizacija NASHEGO prompta, a ne sobstvennogo "
+                       "prodolzhenija modeli - populjacii raznye (pravilo 87)\n");
+                printf("  I eto POTOLOK: dolja prinjatyh chernovikov v nego ne vhodit\n");
+            }
+
             // The segment trace, if asked. One ASCII line per segment for the same reason the
             // PROMO_AB line is ASCII: a bench script on this machine cannot carry a Cyrillic
             // match pattern. `phase warm` because the same trace runs over generation below,
@@ -7637,6 +7681,126 @@ int main(int argc, char** argv) {
                        "считается на CPU и слой его не ждёт\n");
             }
 #endif
+        }
+
+        // CENA PROHODA NA K TOKENOV. Vremja ustrojstva ne zavisit ot znachenij (pravilo 73),
+        // poetomu graf mozhno gonjat na hvoste promta. Zapisi idut na pozicii n..n+K-1, i eto
+        // bezopasno: generacija nizhe pishet kazhduju poziciju PERED tem, kak ejo prochitajut.
+        //
+        // CHESTNOST KANALOV. Pri n_tokens > 1 rasshcheplenie rezidentnyh ekspertov otklyuchaetsja
+        // samo, a kartochnyj put sloev rabotaet TOLKO na toj shirine, pod kotoruju sobran
+        // (--gpu-static-width). Stolbec "sloi" govorit, chto bylo v dejstvitelnosti.
+        if (getenv("MEMEX_SPEC_WIDTH")) {
+            const int kmax = std::max(2, atoi(getenv("MEMEX_SPEC_WIDTH")));
+            const int reps = 5;
+            const bool alllog = getenv("MEMEX_SPEC_ALLLOG")
+                              ? atoi(getenv("MEMEX_SPEC_ALLLOG")) != 0 : false;
+            printf("\nCENA PROHODA NA K TOKENOV (chitat OTNOSHENIE k K=1, ne absoljut)\n");
+            double base = 0.0;
+            for (int K = 1; K <= kmax; ++K) {
+                if (n < K || n + K > n_kv_max) { printf("  K=%d: NE IZMERENO\n", K); continue; }
+                Graph g;
+                const bool built = arch_g4
+                    ? build_gemma4_step(&g, buft, h, w4, kv, K, n, n_kv_max, alllog,
+                                        /*keep_probes=*/false, gsp, nullptr, nullptr)
+                    : build_step(&g, buft, h, w, kv, K, n, n_kv_max, min_experts, expert_thresh,
+                                 alllog, nullptr, false, nullptr, nullptr, gsp);
+                if (!built) { printf("  K=%d: graf ne sobralsja - NE IZMERENO\n", K); continue; }
+                std::vector<llama_token> feed(toks.begin() + (n - K), toks.begin() + n);
+                double best = 1e30;
+                for (int r = 0; r < reps; ++r) {
+                    const auto t0 = Clock::now();
+                    set_inputs(g, feed.data(), K, n);
+                    ggml_backend_graph_compute(be, g.gf);
+                    ggml_backend_synchronize(be);
+                    const double msr = ms_since(t0);
+                    if (msr < best) best = msr;
+                }
+                if (K == 1) base = best;
+                const int rows = alllog ? K : 1;
+
+                // KAZHDAJA STROKA ZAVERJAET SEBJA SAMA. Pravilo 73 razreshaet nevernye
+                // ZNACHENIJA, no ne neverno POSTROENNYJ graf: NaN na vyhode znachit, chto graf
+                // mozhet schitat sovsem ne to, chto nazvano, i togda ego vremja tozhe ne to.
+                std::vector<float> wide(size_t(h.n_vocab) * size_t(rows), 0.0f);
+                ggml_backend_tensor_get(g.logits, wide.data(), 0, sizeof(float) * wide.size());
+                {
+                    size_t nan = 0, inf = 0; double ss = 0.0;
+                    for (float q : wide) {
+                        if (std::isnan(q)) { ++nan; continue; }
+                        if (std::isinf(q)) { ++inf; continue; }
+                        ss += double(q) * double(q);
+                    }
+                    if (nan || inf || ss == 0.0) {
+                        printf("  K=%d VYHOD NEGODEN: NaN %zu, Inf %zu, summa kvadratov %.6g - "
+                               "VREMJA NEDOSTOVERNO\n", K, nan, inf, ss);
+                    }
+                }
+                const bool on_card = gsp && gsp->layers_on() && K == gsp->layer_width();
+                if (on_card) {
+                    const std::string f = gsp->failure();
+                    if (!f.empty()) printf("  K=%d: KARTA OTKAZALA: %s\n", K, f.c_str());
+                }
+                char rat[16];
+                if (base > 0.0) snprintf(rat, sizeof(rat), "%5.3f", best / (double(K) * base));
+                else            snprintf(rat, sizeof(rat), "  -  ");
+                printf("  K=%d  prohod %7.2f ms  na token %6.2f ms  otnoshenie %s  sloi %-6s "
+                       "uzlov %d\n", K, best, best / double(K), rat, on_card ? "karta" : "CPU",
+                       ggml_graph_n_nodes(g.gf));
+
+                // NASTOJASHCHIJ ETALON: K odinochnyh shagov protiv odnogo prohoda shiriny K.
+                //
+                // Ranshe ja sravnival kartu s PROCESSORNYM grafom shiriny K i schital ego
+                // etalonom. On im ne javljaetsja: pri n_tokens > 1 ego gonjaet tolko prefill
+                // (n_past = 0, ni odnoj prochitannoj iz kesha pozicii) i build_verify
+                // spekuljativnogo dekodera, kotoryj sam nikogda ne sverjalsja po tokenam.
+                // Sravnivat dva neproverennyh puti i nazyvat raznicu oshibkoj odnogo iz nih -
+                // eto ne izmerenie.
+                //
+                // Odinochnyj shag - drugoe delo: im idjot vsja generacija, i imenno on dajot
+                // 13,89 tok/s. I eto ROVNO uslovie, na kotorom stoit spekuljativnoe
+                // dekodirovanie: esli prohod na K tokenov ne vosproizvodit K shagov, lomaetsja
+                // ne kartochnyj put, a zateja.
+                if (K > 1 && alllog && getenv("MEMEX_SPEC_SEQ")) {
+                    Graph g1;
+                    const bool b1 = arch_g4
+                        ? build_gemma4_step(&g1, buft, h, w4, kv, 1, n, n_kv_max, false,
+                                            false, gsp, nullptr, nullptr)
+                        : build_step(&g1, buft, h, w, kv, 1, n, n_kv_max, min_experts,
+                                     expert_thresh, false, nullptr, false, nullptr, nullptr, gsp);
+                    if (!b1) {
+                        printf("    odinochnyj graf ne sobralsja - NE SVERENO\n");
+                    } else {
+                        std::vector<float> one(size_t(h.n_vocab), 0.0f);
+                        for (int r = 0; r < K; ++r) {
+                            if (!g1.aim_cache_writes(n + r)) {
+                                printf("    shag %d: zapis ne nacelilas - NE SVERENO\n", r);
+                                break;
+                            }
+                            set_inputs(g1, feed.data() + r, 1, n + r);
+                            ggml_backend_graph_compute(be, g1.gf);
+                            ggml_backend_synchronize(be);
+                            ggml_backend_tensor_get(g1.logits, one.data(), 0,
+                                                    sizeof(float) * one.size());
+                            double rn = 0.0, rd = 0.0; size_t bad = 0;
+                            const size_t off = size_t(r) * size_t(h.n_vocab);
+                            for (int t = 0; t < h.n_vocab; ++t) {
+                                const float u = wide[off + size_t(t)], w1 = one[size_t(t)];
+                                if (!std::isfinite(u) || !std::isfinite(w1)) { ++bad; continue; }
+                                const double d = double(u) - double(w1);
+                                rn += d * d; rd += double(w1) * double(w1);
+                            }
+                            printf("    ETALON stroka %d protiv shaga %d: L2 %.4f%%%s\n", r, r,
+                                   rd > 0.0 ? 100.0 * std::sqrt(rn / rd) : -1.0,
+                                   bad ? "  <<< est nekonechnye" : "");
+                        }
+                        g1.free_all();
+                    }
+                }
+                g.free_all();
+            }
+            printf("  OTNOSHENIE k K odinochnym: 1,00 - ekonomii net, 0,50 - prohod vdvoe "
+                   "deshevle\n");
         }
 
         const auto t_gen = Clock::now();
