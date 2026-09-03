@@ -588,8 +588,14 @@ bool read_hparams(const char* path, HParams* h) {
             h->f_router_scale  = 1.0f / std::sqrt(float(h->n_embd));
         }
 
-        // ---- qwen35moe: attention every fourth layer, a gated delta-net in between.
-        if (a == "qwen35moe") {
+        // ---- qwen35moe I qwen3next: vnimanie kazhdyj chetvjortyj sloj, mezhdu nimi
+        // gejted delta-set. Klyuchi u nih ODNI I TE ZHE (a + ".ssm.*",
+        // a + ".full_attention_interval"), poetomu odna vetka na dvoih, a ne kopija.
+        //
+        // Qwen3-Coder-Next: 48 sloev, interval 4 => vnimanie na 3,7,11...47 (12 sloev),
+        // ostalnye 36 delta-set; 512 ekspertov top-10; ssm group_count 16, time_step_rank 32,
+        // state_size 128, inner_size 4096, conv_kernel 4.
+        if (a == "qwen35moe" || a == "qwen3next") {
             h->ssm_d_conv   = key_u32(g, a + ".ssm.conv_kernel", 0);
             h->ssm_d_inner  = key_u32(g, a + ".ssm.inner_size", 0);
             h->ssm_d_state  = key_u32(g, a + ".ssm.state_size", 0);
@@ -959,6 +965,9 @@ struct Qwen35Weights {
         ggml_tensor* ssm_a = nullptr;       // [n_v_heads], holds -exp(A_log): all negative
         ggml_tensor* ssm_beta = nullptr;    // [n_embd, n_v_heads]
         ggml_tensor* ssm_alpha = nullptr;   // [n_embd, n_v_heads]
+        // qwen3next derzhit oba v ODNOM tenzore ssm_ba [n_embd, 2*n_v_heads]. I lezhat oni ne
+        // dvumja polovinami, a PEREMESHANY po gruppam k-golov - sm. razdelenie v stroitele.
+        ggml_tensor* ssm_ba = nullptr;      // [n_embd, 2*n_v_heads] ili null
         ggml_tensor* ssm_norm = nullptr;    // [head_v_dim], the gated output norm
         ggml_tensor* ssm_out = nullptr;     // [value_dim, n_embd]
         // Every layer.
@@ -1090,8 +1099,14 @@ bool collect_qwen35(llama_model* m, const HParams& h, Qwen35Weights* w) {
             L.ssm_conv1d = need(m, p + "ssm_conv1d.weight", &ok);
             L.ssm_dt = need(m, p + "ssm_dt.bias", &ok);
             L.ssm_a = need(m, p + "ssm_a", &ok);          // no .weight suffix in this arch
-            L.ssm_beta = need(m, p + "ssm_beta.weight", &ok);
-            L.ssm_alpha = need(m, p + "ssm_alpha.weight", &ok);
+            // Razdelnye u qwen35moe, slityj u qwen3next. Trebuem RОВНО odno iz dvuh: fajl,
+            // v kotorom net ni togo ni drugogo, dolzhen otkazat gromko, a ne poluchit nol.
+            L.ssm_beta  = llama_get_model_tensor(m, (p + "ssm_beta.weight").c_str());
+            L.ssm_alpha = llama_get_model_tensor(m, (p + "ssm_alpha.weight").c_str());
+            if (!L.ssm_beta || !L.ssm_alpha) {
+                L.ssm_beta = nullptr; L.ssm_alpha = nullptr;
+                L.ssm_ba = need(m, p + "ssm_ba.weight", &ok);
+            }
             L.ssm_norm = need(m, p + "ssm_norm.weight", &ok);
             L.ssm_out = need(m, p + "ssm_out.weight", &ok);
         } else {
@@ -3333,7 +3348,9 @@ static ggml_tensor* qwen35_ffn(ggml_context* c, const HParams& h,
 //     S     = decay*S + v_new (x) k ,  clamped to +-1e6
 static ggml_tensor* qwen35_delta_layer(ggml_context* c, ggml_cgraph* gf, const HParams& h,
                                        const Qwen35Weights::Layer& L, ggml_tensor* st,
-                                       ggml_tensor* seq_ids, ggml_tensor* inp, int n_tokens) {
+                                       ggml_tensor* seq_ids, ggml_tensor* inp, int n_tokens,
+                                       std::vector<std::pair<std::string, ggml_tensor*>>* dn_probes = nullptr,
+                                       int dn_il = -1) {
     const float eps = h.rms_eps;
     const int Sk = h.ssm_d_state;                     // 128, the key/query head width
     const int Hk = h.ssm_n_group;                     // 16 K heads
@@ -3355,9 +3372,50 @@ static ggml_tensor* qwen35_delta_layer(ggml_context* c, ggml_cgraph* gf, const H
 
     // beta and the decay. ssm_a holds -exp(A_log) - every entry in the file is negative -
     // so `gate` comes out negative and exp(gate) lands in (0,1) as a decay must.
-    ggml_tensor* beta = ggml_reshape_4d(c, ggml_mul_mat(c, L.ssm_beta, x), Hv, 1, n_tokens, 1);
-    ggml_tensor* alpha = ggml_reshape_3d(c, ggml_mul_mat(c, L.ssm_alpha, x), Hv, n_tokens, 1);
+    ggml_tensor* beta = nullptr;
+    ggml_tensor* alpha = nullptr;
+    // Zondy vnutri delta-seti stavjatsja tolko po prosbe: kazhdyj iz nih pinit tenzor cherez
+    // ggml_set_output, a eto zapreshchaet gallocr pereispolzovat ego bufer - to est menjaet
+    // razmeshchenie vsego grafa. Pri vykljuchennyh zondah put bajt v bajt tot zhe, chto byl.
+    auto probe = [&](const char* nm, ggml_tensor* t) {
+        if (!dn_probes || !t) return;
+        ggml_set_output(t);
+        dn_probes->push_back({std::string(nm) + "-" + std::to_string(dn_il), t});
+    };
+    if (L.ssm_ba) {
+        // SLITYJ beta|alpha (qwen3next). Razdeljaetsja NE ves, a REZULTAT umnozhenija, i ne
+        // dvumja polovinami: znachenija peremeshany po gruppam k-golov. Uzel v uzel po
+        // etalonu forka (llama-delta-net.cpp, vetka ssm_beta_alpha):
+        //
+        //     mixed = mul_mat(ssm_ba, x)                  [2*Hv, n_tokens]
+        //     r     = reshape_4d(mixed, 2*Hv/Hk, Hk, n_tokens, 1)     [4, 16, n_tok, 1]
+        //     b     = view_4d(r, Hv/Hk, Hk, ...) so smeshcheniem 0
+        //     a     = view_4d(r, Hv/Hk, Hk, ...) so smeshcheniem Hv/Hk elementov
+        //     beta  = cont_4d(b, Hv, 1, n_tokens, 1);  alpha = cont_3d(a, Hv, n_tokens, 1)
+        //
+        // Razdelit VES po smeshcheniju bylo by proshche i NEVERNO: model rabotala by i davala
+        // drugie chisla - rovno tot vid otkaza, na kotorom etot proekt uzhe gorel. Poetomu
+        // zdes povtorjaetsja imenno poriadok etalona.
+        ggml_tensor* mixed = ggml_mul_mat(c, L.ssm_ba, x);
+        const int ba_dim = 2 * Hv / Hk;
+        const int half   = Hv / Hk;
+        ggml_tensor* r = ggml_reshape_4d(c, mixed, ba_dim, Hk, n_tokens, 1);
+        ggml_tensor* bv = ggml_view_4d(c, r, half, Hk, n_tokens, 1,
+                                       r->nb[1], r->nb[2], r->nb[3], 0);
+        ggml_tensor* av = ggml_view_4d(c, r, half, Hk, n_tokens, 1,
+                                       r->nb[1], r->nb[2], r->nb[3],
+                                       std::size_t(half) * ggml_element_size(r));
+        probe("linear_attn_mixed_ba", mixed);
+        beta  = ggml_cont_4d(c, bv, Hv, 1, n_tokens, 1);
+        alpha = ggml_cont_3d(c, av, Hv, n_tokens, 1);
+    } else {
+        beta = ggml_reshape_4d(c, ggml_mul_mat(c, L.ssm_beta, x), Hv, 1, n_tokens, 1);
+        alpha = ggml_reshape_3d(c, ggml_mul_mat(c, L.ssm_alpha, x), Hv, n_tokens, 1);
+    }
+    probe("beta", beta);
+    probe("alpha", alpha);
     ggml_tensor* gate = ggml_mul(c, ggml_softplus(c, ggml_add(c, alpha, L.ssm_dt)), L.ssm_a);
+    probe("gate", gate);
 
     // The state: a convolution window of dconv-1 positions, then the recurrent matrices.
     // Both are views of one slot so that a single pair of copies at the end writes it back.
@@ -3370,6 +3428,9 @@ static ggml_tensor* qwen35_delta_layer(ggml_context* c, ggml_cgraph* gf, const H
     // The causal depthwise convolution over q|k|v, and the new window, in one op. Its output
     // is the convolved values first and the rolling window after them.
     ggml_tensor* conv_raw = ggml_ssm_conv(c, conv_state, qkv, L.ssm_conv1d, seq_ids, nullptr);
+    // Imja - to zhe, chto emitit etalon (llama-delta-net.cpp: cb(x, "conv_output_raw", il)).
+    probe("conv_output_raw", conv_raw);
+    probe("linear_attn_mixed_qkvz", qkv);
     ggml_tensor* y = ggml_silu(c, ggml_view_2d(c, conv_raw, conv_dim, n_tokens,
                                                size_t(conv_dim) * esz, 0));
     const size_t rowq = size_t(conv_dim) * esz;
@@ -3408,7 +3469,15 @@ static ggml_tensor* qwen35_delta_layer(ggml_context* c, ggml_cgraph* gf, const H
     // and type 0 would be head / 2. The reference picks 1 whenever beta and alpha are stored
     // as separate tensors, which is this file. Getting it wrong pairs every V head with the
     // wrong K head and still produces text.
-    res->op_params[0] = 1;
+    // repeat_type: KAK beta i gate razmnozhajutsja po gruppam golov. Etalon peredajot
+    // `l.ssm_beta_alpha ? 0 : 1` (llama-delta-net.cpp:544), to est NOL dlja slitoj raskladki
+    // (qwen3next) i EDINICU dlja razdelnoj (qwen35moe). U nas stojala zhjostkaja edinica.
+    //
+    // Cena oshibki: model rabotala, ne padala i davala pravdopodobnyj tekst, no ssm_output
+    // rashodilsja s etalonom na 14,81% na PERVOM zhe sloe. Nashli zondy: slitoe umnozhenie
+    // (0,53%), alpha (0,76%) i svjortka (0,59%) sovpali, a vyhod net - to est oshibka lezhala
+    // rovno mezhdu svjortkoj i vyhodom, i tam iz kandidatov ostavalas odna eta cifra.
+    res->op_params[0] = L.ssm_ba ? 0 : 1;
 
     const size_t out_elems = size_t(Sv) * size_t(Hv) * size_t(n_tokens);
     ggml_tensor* out = ggml_view_4d(c, res, Sv, Hv, n_tokens, 1, size_t(Sv) * esz,
@@ -3499,7 +3568,8 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
                 return false;
             }
             attn_out = qwen35_delta_layer(c, g->gf, h, L, ds.s[size_t(il)], g->seq_ids,
-                                          cur, n_tokens);
+                                          cur, n_tokens,
+                                          keep_probes ? &g->probes : nullptr, il);
             if (keep_probes) g->probes.push_back({"ssm_output-" + std::to_string(il), attn_out});
         } else {
             const int hd = G.head_dim;
@@ -3969,6 +4039,15 @@ int probe_cb(ggml_tensor* t, bool ask, void* user_data) {
                             n.rfind("ffn_moe_combined-", 0) == 0 ||
                             n.rfind("ffn_norm_2-", 0) == 0 ||
                             n.rfind("ssm_output-", 0) == 0 ||
+                            // Imena VNUTRI delta-seti - te zhe, chto emitit etalon
+                            // (llama-delta-net.cpp: cb(t, "beta", il) i pr.). Bez nih sverka
+                            // vidit tolko ssm_output i govorit "gde-to v delta-seti".
+                            n.rfind("linear_attn_mixed_ba-", 0) == 0 ||
+                            n.rfind("beta-", 0) == 0 ||
+                            n.rfind("alpha-", 0) == 0 ||
+                            n.rfind("gate-", 0) == 0 ||
+                            n.rfind("conv_output_raw-", 0) == 0 ||
+                            n.rfind("linear_attn_mixed_qkvz-", 0) == 0 ||
                             n == "result_norm";
         // Contiguity is not a detail here, it is the difference between a comparison and a
         // fabrication. The capture below is a flat memcpy of ggml_nbytes, so a PERMUTED VIEW
@@ -6133,7 +6212,10 @@ int main(int argc, char** argv) {
     // than on the string, so a typo is a compile error rather than a silently skipped path.
     const bool arch_q3  = h.arch == "qwen3moe";
     const bool arch_g4  = h.arch == "gemma4";
-    const bool arch_q35 = h.arch == "qwen35moe";
+    // qwen3next idjot tem zhe putjom: geometrija i nabor tenzorov sovpadajut, krome slitogo
+    // ssm_ba (razdeljaetsja v stroitele) i otsutstvujushchih tenzorov MTP-golovy, kotorye
+    // etomu putju i ne nuzhny.
+    const bool arch_q35 = h.arch == "qwen35moe" || h.arch == "qwen3next";
 
     // The graphs below are written for named architectures. Running one against another does
     // not fail - it produces confident nonsense, because the tensor names happen to overlap
