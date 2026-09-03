@@ -93,6 +93,13 @@ void prefer_one_submit_per_graph() {
 // drives theta to zero and leaves dimensions 128..511 unrotated. Only gemma4's full-attention
 // layers carry one; qwen3moe has none anywhere. Dropping it does not fail and does not change a
 // shape - it rotates what must not move, which is the worst way for an input to be missing.
+//
+// SLOTY 16..25 - qwen3next, gejted delta-set; 26..29 - ego zhe OBSHCHIJ EKSPERT. Vse
+// neobjazatelnye: na sloe delta-seti pusty wq/wk/wv/wo/q_norm/k_norm, na sloe vnimanija -
+// vsja ssm-polovina. Kakoj slot objazatelen na kakom sloe, reshaet slot_required nizhe, a ne
+// nomer: pravilo "menshe devjati - objazatelen" verno tolko dlja qwen3moe i gemma4.
+constexpr int kSlots = 30;
+
 void layer_slots(const GpuStaticLayer& L, ggml_tensor** out) {
     out[0] = L.attn_norm; out[1] = L.wq; out[2] = L.wk; out[3] = L.wv; out[4] = L.wo;
     out[5] = L.q_norm;    out[6] = L.k_norm; out[7] = L.ffn_norm; out[8] = L.router;
@@ -103,6 +110,20 @@ void layer_slots(const GpuStaticLayer& L, ggml_tensor** out) {
     out[13] = L.ffn_up;          // gemma4 dense half, only with --gpu-static-dense
     out[14] = L.ffn_gate;
     out[15] = L.ffn_down;
+    out[16] = L.wqkv;            // qwen3next delta-net
+    out[17] = L.wqkv_gate;
+    out[18] = L.ssm_conv1d;
+    out[19] = L.ssm_dt;
+    out[20] = L.ssm_a;
+    out[21] = L.ssm_ba;
+    out[22] = L.ssm_beta;
+    out[23] = L.ssm_alpha;
+    out[24] = L.ssm_norm;
+    out[25] = L.ssm_out;
+    out[26] = L.shexp_gate;      // qwen3next shared expert, every layer
+    out[27] = L.gate_shexp;
+    out[28] = L.up_shexp;
+    out[29] = L.down_shexp;
 }
 
 void layer_unslot(GpuStaticLayer& L, ggml_tensor* const* in) {
@@ -115,6 +136,40 @@ void layer_unslot(GpuStaticLayer& L, ggml_tensor* const* in) {
     L.ffn_up         = in[13];
     L.ffn_gate       = in[14];
     L.ffn_down       = in[15];
+    L.wqkv           = in[16];
+    L.wqkv_gate      = in[17];
+    L.ssm_conv1d     = in[18];
+    L.ssm_dt         = in[19];
+    L.ssm_a          = in[20];
+    L.ssm_ba         = in[21];
+    L.ssm_beta       = in[22];
+    L.ssm_alpha      = in[23];
+    L.ssm_norm       = in[24];
+    L.ssm_out        = in[25];
+    L.shexp_gate     = in[26];
+    L.gate_shexp     = in[27];
+    L.up_shexp       = in[28];
+    L.down_shexp     = in[29];
+}
+
+// Objazatelen li slot na etom sloe. Do qwen3next pravilo bylo odno na vsju model - "nomer
+// menshe devjati, krome wv" - i ono verno ROVNO dlja qwen3moe i gemma4. U qwen3next dva roda
+// sloev s neperesekajushchimisja naborami vesov, i chestnoe pravilo objazano ih razlichat:
+// inache libо sloj delta-seti otkazyvaet po otsutstvujushchemu wq, libo propadaet proverka na
+// nedostajushchij ssm_out - a nedostajushchij ves eto ne padenie, eto nol v grafe.
+bool slot_required(int i, bool qwen3next, bool delta) {
+    if (!qwen3next) return i < 9 && i != 3;   // wv neobjazatelen: pjat sloev gemma4 bez nego
+    switch (i) {
+        case 0: case 7: case 8:                       // attn_norm, ffn_norm, marshrutizator
+        case 26: case 27: case 28: case 29:           // obshchij ekspert - na KAZHDOM sloe
+            return true;
+        case 1: case 2: case 3: case 4: case 5: case 6:
+            return !delta;                            // wq, wk, wv, wo, q_norm, k_norm
+        case 16: case 17: case 18: case 19: case 20: case 24: case 25:
+            return delta;                             // ssm-polovina
+        default:
+            return false;                             // ssm_ba libo beta/alpha - proverjaetsja
+    }                                                 // otdelno, eto "odno iz dvuh"
 }
 
 }  // namespace
@@ -368,7 +423,8 @@ void GpuStatic::shutdown() {
     if (ctx_lg_) { ggml_free(ctx_lg_); ctx_lg_ = nullptr; }
     if (buf_lin_) { ggml_backend_buffer_free(buf_lin_); buf_lin_ = nullptr; }
     if (ctx_lin_) { ggml_free(ctx_lin_); ctx_lin_ = nullptr; }
-    t_lx_ = nullptr; t_pos_ = nullptr; t_mask_ = nullptr;
+    t_lx_ = nullptr; t_pos_ = nullptr; t_mask_ = nullptr; t_mask_sw_ = nullptr;
+    t_seq_ = nullptr;
     for (ggml_backend_buffer_t b : bufs_l_) {
         if (b) ggml_backend_buffer_free(b);
     }
@@ -380,6 +436,8 @@ void GpuStatic::shutdown() {
     lw_.clear();
     kv_k_.clear();
     kv_v_.clear();
+    dstate_.clear();
+    dstate_elems_ = 0;
     kv_pad_ = nullptr;
     step_past_ = -1;
     step_nkv_ = 0;
@@ -547,17 +605,20 @@ ggml_tensor* GpuStatic::head(ggml_context* c, ggml_tensor* x) {
 // tot tenzor. Slot za slotom eto i nazovjot.
 bool GpuStatic::verify_layers(const GpuStaticLayer* src, std::string* err) {
     if (!on() || lg_.empty()) { *err = "sloi ne na karte"; return false; }
-    static const char* kNames[16] = {"attn_norm","wq","wk","wv","wo","q_norm","k_norm",
+    static const char* kNames[kSlots] = {"attn_norm","wq","wk","wv","wo","q_norm","k_norm",
                                      "ffn_norm","router","rope_freqs","post_attn_norm",
                                      "gate_inp_s","pre_ffw_norm_2",
-                                     "ffn_up","ffn_gate","ffn_down"};
+                                     "ffn_up","ffn_gate","ffn_down",
+                                     "wqkv","wqkv_gate","ssm_conv1d","ssm_dt","ssm_a",
+                                     "ssm_ba","ssm_beta","ssm_alpha","ssm_norm","ssm_out",
+                                     "shexp_gate","gate_shexp","up_shexp","down_shexp"};
     std::vector<char> tmp;
     int bad = 0, cmp_slots = 0;
     for (int il = 0; il < cfg_.n_layer; ++il) {
-        ggml_tensor* ss[16]; ggml_tensor* dd[16];
+        ggml_tensor* ss[kSlots]; ggml_tensor* dd[kSlots];
         layer_slots(src[std::size_t(il)], ss);
         layer_slots(lw_[std::size_t(il)], dd);
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < kSlots; ++i) {
             if (!ss[i] || !dd[i]) {
                 if ((ss[i] == nullptr) != (dd[i] == nullptr)) {
                     printf("  sloj %2d slot %-15s: odna storona est, drugoj net" "\n", il, kNames[i]);
@@ -591,7 +652,7 @@ bool GpuStatic::verify_layers(const GpuStaticLayer* src, std::string* err) {
     }
     printf("  bajty vesov sloev v videopamjati sovpadajut s modelju: svereno %d slotov"
            " na %d slojah, propushcheno pustyh s oboih storon %d" "\n",
-           cmp_slots, cfg_.n_layer, cfg_.n_layer * 16 - cmp_slots);
+           cmp_slots, cfg_.n_layer, cfg_.n_layer * kSlots - cmp_slots);
     return true;
 }
 
@@ -727,9 +788,28 @@ bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::str
     }
     // rb_ is the pinned readback staging, allocated for a block of logits. The layer output is
     // far smaller, but "far smaller" is an argument and this is a bounds check.
-    if (!rb_ || std::size_t(cfg_.n_vocab) * std::size_t(cfg_.max_rows) <
-                std::size_t(2 * cfg_.n_embd + cfg_.n_expert)) {
-        *err = "bufer zabora menshe vyhoda sloja";
+    if (!rb_) { *err = "bufer zabora ne vydelen"; return false; }
+    {
+        const std::size_t need =
+            (std::size_t(cfg_.out_embd_slots()) * std::size_t(cfg_.n_embd)
+             + std::size_t(cfg_.n_expert)) * std::size_t(cfg_.layer_width > 0
+                                                             ? cfg_.layer_width : 1);
+        const std::size_t have =
+            std::max(std::size_t(cfg_.n_vocab) * std::size_t(cfg_.max_rows),
+                     std::size_t(3 * cfg_.n_embd + cfg_.n_expert)
+                         * std::size_t(cfg_.layer_width > 0 ? cfg_.layer_width : 1));
+        if (have < need) { *err = "bufer zabora menshe vyhoda sloja"; return false; }
+    }
+    // ODIN TOKEN, i eto ne ogranichenie realizacii, a to, chto umeet karta: shejder
+    // ggml_delta_net na Vulkan sveren i podderzhan TOLKO dlja odnogo tokena i odnoj
+    // posledovatelnosti (STATE.md, shag 3a), a poriadok l2_norm i perestanovki v sloe
+    // delta-seti pri shirine > 1 drugoj. Otkaz vsluh vmesto tihogo neverja.
+    if (cfg_.qwen3next_block && cfg_.layer_width != 1) {
+        char m[220];
+        snprintf(m, sizeof(m),
+                 "qwen3next na karte: shirina sloja %d, a DELTA_NET na Vulkan sveren tolko na "
+                 "odnom tokene - OTKAZ", cfg_.layer_width);
+        *err = m;
         return false;
     }
     // NE DAT DRAJVERU PODLOZHIT SISTEMNUJU PAMJAT. Izmereno na kontekste 5500: kesh s golovoj
@@ -810,6 +890,23 @@ bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::str
         step_nkv_  = 0;
         st_ = GpuStaticStats();
     }
+    // CHTO IMENNO LEZHIT NA KARTE, po rodam - a ne odna summa. Summa ne otlichaet "36 sloev
+    // delta-seti s sostojaniem" ot "48 keshej, iz kotoryh 36 nikto ne prochtjot", a raznica
+    // mezhdu nimi - tri chetverti pamjati ustrojstva.
+    if (cfg_.qwen3next_block) {
+        int n_delta = delta_layers();
+        int n_attn  = cfg_.n_layer - n_delta;
+        std::size_t kvb = 0;
+        for (int il = 0; il < cfg_.n_layer; ++il) {
+            if (kv_k_[std::size_t(il)]) kvb += ggml_nbytes(kv_k_[std::size_t(il)]);
+            if (kv_v_[std::size_t(il)]) kvb += ggml_nbytes(kv_v_[std::size_t(il)]);
+        }
+        printf("qwen3next na karte: %d sloev delta-seti (sostojanie %.1f MiB, %.2f MiB na "
+               "sloj) i %d sloev vnimanija (KV %.1f MiB na %d pozicij)\n",
+               n_delta, double(std::size_t(n_delta) * dstate_elems_ * sizeof(float)) / 1048576.0,
+               double(dstate_elems_ * sizeof(float)) / 1048576.0,
+               n_attn, double(kvb) / 1048576.0, cfg_.n_kv_max);
+    }
     for (const GpuStaticBuffer& b : bufs_info_) {
         GpuExperts::print_placement(b.what.c_str(), b.bytes);
     }
@@ -856,20 +953,23 @@ bool GpuStatic::layer_bytes(const GpuStaticLayer* src, std::vector<std::size_t>*
     for (int il = 0; il < nl; ++il) {
         const GpuStaticGeom gk = cfg_.at(il);
         const int rr = ring_of(il);
-        const std::size_t kv_one = padded(std::size_t(ggml_type_size(GGML_TYPE_F16)) *
-                                          std::size_t(gk.head_dim) *
-                                          std::size_t(rr > 0 ? rr : cfg_.n_kv_max) *
-                                          std::size_t(gk.n_head_kv));
-        ggml_tensor* s[16];
+        // U sloja delta-seti KV net vovse - u nego perenosimoe sostojanie postojannogo razmera.
+        // Odin razmer na vse sloi vydelil by 48 keshej tam, gde nuzhno 12, i 36 iz nih nikto
+        // by ne prochjol: eto ne oshibka formy, eto tri chetverti pamjati karty vpustuju.
+        const std::size_t kv_one = gk.delta ? 0
+            : padded(std::size_t(ggml_type_size(GGML_TYPE_F16)) *
+                     std::size_t(gk.head_dim) *
+                     std::size_t(rr > 0 ? rr : cfg_.n_kv_max) *
+                     std::size_t(gk.n_head_kv));
+        ggml_tensor* s[kSlots];
         layer_slots(src[std::size_t(il)], s);
         std::size_t b = 0;
-        for (int i = 0; i < 16; ++i) {
-            // Slots 9..12 are optional by design; slot 3 (wv) is optional because five of Gemma's
-            // layers ship no attn_v and take V from the raw K projection instead.
-            if (!s[i] && (i >= 9 || i == 3)) continue;
+        for (int i = 0; i < kSlots; ++i) {
+            if (!s[i] && !slot_required(i, cfg_.qwen3next_block, gk.delta)) continue;
             if (!s[i]) {
                 char m[160];
-                snprintf(m, sizeof(m), "sloj %d: ne hvataet tenzora vnimanija #%d", il, i);
+                snprintf(m, sizeof(m), "sloj %d: ne hvataet tenzora #%d (%s)", il, i,
+                         gk.delta ? "delta-set" : "vnimanie");
                 *err = m;
                 return false;
             }
@@ -887,7 +987,22 @@ bool GpuStatic::layer_bytes(const GpuStaticLayer* src, std::vector<std::size_t>*
             }
             b += padded(ggml_nbytes(s[i]));
         }
+        // Odno iz dvuh: slitoe ssm_ba (qwen3next) libo razdelnye beta/alpha (qwen35moe).
+        // repeat_type u ggml_delta_net vybiraetsja imenno po etomu priznaku, i propushchennaja
+        // proverka zdes oznachala by nol v grafe vmesto vesa - to est rabotajushchij nevernyj
+        // otvet, rovno lovushka 7.1.
+        if (gk.delta) {
+            const GpuStaticLayer& S = src[std::size_t(il)];
+            if (!S.ssm_ba && !(S.ssm_beta && S.ssm_alpha)) {
+                char m[160];
+                snprintf(m, sizeof(m),
+                         "sloj %d: net ni slitogo ssm_ba, ni pary ssm_beta/ssm_alpha", il);
+                *err = m;
+                return false;
+            }
+        }
         b += 2 * kv_one;
+        if (gk.delta) b += padded(cfg_.delta_state_elems() * sizeof(float));
         (*per)[std::size_t(il)] = b;
         total += b;
     }
@@ -950,6 +1065,8 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
     lw_.assign(std::size_t(nl), GpuStaticLayer());
     kv_k_.assign(std::size_t(nl), nullptr);
     kv_v_.assign(std::size_t(nl), nullptr);
+    dstate_.assign(std::size_t(nl), nullptr);
+    dstate_elems_ = cfg_.qwen3next_block ? cfg_.delta_state_elems() : 0;
 
     for (std::size_t gi = 0; gi < n_groups; ++gi) {
         const int l0 = first[gi], l1 = first[gi + 1];
@@ -963,17 +1080,17 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
         // davai rovno 74400 bajt na gruppu v vosemnadcat sloev, a trebovalos 74464 - i otkaz byl
         // ne diagnostiruemyj: ggml_new_object vozvrashchaet nol posredi razmeshchenija, a padaet
         // potom i v drugom meste, s narusheniem dostupa i bez edinogo soobshchenija.
-        const std::size_t n_t = std::size_t(l1 - l0) * 16 + 8;
+        const std::size_t n_t = std::size_t(l1 - l0) * (kSlots + 3) + 8;
         ggml_init_params ip = {ggml_tensor_overhead() * n_t + 4096, nullptr, true};
         ggml_context* cx = ggml_init(ip);
         if (!cx) { *err = "ggml_init dlja vesov sloev ne udalsja"; return false; }
         ctxs_l_[gi] = cx;
 
         for (int il = l0; il < l1; ++il) {
-            ggml_tensor* ss[16];
-            ggml_tensor* dd[16] = {nullptr};
+            ggml_tensor* ss[kSlots];
+            ggml_tensor* dd[kSlots] = {nullptr};
             layer_slots(src[std::size_t(il)], ss);
-            for (int i = 0; i < 16; ++i) {
+            for (int i = 0; i < kSlots; ++i) {
                 if (!ss[i]) { dd[i] = nullptr; continue; }   // optional slot
                 dd[i] = ggml_new_tensor(cx, ss[i]->type, GGML_MAX_DIMS, ss[i]->ne);
                 char nm[64];
@@ -992,6 +1109,17 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
             // odin razmer na vse sloi vydelil by libo chetvert nuzhnogo, libo vchetvero bolshe -
             // i pervoe ne dalo by nikakoj oshibki formy, prosto nevernyj otvet.
             const GpuStaticGeom gk = cfg_.at(il);
+            if (gk.delta) {
+                // Ni K, ni V: u etogo sloja net kesha. Vmesto nih - okno svjortki i matrica
+                // sostojanija odnim nepreryvnym tenzorom, tochno takim zhe po forme, kak u
+                // hostovogo DeltaState, chtoby posle prefilla ego mozhno bylo podnjat kak est.
+                dstate_[std::size_t(il)] = ggml_new_tensor_2d(
+                    cx, GGML_TYPE_F32, int64_t(dstate_elems_), 1);
+                char nm[64];
+                snprintf(nm, sizeof(nm), "vk.blk%d.dstate", il);
+                ggml_set_name(dstate_[std::size_t(il)], nm);
+                continue;
+            }
             const int rr = ring_of(il);
             const int64_t kvlen = rr > 0 ? rr : cfg_.n_kv_max;
             kv_k_[std::size_t(il)] = ggml_new_tensor_3d(cx, GGML_TYPE_F16, gk.head_dim,
@@ -1042,11 +1170,11 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
 
         // In pieces, so the driver is never asked for a staging buffer the size of a tensor.
         for (int il = l0; il < l1; ++il) {
-            ggml_tensor* ss[16];
-            ggml_tensor* dd[16];
+            ggml_tensor* ss[kSlots];
+            ggml_tensor* dd[kSlots];
             layer_slots(src[std::size_t(il)], ss);
             layer_slots(lw_[std::size_t(il)], dd);
-            for (int i = 0; i < 16; ++i) {
+            for (int i = 0; i < kSlots; ++i) {
                 if (!ss[i] || !dd[i]) continue;   // optional slot, see layer_slots
                 const std::size_t need = ggml_nbytes(ss[i]);
                 const char* sp = (const char*)ss[i]->data;
@@ -1112,6 +1240,18 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
     // pjat polnyh s 16/2 po 512, s raznym osnovaniem povorota i masshtabom softmax. cfg_.at(il)
     // otdajot skaljary, kogda vektor pust, tak chto put qwen3moe ne izmenilsja ni na bajt.
     int sections[GGML_MROPE_SECTIONS] = {0};
+    // SEKCII MROPE. Do qwen3next zdes stojal nol vo vseh chetyrjoh, i eto rabotalo rovno
+    // potomu, chto u qwen3moe rope_type ne MROPE i vetka s sekcijami ne berjotsja vovse.
+    // U qwen3next sekcii {11,11,10,0}, ih udvoennaja summa i est n_rot 64 iz head_dim 256, i
+    // ggml_rope_multi s nuljami ne prosto dast drugoj otvet - on OTKAZHET utverzhdeniem
+    // (ggml.c:21050 trebuet hotja by odnu polozhitelnuju sekciju).
+    for (int i = 0; i < 4 && i < GGML_MROPE_SECTIONS; ++i) sections[i] = cfg_.rope_sections[i];
+    // CHETYRE POZICII NA TOKEN pri mnogomernom rope: ggml_rope_multi trebuet
+    // `a->ne[2] * 4 == b->ne[0]`. S odnoj poziciej na token postroenie grafa padaet na etom
+    // utverzhdenii do pervogo tokena - imenno tak eto i bylo najdeno v processornom stroitele.
+    const int pos_per_token =
+        (cfg_.rope_type & GGML_ROPE_TYPE_MROPE) || (cfg_.rope_type & GGML_ROPE_TYPE_IMROPE)
+            ? 4 : 1;
 
     // The per-step inputs. Small, so they land in the BAR window, which is exactly where a
     // host-written input wants to be: ggml_vk_buffer_write takes the plain memcpy branch when
@@ -1132,11 +1272,17 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
     }
     if (swa_cap == 0) swa_cap = cfg_.n_kv_max;
     {
-        ggml_init_params ip = {ggml_tensor_overhead() * 8 + 4096, nullptr, true};
+        ggml_init_params ip = {ggml_tensor_overhead() * 12 + 4096, nullptr, true};
         ctx_lin_ = ggml_init(ip);
         if (!ctx_lin_) { *err = "ggml_init dlja vhodov sloja ne udalsja"; return false; }
         t_lx_   = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_F32, ne, W);
-        t_pos_  = ggml_new_tensor_1d(ctx_lin_, GGML_TYPE_I32, W);
+        t_pos_  = ggml_new_tensor_1d(ctx_lin_, GGML_TYPE_I32, W * pos_per_token);
+        if (cfg_.qwen3next_block) {
+            // Karta posledovatelnostej dlja ggml_ssm_conv. Vsegda nol - odna posledovatelnost, -
+            // no lezhat ona objazana v pisuemom bufere: chuzhoj musor v nej adresuet chuzhoj slot.
+            t_seq_ = ggml_new_tensor_2d(ctx_lin_, GGML_TYPE_I32, 1, W);
+            ggml_set_name(t_seq_, "vk.layer.seq");
+        }
         // Strok u maski - vyravnennoe chislo, a ne rovno W. Trebovanie GGML_KQ_MASK_PAD
         // otnositsja k flash-attention, a ne k soft_max_ext (tam tolko mask->ne[1] >= a->ne[1]),
         // no shejder mozhet chitat masku blokami, i lishnie stroki nichego ne stojat: eto
@@ -1151,6 +1297,10 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         ggml_set_name(t_mask_, "vk.layer.mask");
         buf_lin_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_lin_, buft_);
         if (!buf_lin_) { *err = "vhodnoj bufer sloja ne vydelilsja"; return false; }
+        if (t_seq_) {
+            std::vector<int32_t> z(std::size_t(W), 0);
+            ggml_backend_tensor_set(t_seq_, z.data(), 0, z.size() * sizeof(int32_t));
+        }
     }
 
     // Zapas uzlov na sloj. U bloka gemma4 ih bolshe: norma mezhdu wo i ostatkom, dve pre-normy
@@ -1163,7 +1313,14 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
     // eshchjo i v cont - to est uzlov stanovitsja bolshe, i zapas objazan eto uchest. Otkaz
     // ggml_new_object ne diagnostiruem (vozvrashchaet nol posredi postroenija, padaet potom i v
     // drugom meste), poetomu luchshe pereplatit pamjatju na deskriptory.
-    const std::size_t nodes = (cfg_.gemma_block ? (cfg_.dense_ffn ? 96 : 72) : 48)
+    // U qwen3next sloj delta-seti - okolo tridcati uzlov (svjortka, dve l2-normy, softplus,
+    // delta-set, dve zapisi sostojanija, gejtovannaja norma) plus obshchij ekspert (chetyre
+    // umnozhenija) plus marshrutizator; sloj vnimanija - stolko zhe, no s dvojnoj wq, gejtom i
+    // KV. Zapas s izbytkom: otkaz ggml_new_object NE diagnostiruem - on vozvrashchaet nol
+    // posredi postroenija, a padaet potom, v drugom meste i bez soobshchenija.
+    const std::size_t nodes = (cfg_.qwen3next_block ? 112
+                                                    : (cfg_.gemma_block
+                                                           ? (cfg_.dense_ffn ? 96 : 72) : 48))
                             + (W > 1 ? 16 : 0);
     ggml_init_params ip = {
         (ggml_tensor_overhead() * (nodes + 24) + ggml_graph_overhead_custom(nodes, false))
@@ -1189,6 +1346,16 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
         GpuStaticLayer& L = lw_[std::size_t(il)];
         sites_[std::size_t(il)].self = this;
         sites_[std::size_t(il)].il = il;
+
+        // qwen3next - SVOJ blok celikom, a ne vetka vnutri etogo. Dva roda sloev s
+        // neperesekajushchimisja naborami vesov, dvojnaja wq s gejtom, chastichnyj rope po
+        // sekcijam i perenosimoe sostojanie vmesto kesha: obshchego s blokom nizhe u nego
+        // ostajotsja rovno hvost (ffn_norm i marshrutizator), i vpletat ego vetkami znachilo by
+        // pravit put, kotoryj uzhe sveren na trjoh modeljah.
+        if (cfg_.qwen3next_block) {
+            if (!build_next_layer(c, il, nodes, err)) return false;
+            continue;
+        }
 
         // Node for node the host's own qwen3moe decode block, in the host's own order, with
         // two families of node removed. Both removals are counted rather than assumed, because
@@ -1504,69 +1671,323 @@ bool GpuStatic::build_layer_graphs(std::string* err) {
                 fflush(stderr); }
         }
 
-        ggml_gallocr_t ga = ggml_gallocr_new(buft_);
-        if (!ga || !ggml_gallocr_reserve(ga, gf) || !ggml_gallocr_alloc_graph(ga, gf)) {
-            if (ga) ggml_gallocr_free(ga);
-            *err = "graf sloja ne razmestilsja";
-            return false;
-        }
-        // Every node, asked of the backend that is going to run it. A type with no pipeline
-        // aborts inside the backend rather than returning an error, so it has to be refused
-        // here - at init, before any token.
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            ggml_tensor* node = ggml_graph_node(gf, i);
-            if (ggml_backend_supports_op(be_, node)) continue;
-            char b[256];
-            snprintf(b, sizeof(b),
-                     "bekend Vulkan ne podderzhivaet %s nad %s na sloe %d - vnimanie na kartu "
-                     "polozhit nelzja", ggml_op_name(node->op),
-                     node->src[0] ? ggml_type_name(node->src[0]->type) : "?", il);
-            ggml_gallocr_free(ga);
-            *err = b;
-            return false;
-        }
-        G.gf = gf;  G.ga = ga;  G.out = out;
+        G.out = out;
         G.o_res = ffn_inp; G.o_xf = xf; G.o_rl = rl; G.o_xm = xm;
         G.kdst = kdst; G.vdst = vdst; G.kcpy = kcpy; G.vcpy = vcpy;
         G.K = K; G.V = V; G.kq = kq; G.probs = p;
-        G.mapped = nullptr;
-        G.mapped_probed = false;
-        // COUNTED, ONCE, BECAUSE THIS IS THE PRICE OF THE CROSSING - AND COUNTED TWICE OVER,
-        // because only one of the two counts is priced at 7.2 us.
-        //
-        // The device spends 0.467 ms per crossing on a layer whose weights are 10.6 MB; at
-        // this card's 131 GB/s the bytes are worth 0.081 ms. The rest is launch, and launch
-        // is priced per DISPATCH: measured as a slope, 38 nodes -> 29 moved the device time
-        // 0.683 -> 0.618, i.e. 7.2 us, with submits per graph unchanged at 2.00.
-        //
-        // ggml_graph_n_nodes is NOT the dispatch count. It counts RESHAPE and VIEW nodes, and
-        // the Vulkan backend does not dispatch those: ggml_vk_is_empty (ggml-vulkan.cpp:10333)
-        // returns true for NONE / RESHAPE / VIEW / PERMUTE / TRANSPOSE and graph_compute skips
-        // the node entirely. They cost a loop iteration, not a launch. The nine nodes whose
-        // removal produced the 7.2 us slope were all real - four rms_norm+mul pairs folded into
-        // fused_rms_norm, four ggml_cont that are pure reshapes for a single token - so the
-        // slope is a per-dispatch price and multiplying it by 29 overstates the launch item.
-        //
-        // Separately, and worth not confusing with this: the eight-node MoE tail in
-        // memex-fwd.cpp's build_step is a HOST budget. Different nodes, different price, and
-        // cutting it does not move this number at all.
-        if (il == 0) {
-            int total = ggml_graph_n_nodes(gf);
-            int disp = 0;
-            for (int i = 0; i < total; ++i) {
-                ggml_tensor* n = ggml_graph_node(gf, i);
-                const bool empty = ggml_is_empty(n) || n->op == GGML_OP_NONE ||
-                                   n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW ||
-                                   n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE;
-                if (!empty) ++disp;
-            }
-            printf("  graf sloja: %d uzlov, iz nih %d dispatchej (%d reshape/view bekend "
-                   "propuskaet); pri 7.2 us na dispatch eto %.3f ms zapuska iz kazhdogo "
-                   "peresechenija\n",
-                   total, disp, total - disp, 0.0072 * double(disp));
-        }
+        if (!finish_layer_graph(il, gf, G, err)) return false;
     }
     return true;
+}
+
+// Hvost postroenija odnogo sloja, obshchij dlja oboih blokov: razmestit graf i sprosit bekend
+// o KAZHDOM uzle. Vopros ne formalnyj - tip bez konvejera na Vulkan ne vozvrashchaet oshibku,
+// on padaet vnutri bekenda, tak chto otkaz objazan prozvuchat zdes, do pervogo tokena.
+bool GpuStatic::finish_layer_graph(int il, ggml_cgraph* gf, LayerGraph& G, std::string* err) {
+    ggml_gallocr_t ga = ggml_gallocr_new(buft_);
+    if (!ga || !ggml_gallocr_reserve(ga, gf) || !ggml_gallocr_alloc_graph(ga, gf)) {
+        if (ga) ggml_gallocr_free(ga);
+        *err = "graf sloja ne razmestilsja";
+        return false;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor* node = ggml_graph_node(gf, i);
+        if (ggml_backend_supports_op(be_, node)) continue;
+        char b[320];
+        snprintf(b, sizeof(b),
+                 "bekend Vulkan ne podderzhivaet %s nad %s na sloe %d (uzel %d iz %d) - sloj "
+                 "na kartu polozhit nelzja, i tihogo otkata na CPU vnutri sloja net",
+                 ggml_op_name(node->op),
+                 node->src[0] ? ggml_type_name(node->src[0]->type) : "?", il, i,
+                 ggml_graph_n_nodes(gf));
+        ggml_gallocr_free(ga);
+        *err = b;
+        return false;
+    }
+    G.gf = gf;
+    G.ga = ga;
+    G.mapped = nullptr;
+    G.mapped_probed = false;
+    // COUNTED, ONCE PER ROD SLOJA, BECAUSE THIS IS THE PRICE OF THE CROSSING.
+    //
+    // ggml_graph_n_nodes is NOT the dispatch count. It counts RESHAPE and VIEW nodes, and the
+    // Vulkan backend does not dispatch those: ggml_vk_is_empty returns true for
+    // NONE / RESHAPE / VIEW / PERMUTE / TRANSPOSE and graph_compute skips the node entirely.
+    // They cost a loop iteration, not a launch. Pri 7,2 mks na dispatch (izmereno naklonom:
+    // 38 uzlov -> 29 sdvinulo vremja ustrojstva 0,683 -> 0,618) eto i est cena zapuska.
+    //
+    // Dva roda sloev u qwen3next pechatajutsja OTDELNO: u delta-seti i u vnimanija raznye uzly
+    // i raznoe ih chislo, i odna stroka na oba nazvala by chislo, kotorogo net ni u odnogo.
+    static bool said_attn = false, said_delta = false;
+    bool& said = G.delta ? said_delta : said_attn;
+    if (!said) {
+        said = true;
+        int total = ggml_graph_n_nodes(gf);
+        int disp = 0;
+        for (int i = 0; i < total; ++i) {
+            ggml_tensor* n = ggml_graph_node(gf, i);
+            const bool empty = ggml_is_empty(n) || n->op == GGML_OP_NONE ||
+                               n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW ||
+                               n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE;
+            if (!empty) ++disp;
+        }
+        printf("  graf sloja (%s, sloj %d): %d uzlov, iz nih %d dispatchej (%d reshape/view "
+               "bekend propuskaet); pri 7.2 us na dispatch eto %.3f ms zapuska iz kazhdogo "
+               "peresechenija\n",
+               G.delta ? "delta-set" : "vnimanie", il, total, disp, total - disp,
+               0.0072 * double(disp));
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------
+// qwen3next: sloj gejted delta-seti i sloj vnimanija, oba celikom na karte
+// ---------------------------------------------------------------------------------------
+//
+// POCHEMU ETO OTDELNAJA FUNKCIJA, a ne vetka vnutri bloka vyshe. U etoj arhitektury DVA roda
+// sloev s neperesekajushchimisja naborami vesov: 36 sloev delta-seti (wqkv, wqkv_gate, ssm_*)
+// i 12 sloev vnimanija (wq dvojnoj shiriny s gejtom, wk, wv, wo, q_norm, k_norm). Obshchego u
+// nih rovno tri veshchi - attn_norm na vhode, ffn_norm s marshrutizatorom na vyhode i OBSHCHIJ
+// EKSPERT, kotoryj schitaetsja na kazhdom sloe i kazhdom tokene.
+//
+// ARIFMETICHESKIJ ETALON - qwen35_delta_layer i vetka vnimanija build_qwen35_step v
+// memex-fwd.cpp. Zdes povtorjaetsja UZEL V UZEL: ljuboe rashozhdenie - eto rashozhdenie s NIMI,
+// i iskat ego nado sravneniem dvuh, a ne razmyshleniem. Dva mesta, gde odna i ta zhe forma
+// dajot dva raznyh otveta, uzhe stoili etomu proektu po dnju kazhdoe:
+//
+//   - repeat_type u ggml_delta_net: NOL dlja slitogo ssm_ba (qwen3next) i EDINICA dlja
+//     razdelnyh beta/alpha. Model rabotaet i pri nevernom, i dajot pravdopodobnyj tekst.
+//   - polovina wq: 256 zaprosa i 256 gejta CHEREDUJUTSJA PO GOLOVE, a ne lezhat dvumja
+//     nepreryvnymi polovinami. Vtoroe chtenie beryot zaprosy pervyh vosmi golov i ih gejty i
+//     nazyvaet ih shestnadcatju zaprosami.
+//
+// CHEGO ZDES NET, i eto namerenno: obshchij ekspert vozvrashchaetsja hostu UZHE umnozhennym na
+// svoj sigmoid, no NE slozhennym s ostatkom. Slozhenie idjot na hoste v tom zhe porjadke, chto v
+// qwen35_ffn (ostatok k marshrutiziruemoj polovine, potom obshchij ekspert): eto dva slozhenija
+// po 2048 chisel, i vtoroj dispatch na kartu radi nih stoil by 48 krugovyh obmenov na token.
+bool GpuStatic::build_next_layer(ggml_context* c, int il, std::size_t nodes, std::string* err) {
+    const GpuStaticGeom gm = cfg_.at(il);
+    const int W  = cfg_.layer_width > 0 ? cfg_.layer_width : 1;
+    const float eps = cfg_.rms_eps;
+    LayerGraph& G = lg_[std::size_t(il)];
+    GpuStaticLayer& L = lw_[std::size_t(il)];
+    G.delta = gm.delta;
+    G.n_swa = 0;
+    G.ring  = 0;
+
+    ggml_cgraph* gf = ggml_new_graph_custom(c, nodes, false);
+    ggml_tensor* cur = t_lx_;
+    ggml_tensor* attn_out = nullptr;
+    ggml_tensor* kcpy = nullptr;
+    ggml_tensor* vcpy = nullptr;
+
+    if (gm.delta) {
+        const int Sk = cfg_.ssm_d_state;                  // 128, shirina golovy k i q
+        const int Hk = cfg_.ssm_n_group;                  // 16 K-golov
+        const int Hv = cfg_.ssm_dt_rank;                  // 32 V-golovy
+        const int Sv = cfg_.ssm_d_inner / Hv;             // 128, shirina golovy v
+        const int key_dim  = Sk * Hk;                     // 2048
+        const int val_dim  = Sv * Hv;                     // 4096
+        const int conv_dim = key_dim * 2 + val_dim;       // 8192
+        const int dconv    = cfg_.ssm_d_conv;             // 4
+        const int conv_state_dim = (dconv - 1) * conv_dim;
+        const int ssm_state_dim  = Sv * Sv * Hv;
+        const std::size_t esz = sizeof(float);
+        ggml_tensor* st = dstate_[std::size_t(il)];
+        if (!st || !t_seq_) { *err = "sloj delta-seti bez sostojanija na karte"; return false; }
+
+        ggml_tensor* x = lnorm(c, cur, L.attn_norm, eps);
+        ggml_tensor* qkv = ggml_mul_mat(c, L.wqkv, x);        // [conv_dim, W]
+        ggml_tensor* z   = ggml_mul_mat(c, L.wqkv_gate, x);   // [val_dim, W]
+
+        ggml_tensor* beta = nullptr;
+        ggml_tensor* alpha = nullptr;
+        if (L.ssm_ba) {
+            // SLITYJ beta|alpha. Razdeljaetsja NE ves, a REZULTAT umnozhenija, i ne dvumja
+            // polovinami: znachenija peremeshany po gruppam k-golov. Uzel v uzel po etalonu.
+            ggml_tensor* mixed = ggml_mul_mat(c, L.ssm_ba, x);
+            const int ba_dim = 2 * Hv / Hk;
+            const int half   = Hv / Hk;
+            ggml_tensor* r = ggml_reshape_4d(c, mixed, ba_dim, Hk, W, 1);
+            ggml_tensor* bv = ggml_view_4d(c, r, half, Hk, W, 1,
+                                           r->nb[1], r->nb[2], r->nb[3], 0);
+            ggml_tensor* av = ggml_view_4d(c, r, half, Hk, W, 1,
+                                           r->nb[1], r->nb[2], r->nb[3],
+                                           std::size_t(half) * ggml_element_size(r));
+            beta  = ggml_cont_4d(c, bv, Hv, 1, W, 1);
+            alpha = ggml_cont_3d(c, av, Hv, W, 1);
+        } else {
+            beta  = ggml_reshape_4d(c, ggml_mul_mat(c, L.ssm_beta, x), Hv, 1, W, 1);
+            alpha = ggml_reshape_3d(c, ggml_mul_mat(c, L.ssm_alpha, x), Hv, W, 1);
+        }
+        ggml_tensor* gate = ggml_mul(c, ggml_softplus(c, ggml_add(c, alpha, L.ssm_dt)), L.ssm_a);
+
+        ggml_tensor* conv_state = ggml_reshape_3d(c,
+            ggml_view_2d(c, st, conv_state_dim, 1, st->nb[1], 0), dconv - 1, conv_dim, 1);
+        ggml_tensor* state = ggml_reshape_4d(c,
+            ggml_view_2d(c, st, ssm_state_dim, 1, st->nb[1],
+                         std::size_t(conv_state_dim) * esz), Sv, Sv, Hv, 1);
+
+        ggml_tensor* conv_raw = ggml_ssm_conv(c, conv_state, qkv, L.ssm_conv1d, t_seq_, nullptr);
+        ggml_tensor* y = ggml_silu(c, ggml_view_2d(c, conv_raw, conv_dim, W,
+                                                   std::size_t(conv_dim) * esz, 0));
+        const std::size_t rowq = std::size_t(conv_dim) * esz;
+        ggml_tensor* q = ggml_view_4d(c, y, Sk, Hk, W, 1,
+                                      std::size_t(Sk) * esz, rowq, rowq * std::size_t(W), 0);
+        ggml_tensor* k = ggml_view_4d(c, y, Sk, Hk, W, 1,
+                                      std::size_t(Sk) * esz, rowq, rowq * std::size_t(W),
+                                      std::size_t(key_dim) * esz);
+        ggml_tensor* v = ggml_view_4d(c, y, Sv, Hv, W, 1,
+                                      std::size_t(Sv) * esz, rowq, rowq * std::size_t(W),
+                                      std::size_t(2 * key_dim) * esz);
+        // Odin token: perestavlennyj vid i tak nepreryven (u kazhdoj perestavljaemoj osi
+        // ekstent edinica), tak chto normirovka pervoj i perestanovka vtoroj - zakonny i na
+        // odnu kopiju deshevle. Pri W > 1 poriadok obratnyj, i etot put otkazan vyshe.
+        q = ggml_permute(c, ggml_l2_norm(c, q, eps), 0, 2, 1, 3);
+        k = ggml_permute(c, ggml_l2_norm(c, k, eps), 0, 2, 1, 3);
+        ggml_tensor* vp = ggml_permute(c, v, 0, 2, 1, 3);
+        ggml_tensor* gp = ggml_permute(c, gate, 2, 0, 3, 1);
+        ggml_tensor* bp = ggml_permute(c, beta, 2, 0, 1, 3);
+        ggml_tensor* state_flat = ggml_reshape_4d(c, state, Sv, Sv * Hv, 1, 1);
+
+        ggml_tensor* res = ggml_delta_net(c, q, k, vp, gp, bp, state_flat, nullptr);
+        // repeat_type: KAK beta i gate razmnozhajutsja po gruppam golov. NOL dlja slitoj
+        // raskladki (qwen3next), EDINICA dlja razdelnoj. Lovushka 7.1: pri nevernom znachenii
+        // model rabotaet, ne padaet i dajot pravdopodobnyj tekst, rashodjas s etalonom na
+        // 14,81% uzhe na pervom sloe.
+        res->op_params[0] = L.ssm_ba ? 0 : 1;
+
+        const std::size_t out_elems = std::size_t(Sv) * std::size_t(Hv) * std::size_t(W);
+        ggml_tensor* out_dn = ggml_view_4d(c, res, Sv, Hv, W, 1, std::size_t(Sv) * esz,
+                                           std::size_t(Sv * Hv) * esz, out_elems * esz, 0);
+        ggml_tensor* new_state = ggml_reshape_4d(c,
+            ggml_view_1d(c, res, ssm_state_dim, out_elems * esz), Sv, Sv, Hv, 1);
+        ggml_tensor* new_conv = ggml_cont(c,
+            ggml_view_2d(c, conv_raw, dconv - 1, conv_dim, std::size_t(dconv) * esz,
+                         (1 + std::size_t(conv_dim) * std::size_t(W)) * esz));
+        // Obe poloviny sostojanija - obratno v tot zhe bufer na karte. Poriadok tot zhe, chto u
+        // etalona: snachala rekurrentnaja kopija, potom okno svjortki.
+        ggml_tensor* ssm_cpy = ggml_cpy(c, ggml_reshape_2d(c, new_state, ssm_state_dim, 1),
+            ggml_view_2d(c, st, ssm_state_dim, 1, st->nb[1],
+                         std::size_t(conv_state_dim) * esz));
+        ggml_build_forward_expand(gf, ssm_cpy);
+        ggml_tensor* conv_cpy = ggml_cpy(c, ggml_reshape_2d(c, new_conv, conv_state_dim, 1),
+            ggml_view_2d(c, st, conv_state_dim, 1, st->nb[1], 0));
+        ggml_build_forward_expand(gf, conv_cpy);
+
+        ggml_tensor* o2 = ggml_reshape_2d(c, out_dn, Sv, int64_t(Hv) * W);
+        ggml_tensor* z2 = ggml_reshape_2d(c, z, Sv, int64_t(Hv) * W);
+        ggml_tensor* on = ggml_fused_mul_unary(c, z2, lnorm(c, o2, L.ssm_norm, eps),
+                                               GGML_UNARY_OP_SILU);
+        ggml_tensor* proj = ggml_mul_mat(c, L.ssm_out,
+                                         ggml_reshape_2d(c, on, val_dim, W));
+        attn_out = ggml_add(c, proj, cur);
+    } else {
+        const int hd   = gm.head_dim;
+        const int nh   = gm.n_head;
+        const int nkvh = gm.n_head_kv;
+        const int dq   = nh * hd;
+        const float kq_scale = gm.attn_scale > 0.0f ? gm.attn_scale
+                                                    : 1.0f / std::sqrt(float(hd));
+        int sections[GGML_MROPE_SECTIONS] = {0};
+        for (int i = 0; i < 4 && i < GGML_MROPE_SECTIONS; ++i) {
+            sections[i] = cfg_.rope_sections[i];
+        }
+
+        ggml_tensor* x = lnorm(c, cur, L.attn_norm, eps);
+        // wq DVOJNOJ SHIRINY, i poloviny CHEREDUJUTSJA PO GOLOVE: golova n vladeet strokami
+        // [2n*hd, 2n*hd+hd) kak zaprosom i [2n*hd+hd, 2n*hd+2hd) kak gejtom vyhoda. Dve
+        // nepreryvnye poloviny - ochevidnoe chtenie i nevernoe: ono vzjalo by zaprosy i gejty
+        // pervyh vosmi golov i nazvalo ih shestnadcatju zaprosami.
+        ggml_tensor* qaux = ggml_mul_mat(c, L.wq, x);
+        const std::size_t row = std::size_t(hd) * sizeof(float);
+        ggml_tensor* q = ggml_cont(c, ggml_view_3d(c, qaux, hd, nh, W,
+                                                   2 * row, qaux->nb[1], 0));
+        ggml_tensor* agate = ggml_cont_2d(c,
+            ggml_view_3d(c, qaux, hd, nh, W, 2 * row, qaux->nb[1], row), dq, W);
+        ggml_tensor* k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, x), hd, nkvh, W);
+        ggml_tensor* v = ggml_mul_mat(c, L.wv, x);
+
+        q = lnorm(c, q, L.q_norm, eps);
+        k = lnorm(c, k, L.k_norm, eps);
+        // ggml_rope_multi s NASTOJASHCHIMI sekcijami, a ne s tekstovoj formoj iz nulej: eto
+        // interleaved-mrope, i shiriny sekcij reshajut, kakoe izmerenie poluchit kakoj iz trjoh
+        // potokov uglov. n_rot 64 iz head_dim 256 - povorachivaetsja chetvert golovy.
+        q = ggml_rope_multi(c, q, t_pos_, L.rope_freqs, gm.n_rot, sections, gm.rope_type,
+                            cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        k = ggml_rope_multi(c, k, t_pos_, L.rope_freqs, gm.n_rot, sections, gm.rope_type,
+                            cfg_.n_ctx_train, gm.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+        ggml_tensor* Kc = (W == 1)
+            ? ggml_reshape_3d(c, k, hd, 1, nkvh)
+            : ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));
+        ggml_tensor* Vc = (W == 1)
+            ? ggml_reshape_3d(c, v, 1, hd, nkvh)
+            : ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, v, hd, nkvh, W), 1, 2, 0, 3));
+        ggml_tensor* kcache = kv_k_[std::size_t(il)];
+        ggml_tensor* vcache = kv_v_[std::size_t(il)];
+        if (!kcache || !vcache) { *err = "sloj vnimanija bez kesha na karte"; return false; }
+        ggml_tensor* kdst = ggml_view_3d(c, kcache, hd, W, nkvh,
+                                         kcache->nb[1], kcache->nb[2], 0);
+        ggml_tensor* vdst = ggml_view_3d(c, vcache, W, hd, nkvh,
+                                         vcache->nb[1], vcache->nb[2], 0);
+        kcpy = ggml_cpy(c, Kc, kdst);
+        vcpy = ggml_cpy(c, Vc, vdst);
+
+        ggml_tensor* Q = (W == 1) ? ggml_reshape_3d(c, q, hd, 1, nh)
+                                  : ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));
+        ggml_tensor* K = ggml_view_3d(c, kcache, hd, cfg_.n_kv_max, nkvh,
+                                      kcache->nb[1], kcache->nb[2], 0);
+        ggml_tensor* V = ggml_view_3d(c, vcache, cfg_.n_kv_max, hd, nkvh,
+                                      vcache->nb[1], vcache->nb[2], 0);
+        ggml_tensor* kq = ggml_mul_mat(c, K, Q);
+        ggml_tensor* p = ggml_soft_max_ext(c, kq, t_mask_, kq_scale, 0.0f);
+        ggml_tensor* kqv = ggml_mul_mat(c, V, p);
+        if (W > 1) {
+            ggml_mul_mat_set_prec(kq,  GGML_PREC_F32);
+            ggml_mul_mat_set_prec(kqv, GGML_PREC_F32);
+        }
+        kqv = (W == 1) ? ggml_reshape_2d(c, kqv, dq, 1)
+                       : ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), dq, W);
+        // Gejt vyhoda - DO vyhodnoj proekcii. Dva uzla, a ne odin: ggml_fused_mul_unary s
+        // SIGMOID trebuet a->ne[0] == 1, a gejt polnoj shiriny; ta zhe stena i u etalona, gde
+        // eto slijanie napisano i zakryto proverkoj, kotoraja nikogda ne istinna.
+        kqv = ggml_mul(c, kqv, ggml_sigmoid(c, agate));
+        attn_out = ggml_add(c, ggml_mul_mat(c, L.wo, kqv), cur);
+        G.kdst = kdst; G.vdst = vdst; G.kcpy = kcpy; G.vcpy = vcpy;
+        G.K = K; G.V = V; G.kq = kq; G.probs = p;
+    }
+
+    // Hvost, obshchij dlja oboih rodov sloja.
+    ggml_tensor* xf = lnorm(c, attn_out, L.ffn_norm, eps);
+    ggml_tensor* rl = ggml_mul_mat(c, L.router, xf);
+    // OBSHCHIJ EKSPERT. Ne ggml_fused_up_gate: pri kvantovannyh up/gate odnogo tipa ta funkcija
+    // uhodit v GGML_OP_FUSED_UP_GATE, u kotorogo na Vulkan realizacii net vovse - to est sloj
+    // ostalsja by na CPU s vesami v videopamjati. Zdes razvjornuto rovno v to, vo chto
+    // razvorachivaet ejo sobstvennaja nekvantovannaja vetka: dva umnozhenija i fused_mul_unary.
+    ggml_tensor* s_up = ggml_mul_mat(c, L.up_shexp, xf);
+    ggml_tensor* s_gt = ggml_mul_mat(c, L.gate_shexp, xf);
+    ggml_tensor* sh = ggml_mul_mat(c, L.down_shexp,
+                                   ggml_fused_mul_unary(c, s_gt, s_up, GGML_UNARY_OP_SILU));
+    ggml_tensor* s_g = ggml_mul_mat(c, L.shexp_gate, xf);      // [1, W]
+    // Tozhe dva uzla vmesto slitogo: SIGMOID u fused_mul_unary na Vulkan ne podderzhan (tolko
+    // GELU/SILU/RELU), a shirokoveshchatelnaja forma trebuet imenno ego.
+    sh = ggml_mul(c, sh, ggml_sigmoid(c, s_g));
+
+    ggml_set_output(attn_out);
+    ggml_set_output(xf);
+    ggml_set_output(sh);
+    ggml_set_output(rl);
+    if (kcpy) ggml_build_forward_expand(gf, kcpy);
+    if (vcpy) ggml_build_forward_expand(gf, vcpy);
+    ggml_build_forward_expand(gf, attn_out);
+    ggml_build_forward_expand(gf, xf);
+    ggml_build_forward_expand(gf, sh);
+    ggml_build_forward_expand(gf, rl);
+
+    G.out = nullptr;
+    G.o_res = attn_out; G.o_xf = xf; G.o_sh = sh; G.o_rl = rl; G.o_xm = nullptr;
+    return finish_layer_graph(il, gf, G, err);
 }
 
 bool GpuStatic::set_step(int n_past, int n_kv) {
@@ -1612,6 +2033,10 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
     int sw_lo = -1, sw_len = 0, sw_win = 0;
     for (std::size_t pi = 0; pi < lg_.size(); ++pi) {
         const LayerGraph& G = lg_[pi];
+        // U sloja delta-seti net ni kesha, ni maski, ni pozicij: celit nechego. Ranshe etot
+        // obhod predpolagal vnimanie v KAZHDOM sloe, i u qwen3next tri chetverti sloev
+        // razymenovali by nulevye vidy.
+        if (G.delta) continue;
         int lo = 0, len = n_kv;
         if (G.ring > 0) {
             // Zapis shirinoj W ne dolzhna perehodit granicu kolca: odna kopija etogo ne
@@ -1637,6 +2062,7 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
     // Ot etoj stroki i nizhe otkazov byt ne mozhet - vsjo proverено vyshe.
     for (std::size_t pi = 0; pi < lg_.size(); ++pi) {
         LayerGraph& G = lg_[pi];
+        if (G.delta) continue;
         const int lo = plan_lo[pi], len = plan_len[pi];
         G.kv_lo = lo; G.kv_len = len;
         G.K->ne[1] = len;    // strides belong to the cache, so only the extent moves
@@ -1681,6 +2107,7 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
     if (step_past_ != n_past) {
         for (std::size_t il = 0; il < lg_.size(); ++il) {
             LayerGraph& G = lg_[il];
+            if (G.delta) continue;   // pisat nekuda: kesha u etogo sloja net
             ggml_tensor* kc = kv_k_[il];
             ggml_tensor* vc = kv_v_[il];
             // Slot zapisi: pri kolce eto pozicija po modulju, inache sama pozicija.
@@ -1708,9 +2135,23 @@ bool GpuStatic::set_step(int n_past, int n_kv) {
             // otkazyvat nelzja: chast sloev uzhe perenacelena, i vyhod otsjuda ostavil by
             // nesoglasovannoe sostojanie. Imenno tak i bylo do ispravlenija.
         }
-        int32_t pos[16];
-        for (int j = 0; j < W; ++j) pos[j] = int32_t(n_past + j);
-        ggml_backend_tensor_set(t_pos_, pos, 0, std::size_t(W) * sizeof(int32_t));
+        // SKOLKO SEKCIJ POZICIJ - govorit sam tenzor, a ne otdelnyj flag. Pri mnogomernom rope
+        // (MROPE, i qwen3next iz nih) na token prihoditsja CHETYRE pozicii: rope indeksiruet
+        // pos[i], pos[n+i], pos[2n+i], pos[3n+i], i dlja teksta eto t, t, t, 0. Raskladka - ta
+        // zhe, chto u processornogo stroitelja (set_graph_inputs), i vzjata ottuda bukvalno.
+        const int pt = int(t_pos_->ne[0]) / W;
+        int32_t pos[64] = {0};
+        for (int j = 0; j < W; ++j) {
+            const int32_t pv = int32_t(n_past + j);
+            pos[j] = pv;
+            if (pt == 4) {
+                pos[W + j]     = pv;
+                pos[2 * W + j] = pv;
+                pos[3 * W + j] = 0;   // chetvjortaja sekcija u teksta pustaja
+            }
+        }
+        ggml_backend_tensor_set(t_pos_, pos, 0,
+                                std::size_t(W) * std::size_t(pt) * sizeof(int32_t));
     }
     step_past_ = n_past;
     step_nkv_  = n_kv;
@@ -1730,6 +2171,9 @@ bool GpuStatic::upload_kv(ggml_tensor* const* k, ggml_tensor* const* v, int n_la
     if (n_layer != cfg_.n_layer) { *err = "chislo sloev ne sovpadaet"; return false; }
     auto t0 = std::chrono::steady_clock::now();
     for (int il = 0; il < n_layer; ++il) {
+        // Sloj delta-seti kesha ne imeet ni na hoste, ni na karte. Ranshe eta funkcija
+        // predpolagala vnimanie v kazhdom sloe i otkazala by na pervom zhe iz tridcati shesti.
+        if (cfg_.at(il).delta) continue;
         ggml_tensor* sk = k[std::size_t(il)];
         ggml_tensor* sv = v[std::size_t(il)];
         ggml_tensor* dk = kv_k_[std::size_t(il)];
@@ -1820,17 +2264,75 @@ bool GpuStatic::upload_kv(ggml_tensor* const* k, ggml_tensor* const* v, int n_la
     return true;
 }
 
+int GpuStatic::delta_layers() const {
+    int n = 0;
+    for (ggml_tensor* t : dstate_) {
+        if (t) ++n;
+    }
+    return n;
+}
+
+// PERENOSIMOE SOSTOJANIE POSLE PREFILLA - na kartu. Prefill schitaetsja na hoste (drugaja
+// forma grafa, i on uprjot v arifmetiku, a ne v polosu), poetomu k pervomu generiruemomu tokenu
+// okno svjortki i matrica sostojanija 36 sloev lezhat v HOSTOVOM DeltaState, a graf karty chitaet
+// svoj bufer. Odin raz na promt, 75,4 MiB.
+//
+// Bez etogo vyzova karta nachala by dekod s NULEVOGO sostojanija. Eto ne padenie i ne oshibka
+// formy: poluchilsja by svjaznyj tekst, zabyvshij promt - rovno tot rod otkaza, iz-za kotorogo
+// upload_kv sravnivaet razmery, a ne predpolagaet ih. Poetomu razmery sravnivajutsja i zdes.
+bool GpuStatic::upload_delta(ggml_tensor* const* st, int n_layer, std::string* err) {
+    if (!cfg_.layers || lg_.empty()) { *err = "sloi ne na karte"; return false; }
+    if (n_layer != cfg_.n_layer) { *err = "chislo sloev ne sovpadaet"; return false; }
+    if (dstate_elems_ == 0) { *err = "u etoj arhitektury net perenosimogo sostojanija"; return false; }
+    auto t0 = std::chrono::steady_clock::now();
+    int moved = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor* d = dstate_[std::size_t(il)];
+        if (!d) continue;                      // sloj vnimanija - u nego kesh, a ne sostojanie
+        ggml_tensor* s = st[std::size_t(il)];
+        if (!s) {
+            char m[160];
+            snprintf(m, sizeof(m),
+                     "sloj %d: na karte sostojanie delta-seti est, a u hosta ego net", il);
+            *err = m;
+            return false;
+        }
+        if (ggml_nbytes(s) != ggml_nbytes(d) || s->type != d->type) {
+            char m[240];
+            snprintf(m, sizeof(m),
+                     "sloj %d: sostojanie hosta %.2f MiB (%s) ne sovpalo s sostojaniem karty "
+                     "%.2f MiB (%s)", il, double(ggml_nbytes(s)) / 1048576.0,
+                     ggml_type_name(s->type), double(ggml_nbytes(d)) / 1048576.0,
+                     ggml_type_name(d->type));
+            *err = m;
+            return false;
+        }
+        if (!s->data) { *err = "sostojanie hosta nedostupno hostu"; return false; }
+        const std::size_t total = ggml_nbytes(s);
+        const char* sp = (const char*)s->data;
+        for (std::size_t off = 0; off < total; off += kUploadChunk) {
+            const std::size_t n = std::min(kUploadChunk, total - off);
+            ggml_backend_tensor_set(d, sp + off, off, n);
+        }
+        ++moved;
+    }
+    if (moved == 0) { *err = "ni odin sloj delta-seti ne perenesjon - eto ne uspeh"; return false; }
+    ++st_.kv_uploads;
+    st_.kv_upload_ms += ms_since(t0);
+    return true;
+}
+
 void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
                          const ggml_tensor* mask) {
     auto t0 = std::chrono::steady_clock::now();
     ++st_.layer_calls;
-    // Tri velichiny u qwen3moe (ostatok, ego norma, logity) i CHETYRE u gemma4: u nejo dve raznye
+    // Tri velichiny u qwen3moe (ostatok, ego norma, logity) i CHETYRE u gemma4 i qwen3next: u nejo dve raznye
     // pre-normy nad odnim i tem zhe ostatkom - ffn_norm dlja plotnoj poloviny i pre_ffw_norm_2 dlja
     // marshrutiziruemoj - i vernut obe deshevle, chem zastavit host schitat odnu zanovo.
     const int W = cfg_.layer_width > 0 ? cfg_.layer_width : 1;
-    const std::size_t out_floats = (cfg_.gemma_block
-        ? std::size_t(3 * cfg_.n_embd + cfg_.n_expert)
-        : std::size_t(2 * cfg_.n_embd + cfg_.n_expert)) * std::size_t(W);
+    const std::size_t out_floats =
+        (std::size_t(cfg_.out_embd_slots()) * std::size_t(cfg_.n_embd)
+         + std::size_t(cfg_.n_expert)) * std::size_t(W);
 
     if (!fail_msg_.empty()) { std::memset(dst->data, 0, ggml_nbytes(dst)); return; }
     if (step_nkv_ <= 0) {
@@ -1949,8 +2451,13 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
                 bool ok = ggml_backend_vk_arm_readback(be_, G.o_res, rb_,      0, ne * sizeof(float));
                 ok = ok && ggml_backend_vk_arm_readback(be_, G.o_xf, rb_ + ne, 0, ne * sizeof(float));
                 std::size_t off = 2 * ne;
-                if (G.o_xm) {
-                    ok = ok && ggml_backend_vk_arm_readback(be_, G.o_xm, rb_ + off, 0, ne * sizeof(float));
+                // TRETIJ VYHOD razmerom n_embd: u gemma4 eto vtoraja pre-norma ostatka, u
+                // qwen3next - vyhod obshchego eksperta. Odno mesto v raskladke na oba, potomu
+                // chto host rezhet vyhod po SMESHCHENIJAM, i dva nezavisimyh ih schjota - eto
+                // rovno tot rod rashozhdenija, kotoryj ne dajot oshibki formy.
+                ggml_tensor* third = G.o_xm ? G.o_xm : G.o_sh;
+                if (third) {
+                    ok = ok && ggml_backend_vk_arm_readback(be_, third, rb_ + off, 0, ne * sizeof(float));
                     off += ne;
                 }
                 ok = ok && ggml_backend_vk_arm_readback(be_, G.o_rl, rb_ + off, 0,
@@ -1996,8 +2503,9 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
                 ggml_backend_tensor_get(G.o_res, rb_,      0, ne * sizeof(float));
                 ggml_backend_tensor_get(G.o_xf,  rb_ + ne, 0, ne * sizeof(float));
                 std::size_t off = 2 * ne;
-                if (G.o_xm) {
-                    ggml_backend_tensor_get(G.o_xm, rb_ + off, 0, ne * sizeof(float));
+                ggml_tensor* third = G.o_xm ? G.o_xm : G.o_sh;
+                if (third) {
+                    ggml_backend_tensor_get(third, rb_ + off, 0, ne * sizeof(float));
                     off += ne;
                 }
                 ggml_backend_tensor_get(G.o_rl, rb_ + off, 0,
@@ -2059,7 +2567,7 @@ ggml_tensor* GpuStatic::layer(ggml_context* c, int il, ggml_tensor* cur, ggml_te
     // po kakomu do_layer skladyvaet rb_.
     const int Wp = cfg_.layer_width > 0 ? cfg_.layer_width : 1;
     ggml_tensor* proto = ggml_new_tensor_2d(c, GGML_TYPE_F32,
-                                            ((cfg_.gemma_block ? 3 : 2) * cfg_.n_embd
+                                            (cfg_.out_embd_slots() * cfg_.n_embd
                                                 + cfg_.n_expert) * Wp, 1);
     return ggml_map_custom3(c, proto, cur, mask, layer_op, /*n_tasks=*/1,
                             &sites_[std::size_t(il)]);

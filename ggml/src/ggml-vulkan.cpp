@@ -1858,6 +1858,19 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, vk::Memor
     if (memory_type_index == UINT32_MAX && fallback_flags) {
         memory_type_index = find_properties(&mem_props, &mem_req, fallback_flags);
         buf->memory_property_flags = fallback_flags;
+        // MemeX: ETOT OTKAT MOLCHAL, i eto stoilo dnja razborov. Prosili host-visible pamjat, a
+        // ejo ne dali - znachit bufer NE otobrazhen v adresnoe prostranstvo hosta, i kazhdyj
+        // ggml_backend_tensor_set v nego prevrashchaetsja iz memcpy v submit s ozhidaniem
+        // ochered. Dlja krupnyh vesov eto zhelaemoe povedenie (BAR-okno na etoj karte 256 MiB, i
+        // bufer bolshe nego v njom prosto ne pomestilsja by), no otlichit "tak i zadumano" ot
+        // "melkij vhodnoj bufer ne popal v BAR i teper stoit submita na kazhdyj token" po logu
+        // bylo NECHEM. Teper est stroka, i v nej razmer.
+        if ((req_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+            !(fallback_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+            std::cerr << "ggml_vulkan: bufer " << (size >> 20) << " MiB prosil host-visible, "
+                      << "poluchil tolko device-local: zapis v nego idjot cherez submit s "
+                      << "ozhidaniem, a ne memcpy" << std::endl;
+        }
     }
 
     if (memory_type_index == UINT32_MAX) {
@@ -11673,10 +11686,29 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                 if (st->ne[0] != S || st->ne[1] != S * Hv || !ggml_is_contiguous(st)) {
                     return false;
                 }
-                // Shejder indeksiruet plosko po nb[2]; nulevoj shag i ne-f32 element ne godny.
+                // q, k, v shejder chitaet strokoj po head_dim: sosednie niti berut sosednie
+                // adresa, tak chto shag mezhdu elementami strogo odin float.
                 if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(float) ||
-                    v->nb[0] != sizeof(float) || g->nb[0] != sizeof(float) ||
-                    bt->nb[0] != sizeof(float)) {
+                    v->nb[0] != sizeof(float)) {
+                    return false;
+                }
+                // g I beta - ODNO CHISLO NA GOLOVU, i trebovanie k nim DRUGOE. Zdes stojalo
+                // nb[0] == sizeof(float), i eto byla proverka ne togo shaga: shejder chitaet
+                // g_d[h * (nb[2]/4)], a nb[0] u nego ne ispolzuetsja vovse. CPU zhe (iqk i
+                // skaljarnyj otkat odinakovo) chitaet g_data[t*n_heads + h] PLOSKO, mimo
+                // strajdov - to est sovpadenie dvuh putej trebuet rovno nb[2] == 4.
+                //
+                // Cena staroj proverki: test-backend-ops stroit g kak tenzor [1,1,Hv,1], u
+                // kotorogo nb[0] == 4 sluchajno, i sluchaj prohodil; MODEL zhe dajot g kak
+                // ggml_permute(gate, 2,0,3,1) - to zhe samoe logicheski, no s nb[0] == Hv*4,
+                // - i operacija otkazyvala imenno na toj forme, radi kotoroj napisana.
+                // Naideno pri postanovke sloja delta-seti qwen3next na kartu.
+                if (g->ne[0] != 1 || g->ne[1] != 1 || g->nb[2] != sizeof(float) ||
+                    g->ne[2] < Hv) {
+                    return false;
+                }
+                if (bt->ne[0] != 1 || bt->ne[1] != 1 || bt->nb[2] != sizeof(float) ||
+                    bt->ne[2] < Hv) {
                     return false;
                 }
                 if (q->nb[2] != k->nb[2]) {

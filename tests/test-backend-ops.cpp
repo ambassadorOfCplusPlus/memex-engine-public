@@ -1065,9 +1065,18 @@ struct test_delta_net : public test_case {
     const float g_lo;
     const float g_hi;
     const int64_t n_tokens;
+    // RASKLADKA g I beta KAK V MODELI, a ne kak udobno testu.
+    //
+    // Sloj qwen3next stroit ih perestanovkoj: gate [Hv, n_tok, 1] -> permute(2,0,3,1) i
+    // beta [Hv, 1, n_tok] -> permute(2,0,1,3). Logicheski eto to zhe samoe, chto tenzor
+    // [1, 1, Hv, 1], i CPU raznicy ne vidit vovse - iqk chitaet g_data[t*n_heads + h] PLOSKO,
+    // mimo strajdov. No nb[0] u perestanovki ne 4, a Hv*4, i imenno na etom supports_op
+    // otkazyval operaciju na toj edinstvennoj forme, radi kotoroj ona napisana. Sluchaj
+    // sushchestvuet, chtoby eto bolshe ne moglo projti nezamechennym.
+    const bool perm_gb;
 
     std::string vars() override {
-        return VARS_TO_STR8(S, Hk, Hv, repeat_type, steps, g_lo, g_hi, n_tokens);
+        return VARS_TO_STR9(S, Hk, Hv, repeat_type, steps, g_lo, g_hi, n_tokens, perm_gb);
     }
 
     // 128 slagaemyh na skaljarnoe proizvedenie v f32 plus drevesnaja summa v shejdere protiv
@@ -1078,9 +1087,10 @@ struct test_delta_net : public test_case {
 
     test_delta_net(int64_t S = 128, int64_t Hk = 16, int64_t Hv = 32,
                    int repeat_type = 0, int steps = 1,
-                   float g_lo = -2.0f, float g_hi = -0.05f, int64_t n_tokens = 1)
+                   float g_lo = -2.0f, float g_hi = -0.05f, int64_t n_tokens = 1,
+                   bool perm_gb = false)
         : S(S), Hk(Hk), Hv(Hv), repeat_type(repeat_type), steps(steps), g_lo(g_lo), g_hi(g_hi),
-          n_tokens(n_tokens) {}
+          n_tokens(n_tokens), perm_gb(perm_gb) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, S*Hv);
@@ -1090,9 +1100,19 @@ struct test_delta_net : public test_case {
             ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, n_tokens, Hk, 1);
             ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, n_tokens, Hk, 1);
             ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, n_tokens, Hv, 1);
-            ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_tokens, 1, Hv, 1);
-            ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_tokens, Hv, 1);
-            ggml_format_name(g, "dn_g_%d", i);
+            ggml_tensor * g = nullptr;
+            ggml_tensor * b = nullptr;
+            if (perm_gb) {
+                ggml_tensor * gs = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Hv, n_tokens, 1, 1);
+                ggml_tensor * bs = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Hv, 1, n_tokens, 1);
+                ggml_format_name(gs, "dn_g_%d", i);
+                g = ggml_permute(ctx, gs, 2, 0, 3, 1);
+                b = ggml_permute(ctx, bs, 2, 0, 1, 3);
+            } else {
+                g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_tokens, 1, Hv, 1);
+                b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_tokens, Hv, 1);
+                ggml_format_name(g, "dn_g_%d", i);
+            }
 
             out = ggml_delta_net(ctx, q, k, v, g, b, state, nullptr);
             out->op_params[0] = repeat_type;
@@ -2501,6 +2521,10 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     // head_dim 96 (CPU ushjol by v skaljarnyj put s drugoj formuloj) i n_tokens 4.
     test_cases.emplace_back(new test_delta_net(96, 8, 16, 0, 1));
     test_cases.emplace_back(new test_delta_net(128, 16, 32, 0, 1, -2.0f, -0.05f, 4));
+    // Raskladka g/beta ROVNO kak u sloja qwen3next: perestanovka, a ne svezhij tenzor.
+    test_cases.emplace_back(new test_delta_net(128, 16, 32, 0, 1, -2.0f, -0.05f, 1, true));
+    test_cases.emplace_back(new test_delta_net(128, 16, 32, 1, 1, -2.0f, -0.05f, 1, true));
+    test_cases.emplace_back(new test_delta_net(128, 16, 32, 0, 16, -2.0f, -0.05f, 1, true));
     // OTKAZ u SSM_CONV: dve posledovatelnosti.
     test_cases.emplace_back(new test_ssm_conv(4, 128, 1, 2));
 

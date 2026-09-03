@@ -108,6 +108,11 @@ struct GpuStaticGeom {
     // Sliding window in positions; 0 means the layer sees the whole cache. Twenty-five of
     // Gemma four thirty layers are windowed at 1024.
     int   n_swa     = 0;
+    // GEJTED DELTA-SET VMESTO VNIMANIJA. U qwen3next 36 sloev iz 48 - eto ne vnimanie s
+    // drugoj geometriej, a drugaja operacija: net KV-kesha vovse, est perenosimoe sostojanie
+    // fiksirovannogo razmera. Poetomu eto otdelnoe pole, a ne n_head == 0: nol golov chitalsja
+    // by kak "geometrija ne zadana" i molcha vzjal by skaljary iz konfiguracii.
+    bool  delta     = false;
 };
 
 struct GpuStaticConfig {
@@ -174,11 +179,46 @@ struct GpuStaticConfig {
     // memory-budget one and it can be turned off when the card has no room.
     bool dense_ffn = false;
 
+    // Stroit blok qwen3next: 36 sloev gejted delta-seti i 12 sloev vnimanija s dvojnoj wq,
+    // chastichnym rope (n_rot 64 iz head_dim 256) i sekcijami MROPE, plus OBSHCHIJ EKSPERT na
+    // kazhdom sloe. Ne vyvoditsja iz geometrii: formy mogli by sovpast, a blok ostatsja
+    // drugim - i imenno blok reshaet, kakie uzly est i v kakom porjadke.
+    bool qwen3next_block = false;
+    // Gejted delta-set: vsjo, chto nuzhno, chtoby postroit ejo uzly. Snjato s fajla, ne
+    // predpolozheno: conv_kernel 4, inner 4096, state 128, v-golov 32, k-grupp 16.
+    int ssm_d_conv  = 0;
+    int ssm_d_inner = 0;
+    int ssm_d_state = 0;
+    int ssm_dt_rank = 0;   // chislo V-golov
+    int ssm_n_group = 0;   // chislo K-golov
+    // Sekcii mnogomernogo rope. {11,11,10,0} u qwen3next; ih udvoennaja summa i est n_rot 64.
+    // Nol vo vseh chetyrjoh - eto tekstovaja forma, i ggml_rope_multi ejo NE prinimaet vovse
+    // (GGML_ASSERT v ggml.c:21050), tak chto put s sekcijami i put bez nih - raznye vetki.
+    int rope_sections[4] = {0, 0, 0, 0};
+
+    // Skolko f32-elementov zanimaet perenosimoe sostojanie odnogo delta-sloja: okno svjortki
+    // (d_conv-1)*conv_dim plus matrica sostojanija head_v^2 * n_v_heads. Fiksirovano - ono ne
+    // rastjot s kontekstom, i v etom ves ego smysl.
+    std::size_t delta_state_elems() const {
+        if (ssm_dt_rank <= 0 || ssm_n_group <= 0 || ssm_d_conv <= 0) return 0;
+        const std::size_t head_v  = std::size_t(ssm_d_inner) / std::size_t(ssm_dt_rank);
+        const std::size_t key_dim = std::size_t(ssm_d_state) * std::size_t(ssm_n_group);
+        const std::size_t conv_dim = key_dim * 2 + std::size_t(ssm_d_inner);
+        return std::size_t(ssm_d_conv - 1) * conv_dim +
+               head_v * head_v * std::size_t(ssm_dt_rank);
+    }
+
     // Vygruzhat li golovu. Dlja gemma4 - NET: ejo postroitel schitaet golovu svoim putjom, s
     // ogranicheniem logitov i privjazkoj k embeddingu, i head() u nejo ne vyzyvaetsja nikogda.
     // Bez etogo flaga na kartu ujdjot 748 MiB mjortvogo gruza iz 3,8 GB - pjataja chast pamjati
     // pod tenzor, kotoryj nikto ne prochtjot.
     bool head = true;
+
+    // Skolko velichin razmerom n_embd karta vozvrashchaet na sloj. Dve u qwen3moe (ostatok i
+    // ego norma), TRI u gemma4 (vtoraja pre-norma) i TRI u qwen3next (obshchij ekspert).
+    // Odna funkcija, potomu chto eto smeshchenija, po kotorym host rezhet vyhod, i dva
+    // nezavisimyh ih schjota - eto rovno tot rod rashozhdenija, kotoryj ne dajot oshibki formy.
+    int out_embd_slots() const { return (gemma_block || qwen3next_block) ? 3 : 2; }
 
     // The shape of layer il, whichever way it was given.
     GpuStaticGeom at(int il) const {
@@ -219,6 +259,28 @@ struct GpuStaticLayer {
     ggml_tensor* ffn_up   = nullptr;
     ggml_tensor* ffn_gate = nullptr;
     ggml_tensor* ffn_down = nullptr;
+    // OPTIONAL, qwen3next only: gejted delta-set. Na sloe delta-seti wq/wk/wv/wo/q_norm/k_norm
+    // pusty, a eti - net; na sloe vnimanija naoborot. Odna struktura na oba roda sloev, potomu
+    // chto vsjo ostalnoe u nih obshchee (attn_norm, ffn_norm, marshrutizator, obshchij ekspert),
+    // i dve struktury oznachali by dve tablicy slotov, dva podschjota bajtov i dve zalivki.
+    ggml_tensor* wqkv       = nullptr;   // [n_embd, 2*key_dim + val_dim]
+    ggml_tensor* wqkv_gate  = nullptr;   // [n_embd, val_dim]
+    ggml_tensor* ssm_conv1d = nullptr;   // [d_conv, conv_dim]
+    ggml_tensor* ssm_dt     = nullptr;   // [n_v_heads] smeshchenie
+    ggml_tensor* ssm_a      = nullptr;   // [n_v_heads], hranit -exp(A_log): vsjo otricatelno
+    ggml_tensor* ssm_ba     = nullptr;   // [n_embd, 2*n_v_heads] slitye beta i alpha
+    ggml_tensor* ssm_beta   = nullptr;   // ili razdelnye
+    ggml_tensor* ssm_alpha  = nullptr;
+    ggml_tensor* ssm_norm   = nullptr;   // [head_v_dim] gejtovannaja norma vyhoda
+    ggml_tensor* ssm_out    = nullptr;   // [val_dim, n_embd]
+    // OPTIONAL, qwen3next only: OBSHCHIJ EKSPERT. On schitaetsja na KAZHDOM sloe i KAZHDOM
+    // tokene - eto staticheskij trafik, a ne ekspertnyj, i imenno poetomu emu mesto zdes, a ne
+    // v ResidentSet (kotoryj schitaet bajty tolko marshrutiziruemyh i sчitalby jomkost ot
+    // nevernogo znamenatelja).
+    ggml_tensor* shexp_gate = nullptr;   // [n_embd] -> odin sigmoid na token
+    ggml_tensor* gate_shexp = nullptr;
+    ggml_tensor* up_shexp   = nullptr;
+    ggml_tensor* down_shexp = nullptr;
 };
 
 struct GpuStaticStats {
@@ -366,6 +428,18 @@ class GpuStatic {
     bool upload_kv(ggml_tensor* const* k, ggml_tensor* const* v, int n_layer, int n_valid,
                    std::string* err);
 
+    // To zhe, chto upload_kv, no dlja perenosimogo sostojanija delta-seti: prefill schitaetsja
+    // na hoste, i posle nego sostojanie 36 sloev zhivjot v hostovom DeltaState, a graf karty
+    // chitaet svojo. Odin raz na promt, 75,4 MiB.
+    //
+    // Bez etogo vyzova karta nachala by dekod s NULEVOGO sostojanija - i eto ne padenie, a
+    // svjaznyj tekst, zabyvshij promt. Rovno tot rod otkaza, iz-za kotorogo upload_kv sravnivaet
+    // formy, a ne predpolagaet ih.
+    bool upload_delta(ggml_tensor* const* st, int n_layer, std::string* err);
+    // Skolko sloev delta-seti karta derzhit. Nol znachit "arhitektura bez perenosimogo
+    // sostojanija", i togda upload_delta zvat ne nado.
+    int  delta_layers() const;
+
     int  n_kv_max() const { return cfg_.n_kv_max; }
     bool layers_on() const { return on() && cfg_.layers && !lg_.empty(); }
 
@@ -422,6 +496,14 @@ class GpuStatic {
         // ffn_norm (o_xf) and its routed half uses pre_ffw_norm_2, and they are different weights
         // over the same input - so the card returns both rather than making the host redo one.
         ggml_tensor*   o_xm  = nullptr;
+        // qwen3next only: vyhod OBSHCHEGO EKSPERTA, uzhe umnozhennyj na svoj sigmoid. Zanimaet
+        // to zhe tretje mesto v raskladke, chto o_xm u gemma4 - dve arhitektury, tri vyhoda
+        // razmerom n_embd, odin i tot zhe schjot smeshchenij u hosta.
+        ggml_tensor*   o_sh  = nullptr;
+        // Sloj gejted delta-seti, a ne vnimanija: u nego net ni KV, ni maski, ni pozicij, zato
+        // est perenosimoe sostojanie. Pomecheno zdes, a ne vychisljaetsja iz cfg_.at(il), potomu
+        // chto set_step i upload_kv obhodjat imenno etot spisok.
+        bool           delta = false;
         ggml_tensor*   kdst = nullptr;   // the write view, aimed at n_past
         ggml_tensor*   vdst = nullptr;
         ggml_tensor*   kcpy = nullptr;   // and the copy node that carries the same offset
@@ -449,6 +531,15 @@ class GpuStatic {
         const float*   mapped = nullptr; // the output's host mapping, when the driver gave one
         bool           mapped_probed = false;
     };
+
+    // Hvost postroenija odnogo sloja: razmeshchenie grafa i vopros bekendu o KAZHDOM uzle.
+    // Odna funkcija na oba bloka (qwen3moe/gemma4 i qwen3next) namerenno: eto edinstvennoe
+    // mesto, gde otkaz "net operacii na karte" zvuchit vsluh do pervogo tokena, i dva ego
+    // ekzempljara razoshlis by pervoj zhe pravkoj.
+    bool finish_layer_graph(int il, ggml_cgraph* gf, LayerGraph& G, std::string* err);
+    // Ves sloj qwen3next: libo gejted delta-set (36 iz 48), libo vnimanie s dvojnoj wq i
+    // gejtom (12 iz 48), i v oboih sluchajah ffn_norm, marshrutizator i obshchij ekspert.
+    bool build_next_layer(ggml_context* c, int il, std::size_t nodes, std::string* err);
 
     GpuStaticConfig cfg_;
     GpuStaticStats  st_;
@@ -508,6 +599,15 @@ class GpuStatic {
     std::vector<ggml_tensor*> kv_k_, kv_v_;
     ggml_tensor*          kv_pad_ = nullptr;   // clears the BAR ceiling at short contexts
 
+    // PERENOSIMOE SOSTOJANIE DELTA-SETI, na karte, v teh zhe buferah, chto i vesa sloev.
+    // 2,09 MiB na sloj, 75,4 MiB na 36 sloev - fiksirovanno i ne rastjot s kontekstom. Ono
+    // chitaetsja I pishetsja kazhdym tokenom na meste (ggml_ssm_conv i ggml_delta_net), tak chto
+    // vozit ego mezhdu hostom i kartoj znachilo by 150 MiB v obe storony na token radi nichego.
+    // Hostu ono nuzhno rovno odin raz: posle prefilla (kotoryj schitaetsja na CPU) sostojanie
+    // nado podnjat na kartu - eto i delaet upload_delta.
+    std::vector<ggml_tensor*> dstate_;
+    std::size_t               dstate_elems_ = 0;
+
     // Inputs the layer path writes per step: the layer's hidden state, the position, and the
     // attention mask. Small, so they land in the BAR window, which is exactly where a
     // host-written input wants to be.
@@ -520,6 +620,10 @@ class GpuStatic {
     // nih RAZNAJA: polnyj sloj chitaet n_kv pozicij, okonnyj - tolko okno. Shejder softmax
     // shagaet imenno po ne[0] svoej maski, tak chto odnim tenzorom oboih ne obsluzhit.
     ggml_tensor*          t_mask_sw_ = nullptr;
+    // ggml_ssm_conv trebuet kartu posledovatelnostej otdelnym tenzorom. U nas ona vsegda nol -
+    // odna posledovatelnost, - no ona objazana lezhat v pisuemom bufere i byt zapolnena: chuzhoj
+    // musor v nej adresuet chuzhoj slot sostojanija.
+    ggml_tensor*          t_seq_  = nullptr;   // [1, W] I32, nuli
     const void*           step_mask_sw_src_ = nullptr;  // chej srez uzhe lezhit v t_mask_sw_
     // Suzhat li chtenie u okonnyh sloev. Reshaetsja pri POSTROENII grafa (ot etogo zavisit
     // ekstent vidov), poetomu klyuch chitaetsja odin raz i zapominaetsja.
