@@ -208,6 +208,12 @@ llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 
 
+# MemeX: test-backend-ops lezhal v dereve, no ni odna cel ego ne sobirala - poetomu sverki
+# operacij Vulkan protiv CPU zdes nikogda i ne bylo. Registriruetsja bez add_test: on trebuet
+# ustrojstva i argumentov (-b Vulkan0 -o <OP>), tak chto v ctest emu mesta net.
+add_executable(test-backend-ops test-backend-ops.cpp)
+target_link_libraries(test-backend-ops PRIVATE common)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

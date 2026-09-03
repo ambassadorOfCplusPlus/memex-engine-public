@@ -463,6 +463,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_relu[2];
     vk_pipeline pipeline_tanh[2];
     vk_pipeline pipeline_sigmoid[2];
+    vk_pipeline pipeline_exp[2];
+    vk_pipeline pipeline_softplus[2];
 
     vk_pipeline pipeline_geglu[2];
     vk_pipeline pipeline_reglu[2];
@@ -490,6 +492,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_pool2d_f32;
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
+    vk_pipeline pipeline_ssm_conv_f32;
+    vk_pipeline pipeline_delta_net_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_conv2d_dw_whcn_f32;
     vk_pipeline pipeline_conv2d_dw_cwhn_f32;
@@ -901,6 +905,30 @@ struct vk_op_rwkv_wkv7_push_constants {
     uint32_t T;
     uint32_t C;
     uint32_t H;
+};
+
+// SSM_CONV: n_kv == 1, vse vhody nepreryvny (proverjaetsja v supports_op), poetomu shagov
+// v konstantah net - tolko geometrija.
+struct vk_op_ssm_conv_push_constants {
+    uint32_t nr;   // d_inner
+    uint32_t nc;   // d_conv
+    uint32_t n_t;  // n_tokens
+};
+
+// DELTA_NET: odin token, odna posledovatelnost. Shagi mezhdu golovami peredajutsja javno,
+// potomu chto postroitel prihodit s PERESTAVLENNYMI (permute) vidami: u nih ne-nulevye nb na
+// osjah dliny 1, tak chto ggml_is_contiguous na nih lozhen, a ploskoe indeksirovanie verno.
+struct vk_op_delta_net_push_constants {
+    uint32_t S;
+    uint32_t Hv;
+    uint32_t gqa;
+    uint32_t repeat_type;
+    uint32_t qk_hs;
+    uint32_t v_hs;
+    uint32_t g_hs;
+    uint32_t b_hs;
+    uint32_t out_size;
+    float    scale;
 };
 
 struct vk_op_conv2d_dw_push_constants {
@@ -3133,6 +3161,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     CREATE_UNARY(relu)
     CREATE_UNARY(tanh)
     CREATE_UNARY(sigmoid)
+    CREATE_UNARY(exp)
+    CREATE_UNARY(softplus)
 #undef CREATE_UNARY
 
 #define CREATE_GLU(name)  \
@@ -3198,6 +3228,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv7_f32, "rwkv_wkv7_f32", rwkv_wkv7_f32_len, rwkv_wkv7_f32_data, "main", 8, sizeof(vk_op_rwkv_wkv7_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
+
+    // ssm_conv: odna nit na kanal, 128 nitej v gruppe -> denom 128 po pervoj osi.
+    // delta_net: odna gruppa na V-golovu -> denom 1, chislo golov peredajotsja kak elements.
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {128, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_delta_net_f32, "delta_net_f32", delta_net_f32_len, delta_net_f32_data, "main", 7, sizeof(vk_op_delta_net_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -6925,11 +6960,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_rms_norm_back_f32;
         }
         return nullptr;
-    //case GGML_OP_L2_NORM:
-    //    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-    //        return ctx->device->pipeline_l2_norm_f32;
-    //    }
-    //    return nullptr;
+    case GGML_OP_L2_NORM:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_l2_norm_f32;
+        }
+        return nullptr;
     case GGML_OP_UNARY:
         if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) ||
             (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) ||
@@ -6952,6 +6987,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 return ctx->device->pipeline_tanh[dst->type == GGML_TYPE_F16];
             case GGML_UNARY_OP_SIGMOID:
                 return ctx->device->pipeline_sigmoid[dst->type == GGML_TYPE_F16];
+            case GGML_UNARY_OP_EXP:
+                return ctx->device->pipeline_exp[dst->type == GGML_TYPE_F16];
+            case GGML_UNARY_OP_SOFTPLUS:
+                return ctx->device->pipeline_softplus[dst->type == GGML_TYPE_F16];
             default:
                 break;
         }
@@ -7385,7 +7424,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     switch (op) {
     case GGML_OP_NORM:
     case GGML_OP_RMS_NORM_BACK:
-    //case GGML_OP_L2_NORM:
+    case GGML_OP_L2_NORM:
     case GGML_OP_SOFT_MAX:
     case GGML_OP_SOFT_MAX_BACK:
     case GGML_OP_SUM_ROWS:
@@ -7774,6 +7813,147 @@ static void ggml_vk_op_f32_wkv(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 }
 
+// ---------------------------------------------------------------- MemeX: SSM_CONV i DELTA_NET
+//
+// Oba - operacii dlja dekoda gejted delta-seti qwen3next. U nih bolshe treh istochnikov, poetomu
+// obshchij ggml_vk_op_f32 (on znaet rovno src0..src2) ne goditsja, i sbor buferov sdelan zdes po
+// obrazcu ggml_vk_op_f32_wkv vyshe.
+//
+// Pochemu ne odna obshchaja funkcija na oba: ggml_vk_dispatch_pipeline prinimaet
+// std::initializer_list, kotoryj nelzja sobrat v cikle, tak chto chislo buferov objazano byt
+// zapisano v kode. Sosednij wkv reshaet to zhe if-om po versii; zdes dve otdelnye funkcii.
+
+// Sobiraet bufer i smeshchenie dlja n pervyh istochnikov uzla. UMA-put povtorjaet
+// ggml_vk_op_f32_wkv: na integrirovannoj pamjati tenzor mozhet lezhat v host-visible bufere,
+// i togda ego nado brat ottuda, a ne iz dev_buffer.
+static void ggml_vk_gather_srcs(ggml_backend_vk_context * ctx, const ggml_tensor * dst, int n,
+                                vk_buffer * bufs, size_t * offs, uint64_t * sizes) {
+    for (int i = 0; i < n; i++) {
+        const ggml_tensor * src = dst->src[i];
+        GGML_ASSERT(src != nullptr);
+        bufs[i]  = nullptr;
+        offs[i]  = 0;
+        sizes[i] = ggml_nbytes(src);
+        bool uma = false;
+        if (ctx->device->uma) {
+            ggml_vk_host_get(ctx->device, src->data, bufs[i], offs[i]);
+            uma = bufs[i] != nullptr;
+        }
+        if (!uma) {
+            ggml_backend_vk_buffer_context * bc = (ggml_backend_vk_buffer_context *)src->buffer->context;
+            bufs[i] = bc->dev_buffer;
+            offs[i] = vk_tensor_offset(src) + src->view_offs;
+        }
+    }
+}
+
+static void ggml_vk_get_dst(ggml_backend_vk_context * ctx, ggml_tensor * dst,
+                            vk_buffer & buf, size_t & off, uint64_t & size) {
+    buf  = nullptr;
+    off  = 0;
+    size = ggml_nbytes(dst);
+    bool uma = false;
+    if (ctx->device->uma) {
+        ggml_vk_host_get(ctx->device, dst->data, buf, off);
+        uma = buf != nullptr;
+    }
+    if (!uma) {
+        ggml_backend_vk_buffer_context * bc = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+        buf = bc->dev_buffer;
+        off = vk_tensor_offset(dst) + dst->view_offs;
+    }
+}
+
+static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    const ggml_tensor * s   = dst->src[0];  // okno [d_conv-1, d_inner, n_kv]
+    const ggml_tensor * x   = dst->src[1];  // [d_inner, n_tokens]
+    const ggml_tensor * c   = dst->src[2];  // [d_conv, d_inner]
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    const uint32_t nc  = (uint32_t)c->ne[0];
+    const uint32_t nr  = (uint32_t)s->ne[1];
+    const uint32_t n_t = (uint32_t)x->ne[1];
+
+    vk_op_ssm_conv_push_constants pc = { nr, nc, n_t };
+
+    ggml_vk_sync_buffers(subctx);
+
+    vk_buffer bufs[3]; size_t offs[3]; uint64_t sizes[3];
+    ggml_vk_gather_srcs(ctx, dst, 3, bufs, offs, sizes);
+    vk_buffer d_D; size_t d_off; uint64_t d_size;
+    ggml_vk_get_dst(ctx, dst, d_D, d_off, d_size);
+
+    std::array<uint32_t, 3> elements = { nr, 1, 1 };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        vk_subbuffer{ bufs[0], offs[0], sizes[0] },
+        vk_subbuffer{ bufs[1], offs[1], sizes[1] },
+        vk_subbuffer{ bufs[2], offs[2], sizes[2] },
+        vk_subbuffer{ d_D, d_off, d_size }
+    }, pc, elements);
+}
+
+static void ggml_vk_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    const ggml_tensor * q  = dst->src[0];
+    const ggml_tensor * v  = dst->src[2];
+    const ggml_tensor * g  = dst->src[3];
+    const ggml_tensor * bt = dst->src[4];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_pipeline pipeline = ctx->device->pipeline_delta_net_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    const uint32_t S   = (uint32_t)q->ne[0];
+    const uint32_t Hk  = (uint32_t)q->ne[2];
+    const uint32_t Hv  = (uint32_t)v->ne[2];
+    const uint32_t gqa = Hv / Hk;
+
+    vk_op_delta_net_push_constants pc = {
+        S, Hv, gqa, (uint32_t)dst->op_params[0],
+        (uint32_t)(q->nb[2] / sizeof(float)),
+        (uint32_t)(v->nb[2] / sizeof(float)),
+        (uint32_t)(g->nb[2] / sizeof(float)),
+        (uint32_t)(bt->nb[2] / sizeof(float)),
+        S * Hv,
+        1.0f / sqrtf((float)S)
+    };
+
+    ggml_vk_sync_buffers(subctx);
+
+    vk_buffer bufs[6]; size_t offs[6]; uint64_t sizes[6];
+    ggml_vk_gather_srcs(ctx, dst, 6, bufs, offs, sizes);
+    vk_buffer d_D; size_t d_off; uint64_t d_size;
+    ggml_vk_get_dst(ctx, dst, d_D, d_off, d_size);
+
+    std::array<uint32_t, 3> elements = { Hv, 1, 1 };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        vk_subbuffer{ bufs[0], offs[0], sizes[0] },
+        vk_subbuffer{ bufs[1], offs[1], sizes[1] },
+        vk_subbuffer{ bufs[2], offs[2], sizes[2] },
+        vk_subbuffer{ bufs[3], offs[3], sizes[3] },
+        vk_subbuffer{ bufs[4], offs[4], sizes[4] },
+        vk_subbuffer{ bufs[5], offs[5], sizes[5] },
+        vk_subbuffer{ d_D, d_off, d_size }
+    }, pc, elements);
+}
+// ---------------------------------------------------------------- MemeX end
+
 #if 0
 static void ggml_vk_rwkv_wkv6(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
     const size_t seq_length = dst->src[0]->ne[2];
@@ -8128,12 +8308,10 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
             { (uint32_t)ggml_nelements(dst), (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], (uint32_t)(dst->nb[1]/sizeof(float)), (uint32_t)(src0->nb[1]/sizeof(float)), nadd }, dryrun);
 }
 
-#if 0
 static void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
     float * op_params = (float *)dst->op_params;
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, dst, GGML_OP_L2_NORM, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0], 0.0f }, dryrun);
 }
-#endif
 
 static void ggml_vk_unary(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, dst, GGML_OP_UNARY, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f }, dryrun);
@@ -9383,6 +9561,8 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         case GGML_UNARY_OP_RELU:
         case GGML_UNARY_OP_TANH:
         case GGML_UNARY_OP_SIGMOID:
+        case GGML_UNARY_OP_EXP:
+        case GGML_UNARY_OP_SOFTPLUS:
             break;
         default:
             return false;
@@ -9429,7 +9609,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_FUSED_RMS_NORM:
     case GGML_OP_FUSED_MUL_UNARY:
     case GGML_OP_MULTI_ADD:
-    //case GGML_OP_L2_NORM:
+    case GGML_OP_L2_NORM:
+    case GGML_OP_SSM_CONV:
+    case GGML_OP_DELTA_NET:
     case GGML_OP_DIAG_MASK_INF:
     case GGML_OP_SOFT_MAX:
     case GGML_OP_SOFT_MAX_BACK:
@@ -9499,7 +9681,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         case GGML_OP_FUSED_RMS_NORM:
         case GGML_OP_FUSED_MUL_UNARY:
         case GGML_OP_MULTI_ADD:
-        //case GGML_OP_L2_NORM:
+        case GGML_OP_L2_NORM:
         case GGML_OP_UNARY:
         //case GGML_OP_GLU:
         case GGML_OP_DIAG_MASK_INF:
@@ -9644,10 +9826,18 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_MULTI_ADD:
         ggml_vk_multi_add(ctx, compute_ctx, src0, node, dryrun);
         break;
-    //case GGML_OP_L2_NORM:
-    //    ggml_vk_l2_norm(ctx, compute_ctx, src0, node, dryrun);
+    case GGML_OP_L2_NORM:
+        ggml_vk_l2_norm(ctx, compute_ctx, src0, node, dryrun);
 
-    //    break;
+        break;
+    case GGML_OP_SSM_CONV:
+        ggml_vk_ssm_conv(ctx, compute_ctx, node, dryrun);
+
+        break;
+    case GGML_OP_DELTA_NET:
+        ggml_vk_delta_net(ctx, compute_ctx, node, dryrun);
+
+        break;
     case GGML_OP_UNARY:
         switch (ggml_get_unary_op(node)) {
         case GGML_UNARY_OP_SILU:
@@ -9657,6 +9847,8 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         case GGML_UNARY_OP_RELU:
         case GGML_UNARY_OP_TANH:
         case GGML_UNARY_OP_SIGMOID:
+        case GGML_UNARY_OP_EXP:
+        case GGML_UNARY_OP_SOFTPLUS:
             ggml_vk_unary(ctx, compute_ctx, src0, node, dryrun);
             break;
         default:
@@ -9854,7 +10046,9 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     case GGML_OP_FUSED_RMS_NORM:
     case GGML_OP_FUSED_MUL_UNARY:
     case GGML_OP_MULTI_ADD:
-    //case GGML_OP_L2_NORM:
+    case GGML_OP_L2_NORM:
+    case GGML_OP_SSM_CONV:
+    case GGML_OP_DELTA_NET:
     case GGML_OP_DIAG_MASK_INF:
     case GGML_OP_SOFT_MAX:
     case GGML_OP_SOFT_MAX_BACK:
@@ -9893,6 +10087,8 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
         case GGML_UNARY_OP_RELU:
         case GGML_UNARY_OP_TANH:
         case GGML_UNARY_OP_SIGMOID:
+        case GGML_UNARY_OP_EXP:
+        case GGML_UNARY_OP_SOFTPLUS:
             buf = tensor->buffer;
             break;
         default:
@@ -11078,6 +11274,8 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_EXP:
+                case GGML_UNARY_OP_SOFTPLUS:
                     return ggml_is_contiguous(op->src[0]) &&
                            (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
@@ -11354,7 +11552,7 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
             return true;
         case GGML_OP_NORM:
         case GGML_OP_GROUP_NORM:
-        //case GGML_OP_L2_NORM:
+        case GGML_OP_L2_NORM:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_ADD:
         case GGML_OP_SUB:
@@ -11395,6 +11593,98 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
             return true;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+        // ------------------------------------------------ MemeX: dekod gejted delta-seti
+        // Oba otkaza nizhe - JAVNYE i UZKIE. Pravilo proekta: esli sluchaj ne pokryt, vernut
+        // false i pustit ego na CPU, a ne dat medlennyj ili nevernyj put. Imenno na etom uzhe
+        // gorel repeat_type (STATE.md, lovushka 7.1): rabotajushchij graf s drugim otvetom.
+        case GGML_OP_SSM_CONV:
+            {
+                const ggml_tensor * s   = op->src[0];  // okno [d_conv-1, d_inner, n_kv]
+                const ggml_tensor * x   = op->src[1];  // [d_inner, n_tokens]
+                const ggml_tensor * c   = op->src[2];  // [d_conv, d_inner]
+                if (!s || !x || !c) {
+                    return false;
+                }
+                if (s->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+                    c->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // n_kv > 1 (neskolko posledovatelnostej) trebuet kopij sostojanij po
+                // state_seq - ne sdelano.
+                if (s->ne[2] != 1) {
+                    return false;
+                }
+                // src[4] - poshagovyj snimok okna dlja prefilla; otdelnyj bufer, ne sdelan.
+                if (op->src[4] != nullptr) {
+                    return false;
+                }
+                // MAX_D_CONV v shejdere.
+                if (c->ne[0] > 8) {
+                    return false;
+                }
+                return ggml_is_contiguous(s) && ggml_is_contiguous(x) &&
+                       ggml_is_contiguous(c) && ggml_is_contiguous(op);
+            }
+        case GGML_OP_DELTA_NET:
+            {
+                for (int i = 0; i < 6; i++) {
+                    if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
+                        return false;
+                    }
+                }
+                if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                const ggml_tensor * q  = op->src[0];
+                const ggml_tensor * k  = op->src[1];
+                const ggml_tensor * v  = op->src[2];
+                const ggml_tensor * g  = op->src[3];
+                const ggml_tensor * bt = op->src[4];
+                const ggml_tensor * st = op->src[5];
+                // saved_steps: promezhutochnye sostojanija dlja prefilla - ne sdelano.
+                if (op->src[6] != nullptr) {
+                    return false;
+                }
+                // Tolko dekod: odin token, odna posledovatelnost.
+                if (q->ne[1] != 1 || q->ne[3] != 1) {
+                    return false;
+                }
+                // g->ne[1] != 1 na CPU uvodit v put KDA (zatuhanie na kazhdyj stolbec) -
+                // eto DRUGAJA formula, a ne drugoj razmer.
+                if (g->ne[1] != 1) {
+                    return false;
+                }
+                const int64_t S = q->ne[0];
+                // Tolko 64 i 128: pri etih head_dim na CPU schitaet iqk_fused_delta_net, i
+                // imenno ego arifmetiku vosproizvodit shejder. Na ljubom drugom head_dim CPU
+                // uhodit v skaljarnyj otkat iz ggml.c, kotoryj DOPOLNITELNO L2-normiruet q i k
+                // vnutri operacii - sverka sravnivala by dve raznye formuly.
+                if (S != 64 && S != 128) {
+                    return false;
+                }
+                if (v->ne[0] != S || k->ne[0] != S) {
+                    return false;
+                }
+                const int64_t Hk = q->ne[2];
+                const int64_t Hv = v->ne[2];
+                if (Hk <= 0 || Hv <= 0 || Hv % Hk != 0) {
+                    return false;
+                }
+                if (st->ne[0] != S || st->ne[1] != S * Hv || !ggml_is_contiguous(st)) {
+                    return false;
+                }
+                // Shejder indeksiruet plosko po nb[2]; nulevoj shag i ne-f32 element ne godny.
+                if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(float) ||
+                    v->nb[0] != sizeof(float) || g->nb[0] != sizeof(float) ||
+                    bt->nb[0] != sizeof(float)) {
+                    return false;
+                }
+                if (q->nb[2] != k->nb[2]) {
+                    return false;
+                }
+                return true;
+            }
+        // ------------------------------------------------ MemeX end
         default:
             return false;
     }

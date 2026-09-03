@@ -80,7 +80,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             }
         }
 
-        ggml_quantize_chunk(tensor->type, data.data(), dataq.data(), 0, size/tensor->ne[0], tensor->ne[0], im);
+        ggml_quantize_chunk(tensor->type, data.data(), dataq.data(), 0, size/tensor->ne[0], tensor->ne[0], im, nullptr);
         GGML_ASSERT(ggml_validate_row_data(tensor->type, dataq.data(), dataq.size()));
         // TODO: other cases
         //#pragma omp parallel for
@@ -384,7 +384,13 @@ struct test_case {
         mode = MODE_TEST;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            // MemeX: bylo 128. Cepochka iz 16 shagov delta-seti sozdajot okolo 208 tenzorov
+            // (pjat vhodov i chasovoj na kazhdyj shag plus vidy), i kontekst perepolnjalsja:
+            // ggml_new_object vozvrashchal NULL, sledujushchee obrashchenie padalo po adresu.
+            // Otkaz vygljadel kak proizvolnoe padenie POSLE poslednego napechatannogo testa
+            // ljubogo filtra - potomu chto eval() stroit graf KAZHDOGO sluchaja i tolko potom
+            // sravnivaet imja operacii s filtrom.
+            /* .mem_size = */ ggml_tensor_overhead()*1024 + ggml_graph_overhead(),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -545,7 +551,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*1024 + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -962,6 +968,154 @@ struct test_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_L2_NORM
+struct test_l2_norm : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    float eps;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, eps);
+    }
+
+    test_l2_norm(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 10, 10, 10},
+            float eps = 1e-6f)
+        : type(type), ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * out = ggml_l2_norm(ctx, a, eps);
+        return out;
+    }
+};
+
+// GGML_OP_SSM_CONV
+//
+// Formy modeli Qwen3-Coder-Next (arhitektura qwen3next): d_conv 4, d_inner (conv_dim) 8192,
+// odin token, odna posledovatelnost. Vyhod operacii - dva bloka v odnom tenzore: svjornutye
+// znachenija [d_inner, n_tokens], zatem novoe okno [d_conv, d_inner, n_kv]; sravnivaetsja
+// celikom, to est i svjortka, i okno.
+//
+// CHEGO ETOT SLUCHAJ NE PROVERJAET: n_kv > 1 (kopii sostojanij po state_seq) i saved_steps
+// (poshagovyj snimok okna dlja prefilla). Oba na Vulkan otkazany v supports_op.
+struct test_ssm_conv : public test_case {
+    const int64_t d_conv;
+    const int64_t d_inner;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR3(d_conv, d_inner, n_tokens);
+    }
+
+    test_ssm_conv(int64_t d_conv = 4, int64_t d_inner = 8192, int64_t n_tokens = 1)
+        : d_conv(d_conv), d_inner(d_inner), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * s  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, d_inner, 1);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner, n_tokens);
+        ggml_tensor * c  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
+        ggml_tensor * sq = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_tokens);
+        ggml_set_name(sq, "ssm_seq_ids");
+        ggml_tensor * out = ggml_ssm_conv(ctx, s, x, c, sq, nullptr);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                // Pri odnoj posledovatelnosti edinstvennyj dopustimyj identifikator - nol.
+                // init_tensor_uniform zapisyvaet v i32 BITY sluchajnyh float, i CPU-etalon na
+                // takom vhode padaet na GGML_ASSERT(0 <= sq[0] && sq[0] < n_kv) - to est bez
+                // etoj vetki test lozhilsja by ne na oshibke bekenda.
+                std::vector<int32_t> zeros(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, zeros.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_DELTA_NET
+//
+// Formy modeli: S_k = S_v = 128, 16 K-golov, 32 V-golovy, sostojanie [128, 128*32] f32 = 2 MiB.
+// repeat_type 0 - V-golova h berjot K-golovu h/gqa (slityj ssm_ba, qwen3next), 1 - h % H_k
+// (qwen35moe). Oba proverjajutsja.
+//
+// `steps` cepochkoj svjazyvaet neskolko shagov: sostojanie sledujushchego shaga - view na
+// hvost rezultata predydushchego. Eto i est proverka NAKOPLENIJA oshibki: pri steps = 16
+// poslednij uzel nesjot 16 posledovatelnyh obnovlenij sostojanija, a ne odno.
+//
+// g (zatuhanie) po umolchaniju berjotsja OTRICATELNYM, kak v modeli: tam gate =
+// softplus(alpha + dt) * ssm_a, a ssm_a v fajle otricatelen, tak chto decay = exp(g) lezhit v
+// (0,1). Pri g > 0 za 16 shagov sostojanie ushlo by v ogranichitel +-1e6, i sverka mjerila by
+// sovpadenie ogranichitelej, a ne rekurrenciju. Odin sluchaj s g v [-1,1] ostavlen otdelno -
+// on kak raz proverjaet decay > 1 na odnom shage.
+//
+// CHEGO ETOT SLUCHAJ NE PROVERJAET: n_tokens > 1, n_seqs > 1, saved_steps, put KDA
+// (g->ne[1] == S_v, zatuhanie na kazhdyj stolbec). Vse oni na Vulkan otkazany v supports_op.
+struct test_delta_net : public test_case {
+    const int64_t S;   // head_dim
+    const int64_t Hk;  // K/Q-golovy
+    const int64_t Hv;  // V-golovy
+    const int repeat_type;
+    const int steps;
+    const float g_lo;
+    const float g_hi;
+
+    std::string vars() override {
+        return VARS_TO_STR7(S, Hk, Hv, repeat_type, steps, g_lo, g_hi);
+    }
+
+    // 128 slagaemyh na skaljarnoe proizvedenie v f32 plus drevesnaja summa v shejdere protiv
+    // posledovatelnoj u CPU: porjadok slozhenija raznyj, poetomu porog vyshe standartnogo 1e-7.
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_delta_net(int64_t S = 128, int64_t Hk = 16, int64_t Hv = 32,
+                   int repeat_type = 0, int steps = 1,
+                   float g_lo = -2.0f, float g_hi = -0.05f)
+        : S(S), Hk(Hk), Hv(Hv), repeat_type(repeat_type), steps(steps), g_lo(g_lo), g_hi(g_hi) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, S*Hv);
+        ggml_tensor * out = nullptr;
+
+        for (int i = 0; i < steps; i++) {
+            ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, 1, Hk, 1);
+            ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, 1, Hk, 1);
+            ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, 1, Hv, 1);
+            ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, Hv, 1);
+            ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, Hv, 1);
+            ggml_format_name(g, "dn_g_%d", i);
+
+            out = ggml_delta_net(ctx, q, k, v, g, b, state, nullptr);
+            out->op_params[0] = repeat_type;
+
+            if (i + 1 < steps) {
+                // Hvost rezultata - novoe sostojanie; view na nego nepreryven, tak chto
+                // ggml_delta_net primet ego bez kopii.
+                const size_t out_elems = (size_t) S * (size_t) Hv;
+                state = ggml_reshape_2d(ctx,
+                    ggml_view_1d(ctx, out, S*S*Hv, out_elems * sizeof(float)), S, S*Hv);
+            }
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strncmp(t->name, "dn_g_", 5) == 0) {
+                init_tensor_uniform(t, g_lo, g_hi);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
@@ -1261,6 +1415,65 @@ struct test_rope : public test_case {
     }
 };
 
+// GGML_OP_ROPE, rezhim rope_multi (MROPE)
+//
+// Sochetanie, kotorogo v etom dereve eshchjo ne proverjali: sekcii {11,11,10,0} PLUS n_rot 64
+// pri head_dim 256, to est vrashchaetsja tolko chetvert golovy, a hvost dolzhen ostatsja
+// netronutym. Imenno ono nuzhno dlja 12 sloev vnimanija qwen3next (HANDOFF_ROUTER.md, 10.3).
+// Baza 5e6 - iz fajla modeli (qwen3next.rope.freq_base).
+//
+// Pozicij CHETYRE na token: ggml_rope_multi trebuet a->ne[2]*4 == pos->ne[0]. Raskladka ta zhe,
+// chto u postroitelja: pos[i], pos[n+i], pos[2n+i] = t, pos[3n+i] = 0.
+struct test_rope_multi : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_a;
+    const int n_dims;
+    const int mode;
+    const int n_ctx;
+    const float freq_base;
+    std::array<int, 4> sections;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, ne_a, n_dims, mode, n_ctx, freq_base);
+    }
+
+    test_rope_multi(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne_a = {256, 16, 1, 1},
+            int n_dims = 64, int mode = GGML_ROPE_TYPE_MROPE, int n_ctx = 512,
+            float freq_base = 5000000.0f,
+            std::array<int, 4> sections = {11, 11, 10, 0})
+        : type(type), ne_a(ne_a), n_dims(n_dims), mode(mode), n_ctx(n_ctx),
+          freq_base(freq_base), sections(sections) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne_a[2] * 4);
+        int secs[GGML_MROPE_SECTIONS] = { sections[0], sections[1], sections[2], sections[3] };
+        ggml_tensor * out = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, secs, mode, 0,
+                                            freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                const int n = (int) ne_a[2];
+                std::vector<int> data(n * 4, 0);
+                for (int i = 0; i < n; i++) {
+                    const int t_pos = rand() % n_ctx;
+                    data[i]         = t_pos;
+                    data[n + i]     = t_pos;
+                    data[2*n + i]   = t_pos;
+                    data[3*n + i]   = 0;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_POOL2D
 struct test_pool2d : public test_case {
     enum ggml_op_pool pool_type;
@@ -1492,7 +1705,7 @@ struct test_upscale : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
         if (transpose) a = ggml_transpose(ctx, a);
-        ggml_tensor * out = ggml_upscale(ctx, a, scale_factor);
+        ggml_tensor * out = ggml_upscale(ctx, a, scale_factor, GGML_SCALE_MODE_NEAREST);
         return out;
     }
 };
@@ -1514,7 +1727,7 @@ struct test_upscale_ext : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_tensor * out = ggml_upscale_ext(ctx, a, ne_tgt[0], ne_tgt[1],ne_tgt[2], ne_tgt[3]);
+        ggml_tensor * out = ggml_upscale_ext(ctx, a, ne_tgt[0], ne_tgt[1], ne_tgt[2], ne_tgt[3], GGML_SCALE_MODE_NEAREST);
         return out;
     }
 };
@@ -2261,6 +2474,40 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 10, 10, 10}, eps));
     }
 
+    // ---------------------------------------------------------------- MemeX, shag 3a
+    // Formy imenno etoj modeli, ne obobshchjonnye: eps 1e-6 snjat s samogo fajla
+    // (qwen3next.attention.layer_norm_rms_epsilon = 9.999999974752427e-07).
+    test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {128, 16, 1, 1}, 1e-6f));
+    test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {128, 32, 1, 1}, 1e-6f));
+    test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {64, 10, 10, 10}, 1e-6f));
+
+    test_cases.emplace_back(new test_ssm_conv(4, 8192, 1));
+    test_cases.emplace_back(new test_ssm_conv(4, 8192, 4));
+    test_cases.emplace_back(new test_ssm_conv(4, 128, 1));
+
+    test_cases.emplace_back(new test_delta_net(128, 16, 32, 0, 1));
+    test_cases.emplace_back(new test_delta_net(128, 16, 32, 1, 1));
+    // decay > 1 na odnom shage
+    test_cases.emplace_back(new test_delta_net(128, 16, 32, 0, 1, -1.0f, 1.0f));
+    // nakoplenie sostojanija: 16 shagov podrjad
+    test_cases.emplace_back(new test_delta_net(128, 16, 32, 0, 16));
+    test_cases.emplace_back(new test_delta_net(128, 16, 32, 1, 16));
+    // head_dim 64: vtoraja shirina, na kotoroj CPU idjot cherez iqk
+    test_cases.emplace_back(new test_delta_net(64, 8, 16, 0, 1));
+
+    // rope_multi (MROPE) s sekcijami {11,11,10,0} i n_rot 64 < head_dim 256, baza 5e6 -
+    // otkrytyj vopros 10.3 iz HANDOFF_ROUTER.md; zdes tolko PROVERKA, bez pravki.
+    test_cases.emplace_back(new test_rope_multi(GGML_TYPE_F32, {256, 16, 1, 1}, 64,
+                                                GGML_ROPE_TYPE_MROPE, 512, 5000000.0f, {11, 11, 10, 0}));
+    test_cases.emplace_back(new test_rope_multi(GGML_TYPE_F32, {256,  2, 1, 1}, 64,
+                                                GGML_ROPE_TYPE_MROPE, 512, 5000000.0f, {11, 11, 10, 0}));
+    // kontrol: te zhe sekcii pri n_rot == head_dim, i tekstovaja forma s nulevymi sekcijami
+    test_cases.emplace_back(new test_rope_multi(GGML_TYPE_F32, {256, 16, 1, 1}, 256,
+                                                GGML_ROPE_TYPE_MROPE, 512, 5000000.0f, {32, 32, 32, 32}));
+    test_cases.emplace_back(new test_rope_multi(GGML_TYPE_F32, {256, 16, 1, 1}, 64,
+                                                GGML_ROPE_TYPE_MROPE, 512, 5000000.0f, {0, 0, 0, 0}));
+    // ---------------------------------------------------------------- MemeX end
+
 #if 1
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
@@ -2449,47 +2696,27 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_leaky_relu());
 
-    for (bool v : {false, true}) {
-        test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {512, 512, 1, 1}, 0, 1, 0, 1, 0, 0, 0, 0, v));
-        test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 1, 2, 3, 4, 5, 6, 7, 8, v));
-    }
+    // test_pad_ext v etom dereve ne opredeljon: registracija prishla iz bolee novogo apstrima,
+    // a struktura - net. Otkljucheno, chtoby fajl voobshche sobiralsja; PAD proverjaetsja
+    // sluchaem test_pad vyshe.
 
-    for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 576 }) {
-        for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
-            if (hsk != 192 && hsk != 576 && hsk != hsv) continue;
-            if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
-            if (hsk == 576 && hsv != 512) continue; // DeepSeek MLA
-
-            for (bool mask : { true, false } ) {
-                for (bool sinks : { true, false } ) {
-                    for (float max_bias : { 0.0f, 8.0f }) {
-                        if (!mask && max_bias > 0.0f) continue;
-                        for (float logit_softcap : {0.0f, 10.0f}) {
-                            if (hsk != 128 && logit_softcap != 0.0f) continue;
-                            for (int nh : { 4, }) {
-                                for (int nr3 : { 1, 3, }) {
-                                    if (hsk > 64 && nr3 > 1) continue; // skip broadcast for large head sizes
-                                    for (int nr2 : { 1, 4, 16 }) {
-                                        if (nr2 == 16 && hsk != 128) continue;
-                                        //for (int kv : { 1, 17, 31, 33, 61, 113, 65, 127, 129, 130, 255, 260, 371, 380, 407, 512, 1024, }) {
-                                        for (int kv : { 113, 512, 1024, }) {
-                                            if (nr2 != 1 && kv != 512) continue;
-                                            for (int nb : { 1, 3, 32, 35, }) {
-                                                for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
-                                                    if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
-                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
-                                                        test_cases.emplace_back(new test_flash_attn_ext(
-                                                                    hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV));
-                                                        // run fewer test cases permuted
-                                                        if (mask == true && max_bias == 0.0f && logit_softcap == 0 && kv == 512) {
-                                                            test_cases.emplace_back(new test_flash_attn_ext(
-                                                                        hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, {0, 2, 1, 3}));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+    // FLASH_ATTN_EXT. Struktura test_flash_attn_ext v etom dereve prinimaet vosem argumentov
+    // (hs, nh, kv, nb, mask, max_bias, softcap, type_KV), a stojavshij zdes perebor byl napisan
+    // pod bolee novyj apstrim s dvenadcatju (razdelnye hsk/hsv, sinks, prec, permute). Perebor
+    // privedjon k tomu, chto struktura umeet; sluchai s raznymi hsk/hsv, sinks i permute
+    // NE PROVERJAJUTSJA - dlja nih v dereve net ni polej, ni postroitelja grafa.
+    for (int hs : { 64, 80, 128, 256, }) {
+        for (bool mask : { true, false } ) {
+            for (float max_bias : { 0.0f, 8.0f }) {
+                if (!mask && max_bias > 0.0f) continue;
+                for (float softcap : {0.0f, 10.0f}) {
+                    if (hs != 128 && softcap != 0.0f) continue;
+                    for (int nh : { 32, }) {
+                        for (int kv : { 512, 1024, }) {
+                            for (int nb : { 1, 3, 32, 35, }) {
+                                for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+                                    test_cases.emplace_back(new test_flash_attn_ext(
+                                                hs, nh, kv, nb, mask, max_bias, softcap, type_KV));
                                 }
                             }
                         }

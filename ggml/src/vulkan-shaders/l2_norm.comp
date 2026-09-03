@@ -33,7 +33,14 @@ void main() {
         barrier();
     }
 
-    const FLOAT_TYPE scale = inversesqrt(max(sum[0], FLOAT_TYPE(p.param1)));
+    // eps ogranichivaet DELITEL, a ne summu kvadratov. CPU (ggml_compute_forward_l2_norm_f32):
+    //     scale = 1 / fmaxf(sqrtf(sum), eps)
+    // Zdes ranshe stojalo inversesqrt(max(sum, eps)) - to zhe, chto 1/max(sqrt(sum), sqrt(eps)),
+    // to est pri eps 1e-6 modeli porog byl 1e-3 vmesto 1e-6, v tysjachu raz vyshe. Na normalnyh
+    // po velichine strokah oba vyrazhenija sovpadajut (eps ne srabatyvaet vovse), poetomu
+    // rashozhdenie prosnulos by tolko na pochti nulevoj stroke - i vygljadelo by kak oshibka
+    // vychislenija, a ne kak drugoj porog.
+    const FLOAT_TYPE scale = FLOAT_TYPE(1.0f) / max(sqrt(sum[0]), FLOAT_TYPE(p.param1));
 
     [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
         data_d[row*p.KX + col] = D_TYPE(scale * FLOAT_TYPE(data_a[row*p.KX + col]));

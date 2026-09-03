@@ -1,0 +1,69 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// Prichinnaja glubinnaja svjortka gejted delta-seti (GGML_OP_SSM_CONV) dlja odnoj
+// posledovatelnosti (n_kv == 1) i ljubogo chisla tokenov. Odna nit - odin kanal; tokeny nit
+// prohodit posledovatelno, potomu chto okno svjortki perenositsja ot tokena k tokenu.
+//
+// Raskladka vyhoda povtorjaet CPU (ggml_compute_forward_ssm_conv_f32, ggml/src/ggml.c):
+//   dst[0 .. nr*n_t)                       - svjornutye znachenija, [d_inner, n_tokens]
+//   dst[nr*n_t + ch*nc + i]                - novoe sostojanie, POLNAJA stroka shiriny nc
+// Stroka sostojanija - eto [okno_do_tokena[0..nc-2], x_tokena], to est ejo PERVYJ stolbec
+// budet otbroshen chitatelem: potrebitel berjot view so smeshcheniem 1 i shirinoj nc-1
+// (memex-fwd.cpp, new_conv). Pisat srazu nc-1 stolbcov bylo by proshche i NEVERNO - shag
+// mezhdu kanalami u chitatelja raven nc, a ne nc-1.
+
+#define BLOCK_SIZE 128
+#define MAX_D_CONV 8
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint nr;   // d_inner
+    uint nc;   // d_conv
+    uint n_t;  // n_tokens
+};
+
+layout(binding = 0) readonly  buffer SBuf { float s0[];  };  // [nc-1, nr, 1]
+layout(binding = 1) readonly  buffer XBuf { float x0[];  };  // [nr, n_t]
+layout(binding = 2) readonly  buffer CBuf { float cw[];  };  // [nc, nr]
+layout(binding = 3) writeonly buffer DBuf { float dst[]; };
+
+void main() {
+    const uint ch = gl_WorkGroupID.x * BLOCK_SIZE + gl_LocalInvocationID.x;
+    if (ch >= nr) {
+        return;
+    }
+
+    float win[MAX_D_CONV];
+    for (uint i = 0; i + 1 < nc; ++i) {
+        win[i] = s0[i + ch*(nc - 1)];
+    }
+
+    float row[MAX_D_CONV];
+    for (uint i = 0; i < MAX_D_CONV; ++i) {
+        row[i] = 0.0f;
+    }
+
+    for (uint t = 0; t < n_t; ++t) {
+        for (uint i = 0; i + 1 < nc; ++i) {
+            row[i] = win[i];
+        }
+        row[nc - 1] = x0[ch + t*nr];
+
+        float sum = 0.0f;
+        for (uint i = 0; i < nc; ++i) {
+            sum += row[i] * cw[i + ch*nc];
+        }
+        dst[ch + t*nr] = sum;
+
+        for (uint i = 0; i + 1 < nc; ++i) {
+            win[i] = row[i + 1];
+        }
+    }
+
+    for (uint i = 0; i < nc; ++i) {
+        dst[nr*n_t + i + ch*nc] = row[i];
+    }
+}

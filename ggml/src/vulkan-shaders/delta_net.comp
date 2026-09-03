@@ -1,0 +1,118 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// Gejted delta-set (GGML_OP_DELTA_NET) dlja ODNOGO tokena i odnoj posledovatelnosti.
+// Odna rabochaja gruppa - odna V-golova; nit vnutri gruppy - odna STROKA sostojanija.
+//
+// Arifmeticheskij etalon - NE skaljarnyj put iz ggml.c, a jadro iqk_fused_delta_net_impl
+// (ggml/src/iqk/iqk_mul_mat.cpp): pri head_dim 64 ili 128 imenno ono i schitaet na CPU, a
+// skaljarnyj otkat dopolnitelno L2-normiruet q i k vnutri operacii. Dva puti dajut RAZNYE
+// chisla na nenormirovannom vhode, poetomu supports_op propuskaet tolko head_dim 64 i 128 -
+// te, na kotoryh CPU garantirovanno idjot cherez iqk. Inache sverka s CPU sravnivala by
+// nashu realizaciju s drugoj formuloj i chestno pokazyvala by rashozhdenie.
+//
+//   decay = exp(min(g, 50));   beta = sigmoid(beta_raw)
+//   score = <k, q> / sqrt(S)
+//   v'[row]  = sum_col S[row + col*S] * k[col]
+//   o[row]   = sum_col S[row + col*S] * q[col]
+//   v_new    = v[row]*beta - v'[row]*beta*decay
+//   out[row] = o[row]*decay/sqrt(S) + v_new*score
+//   S[row + col*S] = clamp(decay*S[row + col*S] + v_new[row]*k[col], -1e6, 1e6)
+//
+// Sostojanie chitaetsja DVAZHDY: v'/o trebujut vseh stolbcov do togo, kak stanet izvesten
+// v_new, a 64 KiB na golovu v obshchuju pamjat rabochej gruppy ne kladutsja (predel ustrojstva
+// 32 KiB). Cena vtorogo chtenija - 2 MiB na sloj, ~16 mks na etoj karte; ona nazvana v otchjote,
+// a ne spisana v okruglenie.
+//
+// Chtenie sostojanija idjot po strokam: nit tid berjot S[tid + col*S], to est sosednie niti
+// berut sosednie adresa - odna transakcija na 128 nitej. Obratnaja raskladka (nit = stolbec)
+// dala by nepreryvnye 128 float na nit, no potrebovala by mezhnitevoj summy dlja kazhdoj iz
+// 128 strok.
+
+#define BLOCK_SIZE 128
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint S;            // head_dim (== S_k == S_v)
+    uint Hv;           // chislo V-golov
+    uint gqa;          // Hv / Hk
+    uint repeat_type;  // 0: K-golova = h/gqa (slityj ssm_ba, qwen3next); 1: h % Hk (qwen35moe)
+    uint qk_hs;        // shag mezhdu K-golovami v q i k, v elementah
+    uint v_hs;         // shag mezhdu V-golovami v v, v elementah
+    uint g_hs;         // shag mezhdu golovami v g, v elementah
+    uint b_hs;         // shag mezhdu golovami v beta, v elementah
+    uint out_size;     // skolko elementov dst zanjat vyhodom do sostojanija
+    float scale;       // 1/sqrt(S)
+};
+
+layout(binding = 0) readonly buffer QBuf { float q_d[];  };
+layout(binding = 1) readonly buffer KBuf { float k_d[];  };
+layout(binding = 2) readonly buffer VBuf { float v_d[];  };
+layout(binding = 3) readonly buffer GBuf { float g_d[];  };
+layout(binding = 4) readonly buffer BBuf { float b_d[];  };
+layout(binding = 5) readonly buffer SBuf { float st_d[]; };
+layout(binding = 6)          buffer DBuf { float dst[];  };
+
+shared float sh_k[BLOCK_SIZE];
+shared float sh_q[BLOCK_SIZE];
+shared float sh_vnew[BLOCK_SIZE];
+shared float sh_red[BLOCK_SIZE];
+
+void main() {
+    const uint h   = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (h >= Hv) {
+        return;
+    }
+
+    const uint hkq = (repeat_type == 0u) ? (h / gqa) : (h % (Hv / gqa));
+
+    const uint qk_off  = hkq * qk_hs;
+    const uint st_off  = h * S * S;
+    const uint out_off = h * S;
+
+    if (tid < S) {
+        sh_k[tid] = k_d[qk_off + tid];
+        sh_q[tid] = q_d[qk_off + tid];
+        sh_red[tid] = sh_k[tid] * sh_q[tid];
+    } else {
+        sh_red[tid] = 0.0f;
+    }
+    barrier();
+
+    [[unroll]] for (uint sft = BLOCK_SIZE / 2u; sft > 0u; sft >>= 1) {
+        if (tid < sft) {
+            sh_red[tid] += sh_red[tid + sft];
+        }
+        barrier();
+    }
+    const float score = sh_red[0] * scale;
+
+    const float decay = exp(min(g_d[h * g_hs], 50.0f));
+    const float beta  = 1.0f / (1.0f + exp(-b_d[h * b_hs]));
+
+    if (tid < S) {
+        float v_prime = 0.0f;
+        float out_val = 0.0f;
+        for (uint col = 0; col < S; ++col) {
+            const float s = st_d[st_off + tid + col * S];
+            v_prime += s * sh_k[col];
+            out_val += s * sh_q[col];
+        }
+        const float v_new = v_d[h * v_hs + tid] * beta - v_prime * beta * decay;
+        sh_vnew[tid] = v_new;
+        dst[out_off + tid] = out_val * decay * scale + v_new * score;
+    }
+    barrier();
+
+    if (tid < S) {
+        const float vn = sh_vnew[tid];
+        for (uint col = 0; col < S; ++col) {
+            const float s = decay * st_d[st_off + tid + col * S] + vn * sh_k[col];
+            dst[out_size + st_off + tid + col * S] = min(max(s, -1e6f), 1e6f);
+        }
+    }
+}

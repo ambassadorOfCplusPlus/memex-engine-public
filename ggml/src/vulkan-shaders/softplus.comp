@@ -1,0 +1,27 @@
+#version 450
+
+#include "generic_head.comp"
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+void main() {
+    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+
+    if (i >= p.KX) {
+        return;
+    }
+    // Etalon - ggml_compute_softplus_f32 iz ggml/src/ggml.c:
+    //     x > 20 ? x : logf(1 + expf(x))
+    // Porog 20 zdes ne priblizhenie, a uslovie korrektnosti: exp(89) v f32 uzhe beskonechnost,
+    // i bez vetki log(1+exp(x)) vernul by inf tam, gde otvet raven samomu x s tochnostju f32.
+    // Vetka postavlena rovno na tom zhe chisle, chto u CPU, chtoby raznica dvuh putej byla
+    // tolko okrugleniem, a ne razryvom v tochke pereklyuchenija.
+    const float x = float(data_a[i]);
+    data_d[i] = D_TYPE(x > 20.0f ? x : log(1.0f + exp(x)));
+}
