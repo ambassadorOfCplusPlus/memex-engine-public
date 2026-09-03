@@ -3289,7 +3289,8 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
 // that kind of difference as cosmetic.
 static ggml_tensor* qwen35_ffn(ggml_context* c, const HParams& h,
                                const Qwen35Weights::Layer& L, ggml_tensor* attn_out,
-                               int n_tokens, ggml_tensor** normed_out) {
+                               int n_tokens, ggml_tensor** normed_out,
+                               ggml_tensor** sel_out = nullptr, ggml_cgraph* gf = nullptr) {
     const float eps = h.rms_eps;
     ggml_tensor* x = fnorm(c, attn_out, L.ffn_norm, eps);
     if (normed_out) *normed_out = x;
@@ -3297,6 +3298,19 @@ static ggml_tensor* qwen35_ffn(ggml_context* c, const HParams& h,
     ggml_tensor* rlogits = ggml_mul_mat(c, L.router, x);
     ggml_tensor* probs = ggml_soft_max(c, rlogits);
     ggml_tensor* sel = ggml_top_k(c, probs, h.n_expert_used);
+    if (sel_out) {
+        // Nepreryvnaja KOPIJA, a ne sam sel: ego bufer gallocr pereispolzuet, kak tolko
+        // potrebiteli otrabotali, i togda vse sloi prochitalis by kak poslednij - eto uzhe
+        // sluchalos s zondami kartochnogo sloja i vygljadelo kak oshibka vychislenija.
+        ggml_tensor* cp = ggml_cont(c, sel);
+        ggml_set_output(cp);
+        // I V GRAF. ggml_set_output pinit bajty, no NE delaet uzel dostizhimym: kopiju nichto
+        // ne potrebljaet, gallocr ne daet ej bufera, i pervoe zhe chtenie padaet na
+        // GGML_ASSERT(buf != NULL). Rovno na eto ja uzhe napryvalsja s zondami kartochnogo
+        // sloja - poetomu zdes javnyj expand, a ne nadezhda.
+        if (gf) ggml_build_forward_expand(gf, cp);
+        *sel_out = cp;
+    }
     ggml_tensor* weights = ggml_get_rows(c,
         ggml_reshape_3d(c, probs, 1, h.n_expert, n_tokens), sel);
     weights = ggml_reshape_2d(c, weights, h.n_expert_used, n_tokens);
@@ -3513,7 +3527,8 @@ static ggml_tensor* qwen35_delta_layer(ggml_context* c, ggml_cgraph* gf, const H
 // the same feed-forward on both.
 bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
                        const Qwen35Weights& w, Cache& kv, DeltaState& ds, int n_tokens,
-                       int n_past, int n_kv, bool all_logits, bool keep_probes) {
+                       int n_past, int n_kv, bool all_logits, bool keep_probes,
+                       memex::GpuStatic* gstat = nullptr) {
     if (n_tokens <= 0 || n_kv <= 0 || n_past < 0) {
         printf("qwen35moe: бессмысленные размеры n_tokens %d, n_past %d, n_kv %d\n",
                n_tokens, n_past, n_kv);
@@ -3668,7 +3683,13 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         }
 
         ggml_tensor* normed = nullptr;
-        cur = qwen35_ffn(c, h, L, attn_out, n_tokens, keep_probes ? &normed : nullptr);
+        // Marshrutizacija naruzhu - dlja progreva rezidentnogo nabora i dlja zonda pokrytija
+        // ekspertov. Bez etogo krivuju pokrytija na Coder Next merit nechem: rezidentnyj nabor
+        // dlja etoj vetki otkazan, a znachit i sel_ids nikto ne sobiral.
+        ggml_tensor* sel_cp = nullptr;
+        cur = qwen35_ffn(c, h, L, attn_out, n_tokens, keep_probes ? &normed : nullptr,
+                         &sel_cp, g->gf);
+        if (sel_cp) g->sel_ids.push_back(sel_cp);
         if (keep_probes) {
             g->probes.push_back({"ffn_inp_normed-" + std::to_string(il), normed});
             g->probes.push_back({"l_out-" + std::to_string(il), cur});
@@ -3681,7 +3702,12 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
     }
     cur = fnorm(c, cur, w.out_norm, eps);
     if (keep_probes) g->probes.push_back({"result_norm", cur});
-    g->logits = ggml_mul_mat(c, w.out, cur);
+    // head_matmul, a ne ggml_mul_mat: pri --gpu-static vyhodnaja golova (243,4 MiB q6_K)
+    // lezhit v videopamjati. Eto SAMYJ krupnyj odinochnyj kusok perenosimoj statiki u etoj
+    // arhitektury, i stoit on ODNOGO peresechenija na token - samaja deshjovaja forma ceny.
+    // Pri gstat == nullptr head_matmul vozvrashchaet tot zhe ggml_mul_mat, tak chto bez flaga
+    // put bajt v bajt tot zhe, chto byl.
+    g->logits = head_matmul(c, w.out, cur, gstat);
     ggml_set_output(g->logits);
     for (auto& pr : g->probes) ggml_set_output(pr.second);
     ggml_build_forward_expand(g->gf, g->logits);
@@ -3791,7 +3817,7 @@ struct Generator {
         }
         if (q35) {
             return build_qwen35_step(g, buft, *h, *q35, kv, ds, n_tokens, n_past, n_kv_max,
-                                     all_logits, want_probes);
+                                     all_logits, want_probes, gstat);
         }
         return build_step(g, buft, *h, *w, kv, n_tokens, n_past, n_kv_max, min_experts,
                           expert_thresh, all_logits, /*zc=*/nullptr, /*keep_dbg=*/false,
@@ -6769,8 +6795,14 @@ int main(int argc, char** argv) {
         // No SLOI - drugoe delo. Postroitel gemma4 ne zovjot head_matmul vovse, tak chto put
         // golovy u nejo prosto ne ispolzuetsja, a zapret na nego zapreshchal zaodno i sloi. Tot
         // zhe sluchaj, chto s --gen: zapret okazalsja shire svoej prichiny.
-        if (!arch_q3 && !arch_g4) {
-            printf("--gpu-static: poka tolko qwen3moe i gemma4 - ostalnye arhitektury strojat "
+        // qwen35moe/qwen3next DOPUSHCHENY - no tolko k GOLOVE. Ejo tenzor u Coder Next tot
+        // zhe po forme i tipu, chto u qwen3moe (q6_K [2048, 151936], 243,4 MiB), tak chto ves
+        // put golovy - alloc_head, block, do_head i ego samoproverka - rabotaet bez pravok.
+        // SLOI dlja nih po-prezhnemu zapreshcheny vyshe: u modulja karty net programmy bloka
+        // ni dlja ih vnimanija, ni tem bolee dlja delta-seti (u Vulkan net ni odnoj ejo
+        // operacii - ni SSM_CONV, ni DELTA_NET, ni SOFTPLUS).
+        if (!arch_q3 && !arch_g4 && !arch_q35) {
+            printf("--gpu-static: poka tolko qwen3moe, gemma4, qwen35moe i qwen3next - "
                    "golovu svoim putjom, i podmena tam ne proverena\n");
             return 1;
         }
@@ -6830,7 +6862,14 @@ int main(int argc, char** argv) {
         }
         gstat.reset(new memex::GpuStatic());
         std::string serr;
-        if (!gstat->init(sc, arch_g4 ? w4.out : w.out, &serr)) {
+        // TRI vetki, a ne dve. Zdes stojal ternarnik arch_g4 ? w4.out : w.out, i dlja
+        // qwen35moe/qwen3next on peredaval golovu iz struktury QWEN3MOE - a ejo nikto ne
+        // zapolnjal. Otkaz prozvuchal tolko potomu, chto tam okazalsja nol ("output.weight
+        // otsutstvuet"), hotja golova u modeli EST: ona svjazana s token_embd, i sobstvennyj
+        // zagruzchik qwen35 eto uzhe uchjol. Bud struktura w zapolnena, na kartu ushla by
+        // golova DRUGOJ modeli - i eto ne upalo by.
+        ggml_tensor* head_w = arch_g4 ? w4.out : (arch_q35 ? w35.out : w.out);
+        if (!gstat->init(sc, head_w, &serr)) {
             printf("--gpu-static: %s\n", serr.c_str());
             return 1;
         }
@@ -6879,6 +6918,14 @@ int main(int argc, char** argv) {
                     S.ffn_down = L.down;
                 }
             } else {
+                // Eto ne "vsjo ostalnoe", a ROVNO put qwen3moe: u qwen35moe/qwen3next w.layers
+                // PUST (zapolnjaetsja w35), i chtenie zdes ushlo by za granicu. Derzhitsja ono
+                // tolko na zaprete sloev vyshe, poetomu skazano vsluh.
+                if (!arch_q3) {
+                    printf("vnutrennjaja oshibka: sloty sloev karty zapolnjajutsja "
+                           "putjom qwen3moe\n");
+                    return 1;
+                }
                 const Weights::Layer& L = w.layers[std::size_t(il)];
                 S.attn_norm = L.attn_norm; S.wq = L.wq; S.wk = L.wk; S.wv = L.wv; S.wo = L.wo;
                 S.q_norm = L.q_norm; S.k_norm = L.k_norm; S.ffn_norm = L.ffn_norm;
@@ -7492,7 +7539,7 @@ int main(int argc, char** argv) {
                                 rset.get(), /*gx=*/nullptr)
             : arch_q35
             ? build_qwen35_step(&pre, buft, h, w35, kv, hds, pre_w, 0, n_kv_max,
-                                /*all_logits=*/false, /*keep_probes=*/false)
+                                /*all_logits=*/false, /*keep_probes=*/false, gsp)
             : build_step(&pre, buft, h, w, kv, pre_w, 0, n_kv_max, min_experts, expert_thresh,
                          /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/false,
                          rset.get(), /*gx=*/nullptr, gsp);
@@ -7503,7 +7550,7 @@ int main(int argc, char** argv) {
                                     rset.get(), /*gx=*/nullptr)
                 : arch_q35
                 ? build_qwen35_step(&pre_tail, buft, h, w35, kv, hds, pre_tail_w, 0, n_kv_max,
-                                    /*all_logits=*/false, /*keep_probes=*/false)
+                                    /*all_logits=*/false, /*keep_probes=*/false, gsp)
                 : build_step(&pre_tail, buft, h, w, kv, pre_tail_w, 0, n_kv_max, min_experts,
                              expert_thresh, /*all_logits=*/false, /*zc=*/nullptr,
                              /*keep_dbg=*/false, rset.get(), /*gx=*/nullptr, gsp);
@@ -7613,7 +7660,9 @@ int main(int argc, char** argv) {
         // rsel po smeshcheniju off. Blok progreva nizhe eto vidit po rsel_filled i ne chitaet
         // sel_ids zanovo - inache on prochital by tolko poslednij kusok i nazval by ego
         // vsem promtom.
-        if (rset) rsel.assign(size_t(h.n_layer) * size_t(h.n_expert_used) * size_t(n), 0);
+        // rsel nuzhen ne tolko rezidentnomu naboru: zond pokrytija ekspertov chitaet ego zhe.
+        const bool want_cover = getenv("MEMEX_EXPERT_COVERAGE") != nullptr;
+        if (rset || want_cover) rsel.assign(size_t(h.n_layer) * size_t(h.n_expert_used) * size_t(n), 0);
         for (int off = 0; off < n; off += pre_w) {
             const int cnt = std::min(pre_w, n - off);
             Graph& gp = (cnt == pre_w) ? pre : pre_tail;
@@ -7628,7 +7677,7 @@ int main(int argc, char** argv) {
                 ggml_backend_tensor_get(gp.logits, lg.data(), 0,
                                         sizeof(float) * size_t(h.n_vocab));
             }
-            if (rset && !gp.sel_ids.empty()) {
+            if ((rset || want_cover) && !gp.sel_ids.empty()) {
                 if (int(gp.sel_ids.size()) != h.n_layer) {
                     printf("prefill kuskami: kusok vernul %zu sloev marshrutizacii vmesto %d\n",
                            gp.sel_ids.size(), h.n_layer);
@@ -7680,7 +7729,7 @@ int main(int argc, char** argv) {
         // rather than the policy - which on a 24-token run is the whole run. The order matters:
         // the window is per layer but the refresh period counts tokens, so the walk is token
         // outer, layer inner.
-        if (rset && !pre.sel_ids.empty()) {
+        if ((rset || want_cover) && !pre.sel_ids.empty()) {
             if (int(pre.sel_ids.size()) != h.n_layer) {
                 printf("прогрев резидентного набора: граф префилла вернул %zu слоёв "
                        "маршрутизации вместо %d\n", pre.sel_ids.size(), h.n_layer);
@@ -7728,9 +7777,14 @@ int main(int argc, char** argv) {
                 std::vector<long long> cnt(size_t(h.n_expert), 0);
                 // Poslojnye doli dlja neskolkih srezov, plus hudshij sloj - potomu chto
                 // hudshij sloj i reshaet, gde poterjaetsja kachestvo.
-                const int cuts[] = {8, 16, 32, 48, 64, 96};
-                double cov_sum[6] = {0,0,0,0,0,0};
-                double cov_min[6] = {2,2,2,2,2,2};
+                // Srezy dotjanuty do doli, kotoraja realno vlezaet v OZU: dlja Coder Next
+                // rezidentnymi mogut byt okolo 59,5% ekspertov (25,41 GB iz 42,68), to est
+                // 300 iz 512. Bez etih tochek krivaja obryvalas na 18,8% i dvuhurovnevuju
+                // raskladku prihodilos ocenivat ekstrapoljaciej.
+                const int cuts[] = {8, 16, 32, 48, 64, 96, 128, 192, 256, 320};
+                const int n_cuts = int(sizeof(cuts) / sizeof(cuts[0]));
+                std::vector<double> cov_sum(size_t(n_cuts), 0.0);
+                std::vector<double> cov_min(size_t(n_cuts), 2.0);
                 for (int il = 0; il < h.n_layer; ++il) {
                     std::fill(cnt.begin(), cnt.end(), 0LL);
                     const int32_t* bs = rsel.data() +
@@ -7745,7 +7799,7 @@ int main(int argc, char** argv) {
                     if (tot == 0) continue;
                     std::vector<long long> srt(cnt);
                     std::sort(srt.begin(), srt.end(), std::greater<long long>());
-                    for (int ci = 0; ci < 6; ++ci) {
+                    for (int ci = 0; ci < n_cuts; ++ci) {
                         const int N = std::min(cuts[ci], h.n_expert);
                         long long acc = 0;
                         for (int j = 0; j < N; ++j) acc += srt[size_t(j)];
@@ -7754,7 +7808,7 @@ int main(int argc, char** argv) {
                         if (f < cov_min[ci]) cov_min[ci] = f;
                     }
                 }
-                for (int ci = 0; ci < 6; ++ci) {
+                for (int ci = 0; ci < n_cuts; ++ci) {
                     const int N = std::min(cuts[ci], h.n_expert);
                     printf("  srez %3d iz %3d (%4.1f%% modeli): pokrytie v srednem %5.2f%%, "
                            "u hudshego sloja %5.2f%%\n", N, h.n_expert,
@@ -7800,7 +7854,7 @@ int main(int argc, char** argv) {
                 if (n >= 64) {
                     const int half = n / 2;
                     printf("  PERENOS VNUTRI DOKUMENTA (srez po pervoj polovine -> vtoraja):\n");
-                    for (int ci = 0; ci < 6; ++ci) {
+                    for (int ci = 0; ci < n_cuts; ++ci) {
                         const int N = std::min(cuts[ci], h.n_expert);
                         double c1 = 0.0, c2 = 0.0;
                         int nl_ok = 0;
@@ -7886,6 +7940,13 @@ int main(int argc, char** argv) {
             // match pattern. `phase warm` because the same trace runs over generation below,
             // and the two are different populations - the warm-up walks a prompt we wrote, the
             // generation walks the model's own continuation of it.
+            // Progrev - tolko kogda rezidentnyj nabor est. Pri MEMEX_EXPERT_COVERAGE bez
+            // --resident my dohodim sjuda s rset == nullptr, i bez etoj proverki obrashchenie
+            // k nemu upalo by.
+            if (!rset) {
+                printf("progrev rezidentnogo nabora PROPUSHCHEN: --resident ne zaproshen, "
+                       "sobirali tolko marshrutizaciju dlja zonda pokrytija\n");
+            } else {
             memex::ResidentStats seg_base = rset->stats();
             for (int t = 0; t < n; ++t) {
                 for (int il = 0; il < h.n_layer; ++il) {
@@ -7922,6 +7983,7 @@ int main(int argc, char** argv) {
                    n, 100.0 * rrep.warm.hit_rate(), rset->n_resident(0),
                    (unsigned long long)rrep.warm.promotions,
                    (unsigned long long)rrep.warm.refreshes);
+            }   // konec vetki "rezidentnyj nabor est"
         }
 
         // Segment baseline for --resident-trace over the generated tokens. Taken here, after
@@ -7957,7 +8019,7 @@ int main(int argc, char** argv) {
                 : arch_q35
                 ? build_qwen35_step(&dec, buft, h, w35, kv, hds, 1, n, n_kv_max,
                                     /*all_logits=*/false,
-                                    /*keep_probes=*/probe_name == "all")
+                                    /*keep_probes=*/probe_name == "all", gsp)
                 : build_step(&dec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
                              /*all_logits=*/false, /*zc=*/nullptr,
                              /*keep_dbg=*/zopt.check || rset != nullptr,
@@ -8079,6 +8141,17 @@ int main(int argc, char** argv) {
         // samo, a kartochnyj put sloev rabotaet TOLKO na toj shirine, pod kotoruju sobran
         // (--gpu-static-width). Stolbec "sloi" govorit, chto bylo v dejstvitelnosti.
         if (getenv("MEMEX_SPEC_WIDTH") && arch_q35) {
+            // PRICHINA ISPRAVLENA. Ja napisal zdes "vzjala by chuzhoj stroitel" - eto bylo
+            // verno do dispetchera i perestanet byt vernym posle nego, a ohrana snimatsja NE
+            // DOLZHNA. Nastojashchaja prichina ot dispetchera ne zavisit: razvjortka gonjaet
+            // kazhdyj graf PJAT RAZ na hvoste promta, chtoby ego izmerit. Dlja KV-kesha eto
+            // bezobidno - generacija nizhe perepishet kazhduju poziciju prezhde chem ejo
+            // prochitajut. No perenosimoe sostojanie otmotat NECHEM: sloj delta-seti pishet
+            // NOVOE sostojanie obratno v tot zhe DeltaState cherez ggml_cpy, tak chto
+            // izmeritelnyj povtor prodvinul by rekurrentnost, na kotoruju opiraetsja
+            // generacija - i sdelal by eto TIHO. Chtoby snjat ohranu, nuzhen snimok i
+            // vosstanovlenie DeltaState vokrug povtora, a ne pravka dispetchera.
+            // (staraja prichina, uzhe nevernaja: dispetcher iz dvuh vetok)
             // Razvjortka stroit grafy cherez dispetcher iz dvuh vetok, i dlja qwen35moe /
             // qwen3next ona vzjala by CHUZHOJ stroitel - to est izmerila by ne to, chto
             // nazyvaet. Otkaz vmesto tihogo nevernogo chisla.
