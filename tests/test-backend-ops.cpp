@@ -1003,19 +1003,20 @@ struct test_ssm_conv : public test_case {
     const int64_t d_conv;
     const int64_t d_inner;
     const int64_t n_tokens;
+    const int64_t n_kv;
 
     std::string vars() override {
-        return VARS_TO_STR3(d_conv, d_inner, n_tokens);
+        return VARS_TO_STR4(d_conv, d_inner, n_tokens, n_kv);
     }
 
-    test_ssm_conv(int64_t d_conv = 4, int64_t d_inner = 8192, int64_t n_tokens = 1)
-        : d_conv(d_conv), d_inner(d_inner), n_tokens(n_tokens) {}
+    test_ssm_conv(int64_t d_conv = 4, int64_t d_inner = 8192, int64_t n_tokens = 1, int64_t n_kv = 1)
+        : d_conv(d_conv), d_inner(d_inner), n_tokens(n_tokens), n_kv(n_kv) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * s  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, d_inner, 1);
+        ggml_tensor * s  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, d_inner, n_kv);
         ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner, n_tokens);
         ggml_tensor * c  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
-        ggml_tensor * sq = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_tokens);
+        ggml_tensor * sq = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_tokens);
         ggml_set_name(sq, "ssm_seq_ids");
         ggml_tensor * out = ggml_ssm_conv(ctx, s, x, c, sq, nullptr);
         return out;
@@ -1063,9 +1064,10 @@ struct test_delta_net : public test_case {
     const int steps;
     const float g_lo;
     const float g_hi;
+    const int64_t n_tokens;
 
     std::string vars() override {
-        return VARS_TO_STR7(S, Hk, Hv, repeat_type, steps, g_lo, g_hi);
+        return VARS_TO_STR8(S, Hk, Hv, repeat_type, steps, g_lo, g_hi, n_tokens);
     }
 
     // 128 slagaemyh na skaljarnoe proizvedenie v f32 plus drevesnaja summa v shejdere protiv
@@ -1076,19 +1078,20 @@ struct test_delta_net : public test_case {
 
     test_delta_net(int64_t S = 128, int64_t Hk = 16, int64_t Hv = 32,
                    int repeat_type = 0, int steps = 1,
-                   float g_lo = -2.0f, float g_hi = -0.05f)
-        : S(S), Hk(Hk), Hv(Hv), repeat_type(repeat_type), steps(steps), g_lo(g_lo), g_hi(g_hi) {}
+                   float g_lo = -2.0f, float g_hi = -0.05f, int64_t n_tokens = 1)
+        : S(S), Hk(Hk), Hv(Hv), repeat_type(repeat_type), steps(steps), g_lo(g_lo), g_hi(g_hi),
+          n_tokens(n_tokens) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, S*Hv);
         ggml_tensor * out = nullptr;
 
         for (int i = 0; i < steps; i++) {
-            ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, 1, Hk, 1);
-            ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, 1, Hk, 1);
-            ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, 1, Hv, 1);
-            ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, Hv, 1);
-            ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, Hv, 1);
+            ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, n_tokens, Hk, 1);
+            ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, n_tokens, Hk, 1);
+            ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, n_tokens, Hv, 1);
+            ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_tokens, 1, Hv, 1);
+            ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_tokens, Hv, 1);
             ggml_format_name(g, "dn_g_%d", i);
 
             out = ggml_delta_net(ctx, q, k, v, g, b, state, nullptr);
@@ -1097,7 +1100,7 @@ struct test_delta_net : public test_case {
             if (i + 1 < steps) {
                 // Hvost rezultata - novoe sostojanie; view na nego nepreryven, tak chto
                 // ggml_delta_net primet ego bez kopii.
-                const size_t out_elems = (size_t) S * (size_t) Hv;
+                const size_t out_elems = (size_t) S * (size_t) Hv * (size_t) n_tokens;
                 state = ggml_reshape_2d(ctx,
                     ggml_view_1d(ctx, out, S*S*Hv, out_elems * sizeof(float)), S, S*Hv);
             }
@@ -2494,6 +2497,12 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     test_cases.emplace_back(new test_delta_net(128, 16, 32, 1, 16));
     // head_dim 64: vtoraja shirina, na kotoroj CPU idjot cherez iqk
     test_cases.emplace_back(new test_delta_net(64, 8, 16, 0, 1));
+    // OTKAZY, kotorye dolzhny pechatatsja kak "not supported" i uhodit na CPU:
+    // head_dim 96 (CPU ushjol by v skaljarnyj put s drugoj formuloj) i n_tokens 4.
+    test_cases.emplace_back(new test_delta_net(96, 8, 16, 0, 1));
+    test_cases.emplace_back(new test_delta_net(128, 16, 32, 0, 1, -2.0f, -0.05f, 4));
+    // OTKAZ u SSM_CONV: dve posledovatelnosti.
+    test_cases.emplace_back(new test_ssm_conv(4, 128, 1, 2));
 
     // rope_multi (MROPE) s sekcijami {11,11,10,0} i n_rot 64 < head_dim 256, baza 5e6 -
     // otkrytyj vopros 10.3 iz HANDOFF_ROUTER.md; zdes tolko PROVERKA, bez pravki.
@@ -2504,8 +2513,9 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     // kontrol: te zhe sekcii pri n_rot == head_dim, i tekstovaja forma s nulevymi sekcijami
     test_cases.emplace_back(new test_rope_multi(GGML_TYPE_F32, {256, 16, 1, 1}, 256,
                                                 GGML_ROPE_TYPE_MROPE, 512, 5000000.0f, {32, 32, 32, 32}));
-    test_cases.emplace_back(new test_rope_multi(GGML_TYPE_F32, {256, 16, 1, 1}, 64,
-                                                GGML_ROPE_TYPE_MROPE, 512, 5000000.0f, {0, 0, 0, 0}));
+    // Sluchaja s nulevymi sekcijami zdes NET namerenno: ggml_rope_multi v etom dereve padaet
+    // na GGML_ASSERT(sections[0] > 0 || sections[1] > 0 || sections[2] > 0) (ggml.c:21050),
+    // to est tekstovaja forma cherez rope_multi zapreshchena samim ggml, a ne bekendom.
     // ---------------------------------------------------------------- MemeX end
 
 #if 1
