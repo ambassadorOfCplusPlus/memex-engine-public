@@ -6343,11 +6343,19 @@ int main(int argc, char** argv) {
         //
         // Мешали только четыре жёстких вызова build_step в самом цикле, мимо диспетчера
         // build_one, который все три архитектуры и так умеет.
-        if (n_gen > 0 && !arch_g4) {
-            printf("--gen пока только для qwen3moe и gemma4: у \"%s\" дельта-сеть, и её "
-                   "состояние между шагами цикл генерации не переносит\n", h.arch.c_str());
-            printf("  есть --decode-check N: он и генерирует, и сверяет каждый шаг с "
-                   "llama_decode — что для дельта-сети и есть настоящая проверка\n");
+        // ZAPRET SNJAT dlja qwen35moe i qwen3next. Prichina, kotoraja v njom nazyvalas -
+        // "sostojanie mezhdu shagami cikl generacii ne perenosit" - okazalas nevernoj:
+        // sostojanie perenositsja SAMIM GRAFOM. Sloj delta-seti pishet novoe sostojanie
+        // obratno v tot zhe bufer DeltaState cherez ggml_cpy (ssm_cpy i conv_cpy), tak chto
+        // cikl dolzhen tolko peredavat odin i tot zhe DeltaState v kazhdyj shag - i vsjo.
+        //
+        // Meshalo drugoe, i eto vidno po kodu: tri tochki postroenija grafov v cikle imeli
+        // TOLKO DVE vetki (gemma4 i build_step), i qwen35moe popal by v CHUZHOJ stroitel -
+        // to est poluchil by rabotajushchij graf s drugim otvetom. Tot zhe rod oshibki, chto
+        // uzhe byl s chetyrmja zhjostkimi vyzovami build_step do gemma4.
+        if (n_gen > 0 && !arch_g4 && !arch_q35) {
+            printf("--gen poka tolko dlja qwen3moe, gemma4, qwen35moe i qwen3next: u \"%s\" "
+                   "svoj stroitel grafa, i dispetcher cikla ego ne znaet\n", h.arch.c_str());
             return 1;
         }
     }
@@ -7455,6 +7463,17 @@ int main(int argc, char** argv) {
             printf("prefill kuskami: %d tokenov po %d, ostatok %d - promezhutochnyj kq "
                    "kvadratichen po SHIRINE KUSKA, a ne po dline promta\n", n, pre_w, pre_tail_w);
         }
+        // Sostojanie delta-seti dlja cikla generacii. Odno na ves progon: graf pishet v nego
+        // novoe sostojanie na kazhdom shage, poetomu vtoroj ekzempljar oznachal by, chto shag
+        // chitaet ne to, chto zapisal predydushchij.
+        DeltaState hds;
+        if (arch_q35) {
+            if (!hds.init(buft, h)) {
+                printf("sostojanie delta-seti dlja cikla generacii ne vydelilos\n");
+                return 1;
+            }
+            hds.clear();
+        }
         Graph pre;
         Graph pre_tail;
         bool  pre_tail_built = false;
@@ -7471,6 +7490,9 @@ int main(int argc, char** argv) {
             ? build_gemma4_step(&pre, buft, h, w4, kv, pre_w, 0, n_kv_max,
                                 /*all_logits=*/false, /*keep_probes=*/false, gsp,
                                 rset.get(), /*gx=*/nullptr)
+            : arch_q35
+            ? build_qwen35_step(&pre, buft, h, w35, kv, hds, pre_w, 0, n_kv_max,
+                                /*all_logits=*/false, /*keep_probes=*/false)
             : build_step(&pre, buft, h, w, kv, pre_w, 0, n_kv_max, min_experts, expert_thresh,
                          /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/false,
                          rset.get(), /*gx=*/nullptr, gsp);
@@ -7479,6 +7501,9 @@ int main(int argc, char** argv) {
                 ? build_gemma4_step(&pre_tail, buft, h, w4, kv, pre_tail_w, 0, n_kv_max,
                                     /*all_logits=*/false, /*keep_probes=*/false, gsp,
                                     rset.get(), /*gx=*/nullptr)
+                : arch_q35
+                ? build_qwen35_step(&pre_tail, buft, h, w35, kv, hds, pre_tail_w, 0, n_kv_max,
+                                    /*all_logits=*/false, /*keep_probes=*/false)
                 : build_step(&pre_tail, buft, h, w, kv, pre_tail_w, 0, n_kv_max, min_experts,
                              expert_thresh, /*all_logits=*/false, /*zc=*/nullptr,
                              /*keep_dbg=*/false, rset.get(), /*gx=*/nullptr, gsp);
@@ -7929,6 +7954,10 @@ int main(int argc, char** argv) {
                 ? build_gemma4_step(&dec, buft, h, w4, kv, 1, n, n_kv_max,
                                     /*all_logits=*/false,
                                     /*keep_probes=*/probe_name == "all", gsp)
+                : arch_q35
+                ? build_qwen35_step(&dec, buft, h, w35, kv, hds, 1, n, n_kv_max,
+                                    /*all_logits=*/false,
+                                    /*keep_probes=*/probe_name == "all")
                 : build_step(&dec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
                              /*all_logits=*/false, /*zc=*/nullptr,
                              /*keep_dbg=*/zopt.check || rset != nullptr,
@@ -8049,7 +8078,13 @@ int main(int argc, char** argv) {
         // CHESTNOST KANALOV. Pri n_tokens > 1 rasshcheplenie rezidentnyh ekspertov otklyuchaetsja
         // samo, a kartochnyj put sloev rabotaet TOLKO na toj shirine, pod kotoruju sobran
         // (--gpu-static-width). Stolbec "sloi" govorit, chto bylo v dejstvitelnosti.
-        if (getenv("MEMEX_SPEC_WIDTH")) {
+        if (getenv("MEMEX_SPEC_WIDTH") && arch_q35) {
+            // Razvjortka stroit grafy cherez dispetcher iz dvuh vetok, i dlja qwen35moe /
+            // qwen3next ona vzjala by CHUZHOJ stroitel - to est izmerila by ne to, chto
+            // nazyvaet. Otkaz vmesto tihogo nevernogo chisla.
+            printf("MEMEX_SPEC_WIDTH: razvjortka shirin dlja \"%s\" ne realizovana - "
+                   "NE IZMERENO\n", h.arch.c_str());
+        } else if (getenv("MEMEX_SPEC_WIDTH")) {
             const int kmax = std::max(2, atoi(getenv("MEMEX_SPEC_WIDTH")));
             const int reps = 5;
             const bool alllog = getenv("MEMEX_SPEC_ALLLOG")
