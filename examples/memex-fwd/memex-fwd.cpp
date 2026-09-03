@@ -3528,7 +3528,18 @@ static ggml_tensor* qwen35_delta_layer(ggml_context* c, ggml_cgraph* gf, const H
 bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams& h,
                        const Qwen35Weights& w, Cache& kv, DeltaState& ds, int n_tokens,
                        int n_past, int n_kv, bool all_logits, bool keep_probes,
-                       memex::GpuStatic* gstat = nullptr) {
+                       memex::GpuStatic* gstat = nullptr,
+                       // KOPIJA MARSHRUTIZACII NARUZHU - PO ZAPROSU, a ne vsegda.
+                       //
+                       // Stojala bezuslovno, i eto 48 lishnih uzlov (ggml_cont + set_output +
+                       // ggml_build_forward_expand) i 48 zakreplennyh tenzorov na kazhdyj
+                       // token: zakreplennyj vyhod gallocr pereispolzovat ne mozhet, tak chto
+                       // menjaetsja ne tolko schjot uzlov, no i raskladka bufera. U qwen3moe
+                       // i gemma4 ta zhe kopija stoit pod rwarm - to est tolko kogda ejo
+                       // kto-to chitaet. Zdes teper tak zhe: flag stavit harness po tomu zhe
+                       // priznaku, po kotoromu on vydeljaet rsel (rezidentnyj nabor,
+                       // MEMEX_EXPERT_COVERAGE, MEMEX_EXPERT_TRACE).
+                       bool want_sel = false) {
     if (n_tokens <= 0 || n_kv <= 0 || n_past < 0) {
         printf("qwen35moe: бессмысленные размеры n_tokens %d, n_past %d, n_kv %d\n",
                n_tokens, n_past, n_kv);
@@ -3688,7 +3699,7 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // dlja etoj vetki otkazan, a znachit i sel_ids nikto ne sobiral.
         ggml_tensor* sel_cp = nullptr;
         cur = qwen35_ffn(c, h, L, attn_out, n_tokens, keep_probes ? &normed : nullptr,
-                         &sel_cp, g->gf);
+                         want_sel ? &sel_cp : nullptr, g->gf);
         if (sel_cp) g->sel_ids.push_back(sel_cp);
         if (keep_probes) {
             g->probes.push_back({"ffn_inp_normed-" + std::to_string(il), normed});
@@ -3724,6 +3735,214 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
 }
 
 // ---------------------------------------------------------------------------------------
+// REESTR ARHITEKTUR: odno opisanie arhitektury i odna tochka postroenija grafa
+// ---------------------------------------------------------------------------------------
+//
+// Zachem. Do etogo vybor stroitelja povtorjalsja v DEVJATI mestah ternarnikom po
+// arch_g4 / arch_q35, i pjat iz devjati imeli tolko DVE vetki. Novaja arhitektura popadala
+// v CHUZHOJ stroitel: graf sobiralsja, tenzory nahodilis po sovpadajushchim imenam, formy
+// byli pravdopodobny - i otvet byl drugoj. Tot zhe rod oshibki byl v vybore golovy dlja
+// karty (arch_g4 ? w4.out : w.out, gde qwen3next bral strukturu qwen3moe, kotoruju nikto
+// ne zapolnjal) i v chetyrjoh zhjostkih vyzovah build_step do gemma4. Zdes eto stanovitsja
+// nevozmozhnym po postroeniju: vetok rovno stolko, skolko arhitektur v reestre, a
+// nenazvannaja arhitektura ne popadaet nikuda - ona OTKAZYVAET.
+//
+// Vtoraja polovina zadachi - opcii, i eto lovushka 7.7. U build_gemma4_step poslednij
+// parametr gstat po umolchaniju nullptr, i harness ego ne peredaval: karta byla zapolnena,
+// sverena po bajtam, objavlena strokoj "sloi na karte" i ni razu ne pozvana, a kazhdoe
+// chislo --gen pod etoj strokoj bylo chisto processornym. Dopustil eto imenno molchashchij
+// argument po umolchaniju v hvoste iz devjati pozicij. Poetomu opcii teper peredajutsja
+// ODNOJ strukturoj s imenami polej, a vozmozhnost kazhdoj opcii nazvana v reestre javno:
+// esli tochka prosit to, chego arhitektura ne umeet, build_any pechataet imja tochki, imja
+// arhitektury i imja opcii i vozvrashchaet false. Molchalivogo otkata na chuzhuju vetku net.
+
+// Chto tochka postroenija prosit u stroitelja.
+struct BuildOpts {
+    // Imja tochki. Pechataetsja v otkaze, i eto edinstvennoe, chto pozvoljaet otlichit
+    // "prefill ne umeet" ot "decode ne umeet" v odnoj stroke loga.
+    const char* where = "?";
+    bool all_logits = false;
+    bool keep_probes = false;
+    int   min_experts = -1;
+    float expert_thresh = 1.0f;
+    ZonedKvCache* zc = nullptr;
+    // Flag TOLKO build_step: on kladjot v g->dbg paru inpSA/kqv na sloj. U gemma4 i
+    // qwen35moe ta zhe para kladjotsja pod keep_probes, otdelnogo flaga u nih net - tak
+    // bylo i do reestra. Reestr etogo ne menjaet, no govorit vsluh (sm. build_any).
+    bool keep_dbg = false;
+    const memex::ResidentSet* rs = nullptr;
+    memex::GpuExperts* gx = nullptr;
+    memex::GpuStatic* gstat = nullptr;
+    // Perenosimoe sostojanie delta-seti. Odno na ves progon: graf pishet v nego novoe
+    // sostojanie kazhdym shagom, poetomu vtoroj ekzempljar oznachal by, chto shag chitaet
+    // ne to, chto zapisal predydushchij.
+    DeltaState* ds = nullptr;
+    // Tochka gonjaet odin i tot zhe graf po neskolku raz dlja zamera. Dlja KV-kesha eto
+    // bezobidno - generacija perepishet poziciju prezhde chem ejo prochitajut, - a dlja
+    // delta-seti net: sostojanie prodvigaetsja i otmotat ego nechem (lovushka 7.5).
+    // Poetomu eto otdelnaja sprashivaemaja vozmozhnost, a ne svojstvo shiriny grafa.
+    bool repeat_runs = false;
+    // Nuzhna li kopija marshrutizacii naruzhu (g->sel_ids). Ejo chitajut rezidentnyj nabor,
+    // krivaja pokrytija i sled MEMEX_EXPERT_TRACE - i tolko oni, i tolko na grafe prefilla.
+    // U qwen3moe i gemma4 tot zhe vopros reshaet rs (rwarm vnutri stroitelja), poetomu dlja
+    // nih eto pole nichego ne menjaet; u qwen35moe/qwen3next rs net vovse, i do reestra
+    // kopija stroilas VSEGDA - 48 lishnih zakreplennyh uzlov na token.
+    bool want_sel = false;
+};
+
+// Opisanie arhitektury: kakoj nabor vesov zapolnen i chto ejo stroitel umeet.
+//
+// Chetyre otdelnyh ukazatelja, a ne odin tagged union - po toj zhe prichine, kotoruju
+// nazyvaet Generator: togda kompiljator proverjaet, chto stroitel poluchaet imenno te
+// vesa, pod kotorye napisan. Otkaz, kotorogo etot fajl boitsja, ne padenie, a graf,
+// chitajushchij pravdopodobnye tenzory pod chuzhimi imenami.
+struct ArchModel {
+    const char* name = "?";
+    const Weights*       w   = nullptr;   // qwen3moe
+    const DenseWeights*  dw  = nullptr;   // qwen3, tolko kak chernovik
+    const Gemma4Weights* g4  = nullptr;   // gemma4
+    const Qwen35Weights* q35 = nullptr;   // qwen35moe i qwen3next
+    bool needs_delta   = false;  // stroitelju objazatelen DeltaState
+    bool can_zoned     = false;  // zonnyj KV-kesh
+    bool can_resident  = false;  // rasshcheplenie rezidentnyh ekspertov (rs/gx)
+    bool can_gstat     = false;  // stroitel voobshche prinimaet GpuStatic
+    bool can_thresh    = false;  // min_experts / expert_thresh
+    bool can_probes    = false;  // keep_probes
+    bool can_keep_dbg  = false;  // g->dbg pod svoim otdelnym flagom
+    bool can_repeat    = false;  // graf mozhno gonjat povtorno bez porchi perenosimogo sostojanija
+
+    int n_set() const {
+        return (w ? 1 : 0) + (dw ? 1 : 0) + (g4 ? 1 : 0) + (q35 ? 1 : 0);
+    }
+
+    // VYHODNAJA GOLOVA. Zdes stojal ternarnik arch_g4 ? w4.out : w.out, i dlja
+    // qwen35moe/qwen3next on peredaval golovu iz struktury QWEN3MOE - a ejo nikto ne
+    // zapolnjal. Odin i tot zhe rod oshibki, chto i s vyborom stroitelja, poetomu i mesto
+    // odno: kto sprashivaet golovu, sprashivaet reestr.
+    ggml_tensor* head() const {
+        if (w)   return w->out;
+        if (dw)  return dw->out;
+        if (g4)  return g4->out;
+        if (q35) return q35->out;
+        return nullptr;
+    }
+};
+
+static ArchModel arch_qwen3moe(const Weights* w) {
+    ArchModel a;
+    a.name = "qwen3moe"; a.w = w;
+    a.can_zoned = true; a.can_resident = true; a.can_gstat = true; a.can_thresh = true;
+    a.can_probes = true; a.can_keep_dbg = true; a.can_repeat = true;
+    return a;
+}
+
+static ArchModel arch_gemma4(const Gemma4Weights* g4) {
+    ArchModel a;
+    a.name = "gemma4"; a.g4 = g4;
+    // Zon net: modul zon derzhit odnu geometriju golovy na model, a u gemma4 ona svoja na
+    // kazhdom sloe. min_experts/porog stroitel ne prinimaet vovse. Otdelnogo keep_dbg u
+    // nego net - para snimaetsja pod keep_probes.
+    a.can_resident = true; a.can_gstat = true; a.can_probes = true; a.can_repeat = true;
+    return a;
+}
+
+static ArchModel arch_qwen35(const Qwen35Weights* q35, const char* name) {
+    ArchModel a;
+    a.name = name; a.q35 = q35;
+    a.needs_delta = true;
+    a.can_gstat = true; a.can_probes = true;
+    // can_repeat false - lovushka 7.5. can_resident false - ResidentSet schitaet bajty
+    // TOLKO marshrutiziruemyh ekspertov, a zdes na kazhdom sloe i kazhdom tokene chitaetsja
+    // ещё i obshchij ekspert: dolja popadanij opisyvala by chast chtenij, a jomkost
+    // schitalas by ot nevernogo znamenatelja.
+    return a;
+}
+
+static ArchModel arch_qwen3_dense(const DenseWeights* dw) {
+    ArchModel a;
+    a.name = "qwen3"; a.dw = dw;
+    // Chernovik umeet rovno odno: postroit shag. Ni odnogo neobjazatelnogo modulja u nego
+    // net, i eto ne upushchenie, a to, chem on javljaetsja.
+    a.can_repeat = true;
+    return a;
+}
+
+// Odna tochka postroenija grafa na ves fajl. Vse devjat mest harnessa i
+// Generator::build_one idut cherez nejo.
+static bool build_any(const ArchModel& am, Graph* g, ggml_backend_buffer_type_t buft,
+                      const HParams& h, Cache& kv, int n_tokens, int n_past, int n_kv,
+                      const BuildOpts& o) {
+    const char* wh = o.where ? o.where : "?";
+    if (am.n_set() != 1) {
+        printf("tochka %s: reestr arhitektur nazyvaet %d naborov vesov vmesto odnogo - "
+               "OTKAZ\n", wh, am.n_set());
+        return false;
+    }
+    // Kazhdaja stroka nizhe - sochetanie arhitektura x opcija, kotoroe ranshe libo molcha
+    // popadalo v chuzhoj stroitel, libo molcha terjalos v argumente po umolchaniju.
+    if (o.zc && !am.can_zoned) {
+        printf("tochka %s: arhitektura %s ne podderzhivaet zonnyj kesh - OTKAZ\n", wh, am.name);
+        return false;
+    }
+    if ((o.rs || o.gx) && !am.can_resident) {
+        printf("tochka %s: arhitektura %s ne podderzhivaet rasshcheplenie rezidentnyh "
+               "ekspertov - OTKAZ\n", wh, am.name);
+        return false;
+    }
+    if (o.gstat && !am.can_gstat) {
+        printf("tochka %s: arhitektura %s ne prinimaet staticheskuju polovinu na karte - "
+               "OTKAZ\n", wh, am.name);
+        return false;
+    }
+    if ((o.min_experts >= 0 || o.expert_thresh != 1.0f) && !am.can_thresh) {
+        printf("tochka %s: arhitektura %s ne podderzhivaet min_experts/porog "
+               "(prosheno %d / %.4f) - OTKAZ\n", wh, am.name, o.min_experts,
+               double(o.expert_thresh));
+        return false;
+    }
+    if (o.keep_probes && !am.can_probes) {
+        printf("tochka %s: arhitektura %s ne umeet zondy - OTKAZ (pustoj razdel zondov "
+               "chitaetsja kak soglasie, poetomu ne tiho)\n", wh, am.name);
+        return false;
+    }
+    if (o.repeat_runs && !am.can_repeat) {
+        printf("tochka %s: arhitektura %s ne dopuskaet povtornyh progonov odnogo grafa - "
+               "OTKAZ (sloj delta-seti pishet novoe sostojanie obratno cherez ggml_cpy, i "
+               "otmotat ego nechem: lovushka 7.5)\n", wh, am.name);
+        return false;
+    }
+    if (am.needs_delta && !o.ds) {
+        printf("tochka %s: arhitekture %s objazatelno perenosimoe sostojanie delta-seti, a "
+               "tochka ego ne dala - OTKAZ\n", wh, am.name);
+        return false;
+    }
+    // Preduprezhdenie, a ne otkaz, i po odnoj prichine: do reestra sochetanie
+    // gemma4 + --resident vela sebja rovno tak zhe - vetka gemma4 keep_dbg ne prinimala, i
+    // poslojnaja sverka rasshcheplenija tiho propuskalas na pustom g->dbg. Otkaz slomal by
+    // rabotajushchee sochetanie, a molchanie ostavilo by pustoj razdel vygljadet soglasiem.
+    if (o.keep_dbg && !am.can_keep_dbg) {
+        printf("tochka %s: u arhitektury %s net otdelnogo keep_dbg - poslojnaja para "
+               "inpSA/kqv NE snimaetsja, sverka po slojam budet PUSTA (eto ne \"soshlos\")\n",
+               wh, am.name);
+    }
+
+    if (am.dw) {
+        return build_dense_step(g, buft, h, *am.dw, kv, n_tokens, n_past, n_kv, o.all_logits);
+    }
+    if (am.g4) {
+        return build_gemma4_step(g, buft, h, *am.g4, kv, n_tokens, n_past, n_kv,
+                                 o.all_logits, o.keep_probes, o.gstat, o.rs, o.gx);
+    }
+    if (am.q35) {
+        return build_qwen35_step(g, buft, h, *am.q35, kv, *o.ds, n_tokens, n_past, n_kv,
+                                 o.all_logits, o.keep_probes, o.gstat, o.want_sel);
+    }
+    return build_step(g, buft, h, *am.w, kv, n_tokens, n_past, n_kv, o.min_experts,
+                      o.expert_thresh, o.all_logits, o.zc, o.keep_dbg, o.rs, o.gx,
+                      o.gstat, o.keep_probes);
+}
+
+// ---------------------------------------------------------------------------------------
 // A generation loop's machinery, in one place
 // ---------------------------------------------------------------------------------------
 
@@ -3744,6 +3963,10 @@ struct Generator {
     const DenseWeights* dw = nullptr;   // qwen3, the draft
     const Gemma4Weights* g4 = nullptr;  // gemma4
     const Qwen35Weights* q35 = nullptr; // qwen35moe
+    // To zhe samoe, sobrannoe v opisanie iz reestra: chetyre ukazatelja vyshe ostajutsja,
+    // potomu chto na nih smotrit ostalnoj kod generatora (dense(), naprimer), a stroit graf
+    // idjot cherez am - tem zhe putjom, chto i devjat tochek harnessa.
+    ArchModel am;
     // The delta-net's carried state. Empty unless some layer needs it, and shared by the
     // decode graph and the prefill graph on purpose: they are two views of one running
     // recurrence, and giving them separate states would make a generation start over from
@@ -3772,16 +3995,23 @@ struct Generator {
 
     bool dense() const { return dw != nullptr; }
 
+    // Prinimaet OPISANIE iz reestra, a ne chetyre ukazatelja s dvumja znachenijami po
+    // umolchaniju. Prichina ta zhe, chto i u devjati tochek: raneshnij vyzov vygljadel kak
+    // init(..., arch_q3 ? &w : nullptr, nullptr, ..., arch_g4 ? &w4 : nullptr,
+    // arch_q35 ? &w35 : nullptr) - tri ternarnika ryadom, iz kotoryh kazhdyj mog vypast, a
+    // proverka "rovno odin nabor" pojmala by tolko dva vypavshih iz trjoh.
     bool init(ggml_backend_t backend, ggml_backend_buffer_type_t bt, const HParams* hp,
-              const Weights* tw, const DenseWeights* dwp, int n_kv, int min_e, float thr,
-              const Gemma4Weights* g4p = nullptr, const Qwen35Weights* q35p = nullptr) {
-        const int n_set = (tw ? 1 : 0) + (dwp ? 1 : 0) + (g4p ? 1 : 0) + (q35p ? 1 : 0);
-        if (!backend || !bt || !hp || n_set != 1) {
+              const ArchModel& amp, int n_kv, int min_e, float thr) {
+        if (!backend || !bt || !hp || amp.n_set() != 1) {
             printf("генератор: некорректная инициализация "
-                   "(ровно один из наборов весов обязателен, задано %d)\n", n_set);
+                   "(ровно один из наборов весов обязателен, задано %d)\n", amp.n_set());
             return false;
         }
-        be = backend; buft = bt; h = hp; w = tw; dw = dwp; g4 = g4p; q35 = q35p;
+        be = backend; buft = bt; h = hp;
+        am = amp;
+        // Chetyre ukazatelja ostajutsja zapolnennymi: na nih smotrit ostalnoj kod
+        // generatora (dense(), naprimer). Istochnik u nih teper odin - opisanie.
+        w = am.w; dw = am.dw; g4 = am.g4; q35 = am.q35;
         n_kv_max = n_kv; min_experts = min_e; expert_thresh = thr;
         if (n_kv_max <= 0) {
             printf("генератор: бессмысленный размер кэша %d\n", n_kv_max);
@@ -3803,25 +4033,27 @@ struct Generator {
         return true;
     }
 
+    // Cherez tot zhe reestr, chto i devjat tochek harnessa. Ranshe eto byl edinstvennyj
+    // POLNYJ dispetcher v fajle - chetyre vetki protiv dvuh-trjoh v harnesse, - i imenno
+    // poetomu --decode-check nahodil to, chego --gen ne videl. Teper oba idut odnim putjom.
+    //
+    // Karta peredajotsja i sjuda. Bez etogo poshagovaja sverka sravnivala put BEZ karty
+    // sam s soboj i davala sovpadenie do chetvjortogo znaka - rezultat, kotoryj vygljadit
+    // kak uspeh i ne javljaetsja im.
     bool build_one(Graph* g, int n_tokens, int n_past, bool all_logits) {
-        if (dw) {
-            return build_dense_step(g, buft, *h, *dw, kv, n_tokens, n_past, n_kv_max,
-                                    all_logits);
-        }
-        if (g4) {
-            // Karta peredajotsja i sjuda. Bez etogo poshagovaja sverka sravnivala put BEZ karty
-            // sam s soboj i davala sovpadenie do chetvjortogo znaka - rezultat, kotoryj vygljadit
-            // kak uspeh i ne javljaetsja im.
-            return build_gemma4_step(g, buft, *h, *g4, kv, n_tokens, n_past, n_kv_max,
-                                     all_logits, want_probes, gstat);
-        }
-        if (q35) {
-            return build_qwen35_step(g, buft, *h, *q35, kv, ds, n_tokens, n_past, n_kv_max,
-                                     all_logits, want_probes, gstat);
-        }
-        return build_step(g, buft, *h, *w, kv, n_tokens, n_past, n_kv_max, min_experts,
-                          expert_thresh, all_logits, /*zc=*/nullptr, /*keep_dbg=*/false,
-                          /*rs=*/nullptr, /*gx=*/nullptr, gstat, want_probes);
+        BuildOpts o;
+        o.where = "generator";
+        o.all_logits = all_logits;
+        o.keep_probes = want_probes;
+        o.gstat = gstat;
+        o.ds = &ds;
+        // min_experts/porog do reestra dohodili TOLKO do build_step: v vetkah gemma4 i
+        // qwen35moe ih ne bylo v spiske argumentov vovse, tak chto --min-experts s etimi
+        // arhitekturami tiho nichego ne delal. Teper eto otkaz vsluh v build_any, i
+        // peredavat ih nado bezuslovno - inache otkaz ne sostoitsja i molchanie vernjotsja.
+        o.min_experts = min_experts;
+        o.expert_thresh = expert_thresh;
+        return build_any(am, g, buft, *h, kv, n_tokens, n_past, n_kv_max, o);
     }
 
     // The mask is -inf everywhere and zero only where a query at position past+i may see key
@@ -5352,7 +5584,14 @@ int draft_selftest(const std::string& path, const std::string& prompt, int threa
         return 1;
     }
     Graph g;
-    if (!build_dense_step(&g, buft, d, dw, kv, n, 0, n_kv, /*all_logits=*/false)) {
+    // Tochka "dense_ref" - samoproverka chernovika. Ternarnika zdes ne bylo i vetka odna,
+    // no cherez reestr ona idjot po toj zhe prichine, po kotoroj ostalnye vosem: esli kogda-
+    // nibud sjuda pridjot ne plotnyj qwen3, otkaz nazovjot tochku, a ne sobjorjot graf po
+    // chuzhim imenam tenzorov. Arhitektura zdes uzhe proverena po imeni vyshe.
+    const ArchModel dam = arch_qwen3_dense(&dw);
+    BuildOpts dbo;
+    dbo.where = "dense_ref";
+    if (!build_any(dam, &g, buft, d, kv, n, 0, n_kv, dbo)) {
         printf("черновик: граф не собрался\n");
         return 1;
     }
@@ -5479,7 +5718,7 @@ bool load_draft(const std::string& path, llama_model* target_model, const HParam
         print_present_tensors(path.c_str(), "blk.0.");
         return false;
     }
-    if (!d->gen.init(be, buft, &d->h, nullptr, &d->w, n_kv, -1, 1.0f)) return false;
+    if (!d->gen.init(be, buft, &d->h, arch_qwen3_dense(&d->w), n_kv, -1, 1.0f)) return false;
     printf("черновик: кэш %d позиций, %.1f МБ\n", n_kv, d->gen.kv.bytes(d->h) / 1e6);
     return true;
 }
@@ -5543,7 +5782,9 @@ int run_chat(llama_model* model, const std::string& model_path, const HParams& h
     // code reached by nothing. The card path lives in main's harness, which is what measures.
     const int n_kv_max = pad32(n_ctx);
     Generator gen;
-    if (!gen.init(be, buft, &h, &w, nullptr, n_kv_max, min_experts, expert_thresh)) return 1;
+    if (!gen.init(be, buft, &h, arch_qwen3moe(&w), n_kv_max, min_experts, expert_thresh)) {
+        return 1;
+    }
     printf("чат: кэш %d позиций, %.1f МБ; предел ответа %d токенов\n", n_kv_max,
            gen.kv.bytes(h) / 1e6, n_predict);
 
@@ -6742,6 +6983,25 @@ int main(int argc, char** argv) {
         }
     }
 
+    // OPISANIE ARHITEKTURY NA VES HARNESS. Nizhe ono edinstvennoe, chto vybiraet stroitel:
+    // devjat tochek postroenija grafa zovut build_any(am, ...) i ni odna iz nih bolshe ne
+    // znaet imjon build_step / build_gemma4_step / build_qwen35_step. Poka ternarniki stojali
+    // na mestah, pjat tochek iz devjati imeli dve vetki, i tretja arhitektura popadala v
+    // chuzhoj stroitel - rabotajushchij graf s drugim otvetom.
+    //
+    // Sobiraetsja imenno zdes, srazu posle collect_*, i eto ne stil: ranshe kazhdaja tochka
+    // sama reshala, kakaja struktura vesov zapolnena, i mezhdu resheniem i zapolneniem lezhalo
+    // dve tysjachi strok, v kotoryh eto rashodilos.
+    ArchModel am;
+    if (arch_q3)       am = arch_qwen3moe(&w);
+    else if (arch_g4)  am = arch_gemma4(&w4);
+    else if (arch_q35) am = arch_qwen35(&w35, h.arch.c_str());
+    if (am.n_set() != 1) {
+        printf("reestr arhitektur: \"%s\" ne opisana - OTKAZ (imja proshlo proverku vyshe, "
+               "a opisanija u nego net: eto rashozhdenie v samom reestre)\n", h.arch.c_str());
+        return 1;
+    }
+
     // What the CPU half will actually run on. Printed from the loaded tensors, group by group,
     // because "repacking is on" is a request and this is the outcome: with the experts excluded
     // the win is partial by construction, so the partial has to be visible rather than assumed.
@@ -6868,7 +7128,9 @@ int main(int argc, char** argv) {
         // otsutstvuet"), hotja golova u modeli EST: ona svjazana s token_embd, i sobstvennyj
         // zagruzchik qwen35 eto uzhe uchjol. Bud struktura w zapolnena, na kartu ushla by
         // golova DRUGOJ modeli - i eto ne upalo by.
-        ggml_tensor* head_w = arch_g4 ? w4.out : (arch_q35 ? w35.out : w.out);
+        // Teper ne ternarnik, a reestr: am.head(). Vetok stolko, skolko arhitektur opisano,
+        // i chetvjortaja ne mozhet popast v tretju po umolchaniju.
+        ggml_tensor* head_w = am.head();
         if (!gstat->init(sc, head_w, &serr)) {
             printf("--gpu-static: %s\n", serr.c_str());
             return 1;
@@ -7042,11 +7304,15 @@ int main(int argc, char** argv) {
         // From no history. The reference's own decode starts from an empty state too, and
         // a comparison against a recurrence that began somewhere else is not a comparison.
         cmp_ds.clear();
-        const bool built = arch_g4
-            ? build_gemma4_step(&g, buft, h, w4, cmp_kv, n, 0, nkv, /*all_logits=*/false,
-                                /*keep_probes=*/true)
-            : build_qwen35_step(&g, buft, h, w35, cmp_kv, cmp_ds, n, 0, nkv,
-                                /*all_logits=*/false, /*keep_probes=*/true);
+        // Tochka "compare". Ternarnik zdes imel DVE vetki i byl bezopasen tolko po
+        // sluchajnosti: v etu vetku popadajut vse arhitektury krome qwen3moe, i poka ih
+        // rovno dve, ternarnik verno nazyvaet vtoruju. Chetvjortaja arhitektura popala by v
+        // qwen35moe.
+        BuildOpts bopt;
+        bopt.where = "compare";
+        bopt.keep_probes = true;   // sverka s etalonom i est sravnenie po zondam
+        bopt.ds = &cmp_ds;
+        const bool built = build_any(am, &g, buft, h, cmp_kv, n, 0, nkv, bopt);
         if (!built) {
             printf("наш граф не собрался\n");
             return 1;
@@ -7187,9 +7453,10 @@ int main(int argc, char** argv) {
         bool probe_empty_said = false;
         long probe_asked = 0, probe_matched = 0;
         gen.gstat = gsp;   // poshagovaja sverka dolzhna proverjat imenno tot put, kotoryj rabotaet
-        if (!gen.init(be, buft, &h, arch_q3 ? &w : nullptr, nullptr, n_kv_max, min_experts,
-                      expert_thresh, arch_g4 ? &w4 : nullptr,
-                      arch_q35 ? &w35 : nullptr)) {
+        // To zhe opisanie, chto i u devjati tochek harnessa: odno na progon. Tri ternarnika,
+        // stojavshie zdes, ushli - i vmeste s nimi vozmozhnost togo, chto poshagovaja sverka
+        // proverjaet ne tot nabor vesov, kotoryj gonjaet --gen.
+        if (!gen.init(be, buft, &h, am, n_kv_max, min_experts, expert_thresh)) {
             return 1;
         }
         printf("  кэш %d позиций, %.1f МБ", n_kv_max, gen.kv.bytes(h) / 1e6);
@@ -7501,6 +7768,15 @@ int main(int argc, char** argv) {
                    h.n_layer);
         }
 
+        // KTO CHITAET MARSHRUTIZACIJU. Sprosheno ZDES, do postroenija grafa prefilla, a ne
+        // posle nego, potomu chto ot etogo zavisit sam graf: kopija top-k naruzhu eto uzel na
+        // sloj plus zakreplennyj vyhod, kotoryj gallocr uzhe ne mozhet pereispolzovat.
+        // Ranshe u qwen35moe/qwen3next ona stroilas vsegda - 48 lishnih uzlov na token dazhe
+        // togda, kogda ejo nikto ne chital.
+        const bool want_cover = getenv("MEMEX_EXPERT_COVERAGE") != nullptr;
+        const char* trace_path = getenv("MEMEX_EXPERT_TRACE");
+        const bool want_sel = (rset != nullptr) || want_cover || (trace_path != nullptr);
+
         // SHIRINA GRAFA PREFILLA: ves promt ili kusok. Ostatok idjot svoim grafom - dvuh
         // grafov hvataet na ljubuju dlinu, i eto chestnee, chem dopolnjat poslednij kusok
         // fiktivnymi tokenami i zakryvat ih maskoj.
@@ -7525,35 +7801,33 @@ int main(int argc, char** argv) {
         Graph pre_tail;
         bool  pre_tail_built = false;
         bool  rsel_filled = false;
-        // Диспетчер по архитектуре вместо жёсткого вызова. Цикл генерации звал build_step
-        // напрямую, минуя build_one, который все три архитектуры умеет, - и это была
-        // единственная причина, по которой gemma4 не могла генерировать. Необязательные модули
-        // для неё запрещены выше по имени, поэтому здесь они заведомо пусты.
-        const bool built_pre = arch_g4
-            // rset, so the prefill exports its routing and the sliding window is warm by the
-            // first generated token - rwarm, not rsplit: with n_tokens > 1 the mask has one
-            // row per layer and not per token, so the prefill stays on the unsplit path.
-            // gsp too: the prefill's head is the same 748 MiB.
-            ? build_gemma4_step(&pre, buft, h, w4, kv, pre_w, 0, n_kv_max,
-                                /*all_logits=*/false, /*keep_probes=*/false, gsp,
-                                rset.get(), /*gx=*/nullptr)
-            : arch_q35
-            ? build_qwen35_step(&pre, buft, h, w35, kv, hds, pre_w, 0, n_kv_max,
-                                /*all_logits=*/false, /*keep_probes=*/false, gsp)
-            : build_step(&pre, buft, h, w, kv, pre_w, 0, n_kv_max, min_experts, expert_thresh,
-                         /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/false,
-                         rset.get(), /*gx=*/nullptr, gsp);
+        // Tochki "prefill" i "prefill_tail" - cherez reestr. Zdes stojal ternarnik iz trjoh
+        // vetok, i on byl uzhe ispravlennym: do ispravlenija u nego bylo DVE vetki i
+        // qwen35moe/qwen3next popadali v build_step. Teper vetok net vovse.
+        //
+        // rs: prefill eksportiruet svoju marshrutizaciju, chtoby skolzjashchee okno bylo
+        // prognato k pervomu sgenerirovannomu tokenu - rwarm, a ne rsplit: pri n_tokens > 1
+        // maska imeet odnu stroku na sloj, a ne na token, tak chto prefill idjot
+        // nerasshcheplennym putjom. gstat tozhe: golova u prefilla ta zhe.
+        //
+        // min_experts/porog peredajutsja BEZUSLOVNO, hotja do reestra oni dohodili tolko v
+        // vetke qwen3moe. Eto i est raznica: teper --min-experts s gemma4 otkazhet vsluh
+        // vmesto togo, chtoby tiho nichego ne sdelat.
+        BuildOpts pbo;
+        pbo.where = "prefill";
+        pbo.min_experts = min_experts;
+        pbo.expert_thresh = expert_thresh;
+        pbo.rs = rset.get();
+        pbo.gstat = gsp;
+        pbo.ds = &hds;
+        pbo.want_sel = want_sel;
+        const bool built_pre =
+            build_any(am, &pre, buft, h, kv, pre_w, 0, n_kv_max, pbo);
         if (built_pre && pre_tail_w > 0) {
-            pre_tail_built = arch_g4
-                ? build_gemma4_step(&pre_tail, buft, h, w4, kv, pre_tail_w, 0, n_kv_max,
-                                    /*all_logits=*/false, /*keep_probes=*/false, gsp,
-                                    rset.get(), /*gx=*/nullptr)
-                : arch_q35
-                ? build_qwen35_step(&pre_tail, buft, h, w35, kv, hds, pre_tail_w, 0, n_kv_max,
-                                    /*all_logits=*/false, /*keep_probes=*/false, gsp)
-                : build_step(&pre_tail, buft, h, w, kv, pre_tail_w, 0, n_kv_max, min_experts,
-                             expert_thresh, /*all_logits=*/false, /*zc=*/nullptr,
-                             /*keep_dbg=*/false, rset.get(), /*gx=*/nullptr, gsp);
+            BuildOpts tbo = pbo;
+            tbo.where = "prefill_tail";
+            pre_tail_built =
+                build_any(am, &pre_tail, buft, h, kv, pre_tail_w, 0, n_kv_max, tbo);
             if (!pre_tail_built) {
                 printf("graf ostatka prefilla (%d tokenov) ne sobralsja\n", pre_tail_w);
                 return 1;
@@ -7661,7 +7935,7 @@ int main(int argc, char** argv) {
         // sel_ids zanovo - inache on prochital by tolko poslednij kusok i nazval by ego
         // vsem promtom.
         // rsel nuzhen ne tolko rezidentnomu naboru: zond pokrytija ekspertov chitaet ego zhe.
-        const bool want_cover = getenv("MEMEX_EXPERT_COVERAGE") != nullptr;
+        //
         // SLED MARSHRUTIZACII PO TOKENAM. Krivaja pokrytija otvechaet na vopros "skolko
         // ekspertov derzhat, chtoby popadat", a predskazatel - na drugoj: "KAKIE imenno budut
         // nuzhny na sledujushchem tokene". Vtoroj vopros po schjotchikam ne reshaetsja, nuzhen
@@ -7671,8 +7945,10 @@ int main(int argc, char** argv) {
         // sravnivajutsja OFLAJN, bez peresborki i bez zanjatija mashiny, i potolok deshjovyh
         // sposobov (chastota, uporstvo predydushchego tokena, sosednij sloj) izmerjaetsja
         // PREZHDE chem pisat obuchaemyj.
-        const char* trace_path = getenv("MEMEX_EXPERT_TRACE");
-        if (rset || want_cover || trace_path)
+        //
+        // want_cover, trace_path i want_sel sprosheny VYSHE, do postroenija grafa prefilla:
+        // ot nih zavisit sam graf, a ne tolko chtenie iz nego.
+        if (want_sel)
             rsel.assign(size_t(h.n_layer) * size_t(h.n_expert_used) * size_t(n), 0);
         for (int off = 0; off < n; off += pre_w) {
             const int cnt = std::min(pre_w, n - off);
@@ -7688,7 +7964,7 @@ int main(int argc, char** argv) {
                 ggml_backend_tensor_get(gp.logits, lg.data(), 0,
                                         sizeof(float) * size_t(h.n_vocab));
             }
-            if ((rset || want_cover || trace_path) && !gp.sel_ids.empty()) {
+            if (want_sel && !gp.sel_ids.empty()) {
                 if (int(gp.sel_ids.size()) != h.n_layer) {
                     printf("prefill kuskami: kusok vernul %zu sloev marshrutizacii vmesto %d\n",
                            gp.sel_ids.size(), h.n_layer);
@@ -7740,7 +8016,15 @@ int main(int argc, char** argv) {
         // rather than the policy - which on a 24-token run is the whole run. The order matters:
         // the window is per layer but the refresh period counts tokens, so the walk is token
         // outer, layer inner.
-        if ((rset || want_cover || trace_path) && !pre.sel_ids.empty()) {
+        // Marshrutizaciju sprosili, a graf ejo ne otdal. Do sih por eto bylo TIHIM
+        // propuskom: blok nizhe prosto ne vypolnjalsja, krivaja pokrytija ne pechatalas, i
+        // otsutstvie tablicy chitalos kak "prognali i nichego ne nashli".
+        if (want_sel && pre.sel_ids.empty()) {
+            printf("marshrutizacija zaproshena (--resident / MEMEX_EXPERT_COVERAGE / "
+                   "MEMEX_EXPERT_TRACE), no graf prefilla ejo NE OTDAL: krivaja pokrytija, "
+                   "progrev nabora i sled - NE IZMERENY\n");
+        }
+        if (want_sel && !pre.sel_ids.empty()) {
             if (int(pre.sel_ids.size()) != h.n_layer) {
                 printf("прогрев резидентного набора: граф префилла вернул %zu слоёв "
                        "маршрутизации вместо %d\n", pre.sel_ids.size(), h.n_layer);
@@ -7941,7 +8225,20 @@ int main(int argc, char** argv) {
                            "potolok uskorenija processornoj poloviny x%5.3f\n",
                            K, un, serial, un / serial, serial / un);
                 }
-                if (trace_path) {
+                printf("  VNIMANIE: eto marshrutizacija NASHEGO prompta, a ne sobstvennogo "
+                       "prodolzhenija modeli - populjacii raznye (pravilo 87)\n");
+                printf("  I eto POTOLOK: dolja prinjatyh chernovikov v nego ne vhodit\n");
+            }
+
+            // SLED MARSHRUTIZACII - PO SVOEMU FLAGU I NICHEMU BOLSHE.
+            //
+            // Blok zapisi lezhal VNUTRI if (getenv("MEMEX_MTP_OVERLAP")), i po shtatnoj
+            // komande iz HANDOFF_ROUTER (MEMEX_EXPERT_COVERAGE + MEMEX_EXPERT_TRACE) sled ne
+            // pisalsja vovse: fajla net, i ni odnoj stroki ob etom ne pechatalos - rovno tot
+            // rod otkaza, kotoryj etot fajl i lovit. Teper uslovie odno: zadan
+            // MEMEX_EXPERT_TRACE. Nichego drugogo vkljuchat ne nado - rsel k etomu mestu uzhe
+            // sobran, potomu chto uslovie vhoda v etot blok samo nazyvaet trace_path.
+            if (trace_path) {
                 // Format nabroshen tak, chtoby ego chital python odnoj strokoj i chtoby v njom
                 // NELZJA bylo pereputat poriadok osej: zagolovok nazyvaet vse tri razmera.
                 FILE* tf = fopen(trace_path, "wb");
@@ -7961,14 +8258,10 @@ int main(int argc, char** argv) {
                         }
                     }
                     fclose(tf);
-                    printf("  sled marshrutizacii zapisan: %s (%d tokenov x %d sloev x %d "
+                    printf("sled marshrutizacii zapisan: %s (%d tokenov x %d sloev x %d "
                            "mest, iz %d ekspertov)\n", trace_path, n, h.n_layer,
                            h.n_expert_used, h.n_expert);
                 }
-            }
-            printf("  VNIMANIE: eto marshrutizacija NASHEGO prompta, a ne sobstvennogo "
-                       "prodolzhenija modeli - populjacii raznye (pravilo 87)\n");
-                printf("  I eto POTOLOK: dolja prinjatyh chernovikov v nego ne vhodit\n");
             }
 
             // The segment trace, if asked. One ASCII line per segment for the same reason the
@@ -8038,28 +8331,31 @@ int main(int argc, char** argv) {
         double build_ms = 0.0;
         if (!zopt.on || zopt.check) {
             const auto t_b = Clock::now();
-            const bool built_dec = arch_g4
-                // gsp, and it was MISSING. The qwen3moe branch below has always passed it;
-                // gemma4's last argument defaults to nullptr, so `card` in the layer loop was
-                // false on every layer of every decode. place_layers had already run, the byte
-                // verification had already passed, and the loader had already printed
-                // "vnimanie, marshrutizatory i KV-kesh na karte: 30 sloev ... v videopamjati" -
-                // so every gemma4 --gen number taken with --gpu-static-layers was a pure CPU
-                // number sitting under a line that says the layers are on the card. Found in
-                // review. The only path that ever passed gstat was Generator::build_one, and
-                // gen.gstat is set only under --decode-check, which is why the probe comparison
-                // exercised the card and the speed measurement did not.
-                ? build_gemma4_step(&dec, buft, h, w4, kv, 1, n, n_kv_max,
-                                    /*all_logits=*/false,
-                                    /*keep_probes=*/probe_name == "all", gsp)
-                : arch_q35
-                ? build_qwen35_step(&dec, buft, h, w35, kv, hds, 1, n, n_kv_max,
-                                    /*all_logits=*/false,
-                                    /*keep_probes=*/probe_name == "all", gsp)
-                : build_step(&dec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
-                             /*all_logits=*/false, /*zc=*/nullptr,
-                             /*keep_dbg=*/zopt.check || rset != nullptr,
-                             /*rs=*/nullptr, /*gx=*/nullptr, gsp);
+            // Tochka "decode" - cherez reestr.
+            //
+            // gsp zdes odnazhdy OTSUTSTVOVAL v vetke gemma4 (u nejo poslednij argument po
+            // umolchaniju nullptr), i eto lovushka 7.7 v chistom vide: place_layers otrabotal,
+            // sverka bajtov proshla, zagruzchik napechatal "marshrutizatory i KV-kesh na
+            // karte: 30 sloev v videopamjati" - a graf kartu ne zval, i kazhdoe chislo --gen
+            // s --gpu-static-layers bylo chisto processornym pod strokoj, utverzhdajushchej
+            // obratnoe. V reestre gstat odno pole odnoj struktury, i propustit ego v odnoj
+            // arhitekture iz trjoh bolshe ne poluchitsja.
+            //
+            // SOHRANJAETSJA RAZLICHIE, kotoroe bylo do reestra: keep_probes zdes berjotsja
+            // po --probe all tolko dlja gemma4 i qwen35moe, a dlja qwen3moe on byl vsegda
+            // false (zondy dekodnogo grafa build_step poluchaet tolko iz
+            // Generator::build_one pod --decode-check). Shag "reestr arhitektur" svodit
+            // vybor stroitelja, a ne pravit povedenie: eto otdelnaja pravka s otdelnoj
+            // sverkoj, i delat ejo poputno znachilo by smeshat dva izmenenija v odnom zamere.
+            BuildOpts dbo;
+            dbo.where = "decode";
+            dbo.min_experts = min_experts;
+            dbo.expert_thresh = expert_thresh;
+            dbo.keep_probes = !arch_q3 && probe_name == "all";
+            dbo.keep_dbg = zopt.check || rset != nullptr;
+            dbo.gstat = gsp;
+            dbo.ds = &hds;
+            const bool built_dec = build_any(am, &dec, buft, h, kv, 1, n, n_kv_max, dbo);
             if (!built_dec) {
                 printf("граф декода не собрался\n");
                 return 1;
@@ -8089,14 +8385,24 @@ int main(int argc, char** argv) {
         bool rdec_built = false;
         if (rset) {
             const auto t_rb = Clock::now();
-            const bool built_rdec = arch_g4
-                ? build_gemma4_step(&rdec, buft, h, w4, kv, 1, n, n_kv_max,
-                                    /*all_logits=*/false,
-                                    /*keep_probes=*/probe_name == "all", gsp,
-                                    rset.get(), gxp)
-                : build_step(&rdec, buft, h, w, kv, 1, n, n_kv_max, min_experts, expert_thresh,
-                             /*all_logits=*/false, /*zc=*/nullptr, /*keep_dbg=*/true,
-                             rset.get(), gxp, gsp);
+            // Tochka "rdec". Zdes byl ternarnik iz DVUH vetok, i qwen35moe/qwen3next popali
+            // by v build_step - to est v chuzhoj stroitel. Molcha: rset dlja etih arhitektur
+            // zapreshchjon vyshe po imeni, tak chto do vetki delo ne dohodilo, i oshibka
+            // zhdala pervoj arhitektury, kotoroj rasshcheplenie razreshat. Teper eto otkaz
+            // vsluh iz build_any: can_resident u qwen35moe false, potomu chto ResidentSet
+            // schitaet bajty tolko marshrutiziruemyh ekspertov, a obshchij ekspert chitaetsja
+            // na kazhdom sloe i kazhdom tokene i v znamenatel ne vhodit.
+            BuildOpts rbo;
+            rbo.where = "rdec";
+            rbo.min_experts = min_experts;
+            rbo.expert_thresh = expert_thresh;
+            rbo.keep_probes = !arch_q3 && probe_name == "all";
+            rbo.keep_dbg = true;
+            rbo.rs = rset.get();
+            rbo.gx = gxp;
+            rbo.gstat = gsp;
+            rbo.ds = &hds;
+            const bool built_rdec = build_any(am, &rdec, buft, h, kv, 1, n, n_kv_max, rbo);
             if (!built_rdec) {
                 printf("расщеплённый граф декода не собрался\n");
                 return 1;
@@ -8176,7 +8482,11 @@ int main(int argc, char** argv) {
         // CHESTNOST KANALOV. Pri n_tokens > 1 rasshcheplenie rezidentnyh ekspertov otklyuchaetsja
         // samo, a kartochnyj put sloev rabotaet TOLKO na toj shirine, pod kotoruju sobran
         // (--gpu-static-width). Stolbec "sloi" govorit, chto bylo v dejstvitelnosti.
-        if (getenv("MEMEX_SPEC_WIDTH") && arch_q35) {
+        // Uslovie sprashivaet REESTR (am.can_repeat), a ne imja arhitektury. Tak pravilo
+        // zhivjot v odnom meste: build_any otkazhet tochno tak zhe, esli tochka vsjo-taki
+        // dojdjot do postroenija, i dobavlenie arhitektury s perenosimym sostojaniem ne
+        // trebuet vspomnit pro etu stroku.
+        if (getenv("MEMEX_SPEC_WIDTH") && !am.can_repeat) {
             // PRICHINA ISPRAVLENA. Ja napisal zdes "vzjala by chuzhoj stroitel" - eto bylo
             // verno do dispetchera i perestanet byt vernym posle nego, a ohrana snimatsja NE
             // DOLZHNA. Nastojashchaja prichina ot dispetchera ne zavisit: razvjortka gonjaet
@@ -8203,11 +8513,17 @@ int main(int argc, char** argv) {
             for (int K = 1; K <= kmax; ++K) {
                 if (n < K || n + K > n_kv_max) { printf("  K=%d: NE IZMERENO\n", K); continue; }
                 Graph g;
-                const bool built = arch_g4
-                    ? build_gemma4_step(&g, buft, h, w4, kv, K, n, n_kv_max, alllog,
-                                        /*keep_probes=*/false, gsp, nullptr, nullptr)
-                    : build_step(&g, buft, h, w, kv, K, n, n_kv_max, min_experts, expert_thresh,
-                                 alllog, nullptr, false, nullptr, nullptr, gsp);
+                // Tochka "spec_width". Ternarnik iz DVUH vetok: qwen35moe/qwen3next popali by
+                // v build_step. Ohrana vyshe do nih ne dopuskala, no ohrana i vetka - dva
+                // raznyh mesta, i rashodilis oni imenno tak.
+                BuildOpts wbo;
+                wbo.where = "spec_width";
+                wbo.min_experts = min_experts;
+                wbo.expert_thresh = expert_thresh;
+                wbo.all_logits = alllog;
+                wbo.gstat = gsp;
+                wbo.repeat_runs = true;   // graf progonjaetsja reps raz dlja zamera
+                const bool built = build_any(am, &g, buft, h, kv, K, n, n_kv_max, wbo);
                 if (!built) { printf("  K=%d: graf ne sobralsja - NE IZMERENO\n", K); continue; }
                 std::vector<llama_token> feed(toks.begin() + (n - K), toks.begin() + n);
                 double best = 1e30;
@@ -8271,12 +8587,15 @@ int main(int argc, char** argv) {
                     // processorom po tokenam u gemma4 nikto ni razu ne izmeril - a ono, kak
                     // vyjasnilos, rashoditsja posle trjoh tokenov.
                     Graph g1;
-                    const bool b1 = arch_g4
-                        ? build_gemma4_step(&g1, buft, h, w4, kv, 1, n, n_kv_max, false,
-                                            false, nullptr, nullptr, nullptr)
-                        : build_step(&g1, buft, h, w, kv, 1, n, n_kv_max, min_experts,
-                                     expert_thresh, false, nullptr, false, nullptr, nullptr,
-                                     nullptr);
+                    // Tochka "spec_one". Tozhe dve vetki, i gstat zdes NAROSCHNO ne
+                    // peredajotsja: etalon objazan byt processornym, inache pri shirine 1
+                    // eto "karta protiv samoj sebja" - sravnenie, kotoroe vsegda dajot nol.
+                    BuildOpts obo;
+                    obo.where = "spec_one";
+                    obo.min_experts = min_experts;
+                    obo.expert_thresh = expert_thresh;
+                    obo.repeat_runs = true;   // K odinochnyh progonov odnogo grafa
+                    const bool b1 = build_any(am, &g1, buft, h, kv, 1, n, n_kv_max, obo);
                     if (!b1) {
                         printf("    odinochnyj graf ne sobralsja - NE SVERENO\n");
                     } else {
@@ -8356,9 +8675,19 @@ int main(int argc, char** argv) {
             }
             Graph zdec;
             const auto t_zb = Clock::now();
-            if (!build_step(&zdec, buft, h, w, kv, 1, n, n_kv_max, min_experts,
-                            expert_thresh, /*all_logits=*/false, zkv.c,
-                            /*keep_dbg=*/zopt.check, /*rs=*/nullptr, /*gx=*/nullptr, gsp)) {
+            // Tochka "zoned". Zdes byla ODNA vetka - zhjostkij build_step, - i eto bylo verno
+            // ровно poka zonnyj kesh razreshjon tolko dlja qwen3moe. Verno po ohrane vyshe, a
+            // ne po postroeniju: proverka i vetka lezhali v raznyh mestah. Teper zc eto pole
+            // BuildOpts, i can_zoned est tolko u qwen3moe - ljubaja drugaja arhitektura
+            // poluchit otkaz s imenem tochki vmesto grafa po chuzhim imenam tenzorov.
+            BuildOpts zbo;
+            zbo.where = "zoned";
+            zbo.min_experts = min_experts;
+            zbo.expert_thresh = expert_thresh;
+            zbo.zc = zkv.c;
+            zbo.keep_dbg = zopt.check;
+            zbo.gstat = gsp;
+            if (!build_any(am, &zdec, buft, h, kv, 1, n, n_kv_max, zbo)) {
                 printf("зонный граф декода не собрался\n");
                 return 1;
             }
