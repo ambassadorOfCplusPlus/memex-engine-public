@@ -1242,6 +1242,11 @@ struct Graph {
     std::vector<ggml_tensor*> res_ids;
     std::vector<ggml_tensor*> oth_ids;
     std::vector<ggml_tensor*> sel_ids;
+    // `hid_outs` - vhod MARSHRUTIZATORA, po odnomu tenzoru na sloj: vyhod ffn_norm, to est
+    // rovno to, na chto smotrit ggml_top_k. Sobiraetsja tolko pod MEMEX_HIDDEN_TRACE i
+    // tolko na grafe prefilla - eto vhod predskazatelja ekspertov po skrytomu sostojaniju,
+    // i ocenivaetsja on oflajn (bench/hidden_lab.py), a ne v dvizhke.
+    std::vector<ggml_tensor*> hid_outs;
 
     ggml_tensor* probe(const std::string& name) const {
         for (const auto& p : probes) {
@@ -3556,7 +3561,11 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
                        // kto-to chitaet. Zdes teper tak zhe: flag stavit harness po tomu zhe
                        // priznaku, po kotoromu on vydeljaet rsel (rezidentnyj nabor,
                        // MEMEX_EXPERT_COVERAGE, MEMEX_EXPERT_TRACE).
-                       bool want_sel = false) {
+                       bool want_sel = false,
+                       // DAMP VHODA MARSHRUTIZATORA - po toj zhe sheme i po tomu zhe
+                       // pravilu, chto want_sel: kopija naruzhu tolko togda, kogda ejo
+                       // kto-to chitaet (MEMEX_HIDDEN_TRACE).
+                       bool want_hid = false) {
     if (n_tokens <= 0 || n_kv <= 0 || n_past < 0) {
         printf("qwen35moe: бессмысленные размеры n_tokens %d, n_past %d, n_kv %d\n",
                n_tokens, n_past, n_kv);
@@ -3598,12 +3607,77 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
     int sections[GGML_MROPE_SECTIONS] = {0};
     for (int i = 0; i < 4 && i < GGML_MROPE_SECTIONS; ++i) sections[i] = h.rope_sections[i];
 
+    // VSJA STATIKA NA KARTE, dlja DEKODA ODNOGO TOKENA. Karta schitaet sloj celikom - normu,
+    // delta-set libo vnimanie, ostatok, ffn_norm, marshrutizator i OBSHCHEGO EKSPERTA - i
+    // otdajot chetyre velichiny odnim zaborom. Hostu ostajotsja rovno mul_mat_id po 512
+    // ekspertam i dva slozhenija.
+    //
+    // Tolko odin token i tolko pri sovpadenii shiriny. Prefill ostajotsja na CPU: eto drugaja
+    // forma grafa, i on uprjot v arifmetiku, a ne v polosu. Sprosit shirinu, a ne predpolozhit
+    // ejo - potomu chto pri nesovpadenii karta poschitala by odin token tam, gde graf zhdjot
+    // chetyre, i oshibka vyshla by tihoj.
+    const bool card_layers =
+#ifdef MEMEX_FWD_GPU_EXPERTS
+        gstat && gstat->layers_on() && n_tokens == 1 && gstat->layer_width() == 1;
+#else
+        false;
+#endif
+    g->on_card = card_layers;
+    // OTLADOCHNOE SUZHENIE: KAKIE IMENNO sloi idut na kartu. Vesa i grafy vseh sloev pri etom
+    // vsjo ravno lezhat na karte - suzhaetsja tolko VYZOV, - poetomu eto chestnoe A/B odnogo
+    // sloja protiv processornogo puti TOGO ZHE binarnika, a ne drugaja sborka.
+    //
+    // Zachem: rashozhdenie na 48 slojah srazu govorit tolko o tom, chto ono gde-to est. Odin
+    // sloj na karte i zond l_out-<il> nazyvajut mesto. Poriadok proverki iz plana - sperva
+    // odin sloj delta-seti, potom vse 36, potom odin sloj vnimanija, potom 12 - derzhitsja
+    // imenno na etom.
+    static const int card_lo = getenv("MEMEX_CARD_LO") ? atoi(getenv("MEMEX_CARD_LO")) : 0;
+    static const int card_hi = getenv("MEMEX_CARD_HI") ? atoi(getenv("MEMEX_CARD_HI"))
+                                                       : 1000000;
+    if (card_layers) {
+        static bool said_range = false;
+        if (!said_range) {
+            said_range = true;
+            printf("sloi na karte: %d..%d (ostalnye na CPU tem zhe binarnikom)\n",
+                   card_lo, std::min(card_hi, h.n_layer - 1));
+        }
+    }
+
     ggml_tensor* cur = ggml_get_rows(c, w.tok_embd, g->tokens);
     for (int il = 0; il < h.n_layer; ++il) {
         const Qwen35Weights::Layer& L = w.layers[size_t(il)];
         const LayerGeom& G = h.L(il);
         ggml_tensor* attn_out = nullptr;
+        // Chto karta vernula: normirovannyj vhod ekspertov, syrye logity marshrutizatora i
+        // uzhe gejtovannyj vyhod obshchego eksperta. Nol - znachit sloj schitalsja na CPU.
+        ggml_tensor* card_x  = nullptr;
+        ggml_tensor* card_rl = nullptr;
+        ggml_tensor* card_sh = nullptr;
 
+#ifdef MEMEX_FWD_GPU_EXPERTS
+        if (card_layers && il >= card_lo && il <= card_hi) {
+            // [ostatok | ego norma | obshchij ekspert | logity marshrutizatora] - chetyre
+            // velichiny odnim zaborom, potomu chto kazhdyj zabor eto submit s ozhidaniem.
+            // Logity vozvrashchajutsja SYRYMI: softmax i top-k ostajutsja temi zhe uzlami v tom
+            // zhe porjadke, chto do karty, - reshenie marshrutizacii ne dvigaetsja.
+            ggml_tensor* lay = gstat->layer(c, il, cur, g->mask);
+            attn_out = ggml_reshape_2d(c, ggml_view_1d(c, lay, h.n_embd, 0), h.n_embd, 1);
+            card_x   = ggml_reshape_2d(c,
+                ggml_view_1d(c, lay, h.n_embd, size_t(h.n_embd) * sizeof(float)),
+                h.n_embd, 1);
+            card_sh  = ggml_reshape_2d(c,
+                ggml_view_1d(c, lay, h.n_embd, size_t(2 * h.n_embd) * sizeof(float)),
+                h.n_embd, 1);
+            card_rl  = ggml_reshape_2d(c,
+                ggml_view_1d(c, lay, h.n_expert, size_t(3 * h.n_embd) * sizeof(float)),
+                h.n_expert, 1);
+            // Zondov VNUTRI sloja zdes net i byt ne mozhet: sloj schitan na karte odnim uzlom,
+            // i promezhutochnyh tenzorov v etom grafe prosto ne sushchestvuet. Sverjaetsja to,
+            // chto vidno na granice - ffn_inp_normed-<il> i l_out-<il> nizhe, oba s temi zhe
+            // imenami, chto emitit processornyj put. Molcha stavit sjuda "ssm_output" bylo by
+            // huzhe pustogo mesta: imja obeshchalo by sravnenie, kotorogo net.
+        } else
+#endif
         if (G.kind == LayerKind::DELTA_NET) {
             if (!ds.s[size_t(il)] || !g->seq_ids) {
                 printf("qwen35moe: слой %d — дельта-сеть без состояния или без карты "
@@ -3715,9 +3789,37 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // ekspertov. Bez etogo krivuju pokrytija na Coder Next merit nechem: rezidentnyj nabor
         // dlja etoj vetki otkazan, a znachit i sel_ids nikto ne sobiral.
         ggml_tensor* sel_cp = nullptr;
-        cur = qwen35_ffn(c, h, L, attn_out, n_tokens, keep_probes ? &normed : nullptr,
-                         want_sel ? &sel_cp : nullptr, g->gf);
+        if (card_x) {
+            // Hvost na CPU: rovno te zhe uzly v tom zhe porjadke, chto vnutri qwen35_ffn -
+            // eto odna i ta zhe funkcija, a ne ejo kopija. Poriadok dvuh poslednih slozhenij
+            // tozhe tot zhe: ostatok k marshrutiziruemoj polovine, potom obshchij ekspert.
+            ggml_tensor* routed = qwen35_moe_routed(c, h, L, attn_out, card_x, card_rl,
+                                                    n_tokens, want_sel ? &sel_cp : nullptr,
+                                                    g->gf);
+            cur = ggml_add(c, routed, card_sh);
+            normed = card_x;
+        } else {
+            cur = qwen35_ffn(c, h, L, attn_out, n_tokens,
+                             (keep_probes || want_hid) ? &normed : nullptr,
+                             want_sel ? &sel_cp : nullptr, g->gf);
+        }
         if (sel_cp) g->sel_ids.push_back(sel_cp);
+        if (want_hid) {
+            // Nepreryvnaja KOPIJA i javnyj expand - po tem zhe dvum prichinam, chto u sel:
+            // bufer samogo normed gallocr pereispolzuet, kak tolko FFN otrabotal, i togda vse
+            // sloi prochitalis by kak poslednij (lovushka 7.3); a ggml_set_output pinit bajty,
+            // no NE delaet uzel dostizhimym - bez expand pervoe zhe chtenie padaet na
+            // GGML_ASSERT(buf != NULL) (lovushka 7.2).
+            if (!normed) {
+                printf("MEMEX_HIDDEN_TRACE: sloj %d ne otdal vhod marshrutizatora - "
+                       "DAMP NE SNIMAETSJA\n", il);
+                return false;
+            }
+            ggml_tensor* hcp = ggml_cont(c, normed);
+            ggml_set_output(hcp);
+            ggml_build_forward_expand(g->gf, hcp);
+            g->hid_outs.push_back(hcp);
+        }
         if (keep_probes) {
             g->probes.push_back({"ffn_inp_normed-" + std::to_string(il), normed});
             g->probes.push_back({"l_out-" + std::to_string(il), cur});
@@ -3805,6 +3907,11 @@ struct BuildOpts {
     // nih eto pole nichego ne menjaet; u qwen35moe/qwen3next rs net vovse, i do reestra
     // kopija stroilas VSEGDA - 48 lishnih zakreplennyh uzlov na token.
     bool want_sel = false;
+    // Nuzhen li damp vhoda marshrutizatora naruzhu (g->hid_outs). Ta zhe cena, chto u
+    // want_sel - uzel i zakreplennyj vyhod na sloj, - i to zhe pravilo: stroitsja tolko
+    // kogda ego kto-to chitaet. Umeet EJO odin stroitel, i build_any otkazyvaet vsluh
+    // ostalnym, a ne pishet nuli pod imenem dampa.
+    bool want_hid = false;
 };
 
 // Opisanie arhitektury: kakoj nabor vesov zapolnen i chto ejo stroitel umeet.
@@ -3928,6 +4035,15 @@ static bool build_any(const ArchModel& am, Graph* g, ggml_backend_buffer_type_t 
                "otmotat ego nechem: lovushka 7.5)\n", wh, am.name);
         return false;
     }
+    // DAMP VHODA MARSHRUTIZATORA umeet odin stroitel. Otkaz vsluh, a ne tihij propusk:
+    // pustoj (ili nulevoj) damp pod imenem fajla chitalsja by kak izmerenie - eto rovno tot
+    // rod otkaza, radi kotorogo reestr i sdelan.
+    if (o.want_hid && !am.q35) {
+        printf("tochka %s: MEMEX_HIDDEN_TRACE prosit vhod marshrutizatora, a arhitektura %s "
+               "ego ne otdajot - OTKAZ (dlja qwen3moe i gemma4 eto ne sdelano)\n",
+               wh, am.name);
+        return false;
+    }
     if (am.needs_delta && !o.ds) {
         printf("tochka %s: arhitekture %s objazatelno perenosimoe sostojanie delta-seti, a "
                "tochka ego ne dala - OTKAZ\n", wh, am.name);
@@ -3963,7 +4079,8 @@ static bool build_any(const ArchModel& am, Graph* g, ggml_backend_buffer_type_t 
             printf("MEMEX_LAYOUT_SEL: tochka %s stroit kopiju top-k naruzhu - raskladka drugaja\n", wh);
         }
         return build_qwen35_step(g, buft, h, *am.q35, kv, *o.ds, n_tokens, n_past, n_kv,
-                                 o.all_logits, o.keep_probes, o.gstat, o.want_sel || force_sel);
+                                 o.all_logits, o.keep_probes, o.gstat, o.want_sel || force_sel,
+                                 o.want_hid);
     }
     return build_step(g, buft, h, *am.w, kv, n_tokens, n_past, n_kv, o.min_experts,
                       o.expert_thresh, o.all_logits, o.zc, o.keep_dbg, o.rs, o.gx,
@@ -4145,6 +4262,16 @@ struct Generator {
             if (!gstat->upload_kv(kv.k.data(), kv.v.data(), h->n_layer, past, &uerr)) {
                 printf("кэш промпта не уехал на карту: %s\n", uerr.c_str());
                 return false;
+            }
+            // I PERENOSIMOE SOSTOJANIE TOZHE. U delta-seti kesha net, no est okno svjortki i
+            // matrica sostojanija, i posle prefilla na hoste oni lezhat v hostovom DeltaState.
+            // Bez etoj peredachi karta nachala by dekod s NULJA - i eto ne padenie, a svjaznyj
+            // tekst, zabyvshij promt.
+            if (gstat->delta_layers() > 0) {
+                if (!gstat->upload_delta(ds.s.data(), h->n_layer, &uerr)) {
+                    printf("sostojanie delta-seti ne uehalo na kartu: %s\n", uerr.c_str());
+                    return false;
+                }
             }
         }
 #endif
@@ -6638,13 +6765,22 @@ int main(int argc, char** argv) {
         // geometrija, dve maski i neobjazatelnye slots dlja treh ejo sobstvennyh tenzorov i dlja
         // otsutstvujushchego wv. Vsjo eto proverjaetsja --decode-check: on sveryaet KAZHDYJ shag s
         // llama_decode, i imenno tak byla najdena predydushchaja oshibka v etoj vetke.
-        if (sopt.layers && !arch_g4) {
+        if (sopt.layers && !arch_g4 && !arch_q35) {
             // GpuStatic строит один граф слоя и переиспользует его на всех слоях: у него одна
             // форма головы, один размер, одно окно. У gemma4 из тридцати слоёв двадцать пять со
             // скользящим окном, головы 16/2 по 512 чередуются с 16/8 по 256, а масштаб внимания
             // единица вместо 1/sqrt(d). Отказ по имени, а не молчаливый неверный ответ.
             printf("--gpu-static-layers пока только для qwen3moe: один граф слоя на все слои, "
                    "а у \"%s\" геометрия своя на каждом\n", h.arch.c_str());
+            return 1;
+        }
+        // qwen35moe/qwen3next DOPUSHCHENY k slojam. Poslojnaja geometrija u nih tozhe svoja -
+        // i dazhe krupnee, chem u gemma4: DVA RODA sloev, 36 gejted delta-seti i 12 vnimanija.
+        // Modul teper stroit graf na sloj PO EGO RODU, a ne odin graf na vsju model, poetomu
+        // prichina zapreta u nih otpala. Dlja vsego ostalnogo zapret ostajotsja.
+        if (sopt.layers && arch_q35 && sopt.width != 1) {
+            printf("--gpu-static-layers dlja etoj arhitektury: shirina sloja %d, a DELTA_NET na "
+                   "Vulkan sveren tolko na odnom tokene - OTKAZ\n", sopt.width);
             return 1;
         }
         // --gen для gemma4 РАЗРЕШЁН. Запрет стоял на всей ветке, хотя привязаны к геометрии были
@@ -7177,6 +7313,43 @@ int main(int argc, char** argv) {
                 g.n_swa     = (G.kind == LayerKind::ATTN_SWA) ? h.n_swa : 0;
             }
         }
+        if (arch_q35 && sopt.layers) {
+            // DVA RODA SLOEV V ODNOJ MODELI, i eto ne raznaja geometrija odnogo bloka, a raznye
+            // bloki: 36 sloev gejted delta-seti bez kesha voobshche i 12 sloev vnimanija s
+            // dvojnoj wq. Odin flag na model tut ne rabotaet - priznak stoit na sloe.
+            sc.qwen3next_block = true;
+            sc.ssm_d_conv  = h.ssm_d_conv;
+            sc.ssm_d_inner = h.ssm_d_inner;
+            sc.ssm_d_state = h.ssm_d_state;
+            sc.ssm_dt_rank = h.ssm_dt_rank;
+            sc.ssm_n_group = h.ssm_n_group;
+            for (int i = 0; i < 4; ++i) sc.rope_sections[i] = h.rope_sections[i];
+            sc.geom.resize(std::size_t(h.n_layer));
+            for (int il = 0; il < h.n_layer; ++il) {
+                const LayerGeom& G = h.L(il);
+                memex::GpuStaticGeom& g = sc.geom[std::size_t(il)];
+                g.delta     = (G.kind == LayerKind::DELTA_NET);
+                g.n_head    = G.n_head;
+                g.n_head_kv = G.n_head_kv;
+                g.head_dim  = G.head_dim;
+                g.n_rot     = G.n_rot;       // 64 iz 256: povorachivaetsja chetvert golovy
+                g.rope_type = h.rope_type;
+                g.rope_base = G.rope_base;
+                g.attn_scale = h.f_attn_scale;
+                g.n_swa     = 0;             // okna u etoj arhitektury net ni na odnom sloe
+            }
+            // Samoattestacija: skolko sloev kakogo roda uvidel modul. Bez etoj stroki
+            // "36 i 12" ostalos by utverzhdeniem - a imenno na etom delenii stoit i raskladka
+            // pamjati, i to, kakoj graf sobiraetsja dlja kakogo sloja.
+            int nd = 0;
+            for (const memex::GpuStaticGeom& g : sc.geom) {
+                if (g.delta) ++nd;
+            }
+            printf("--gpu-static-layers dlja %s: %d sloev delta-seti, %d sloev vnimanija, "
+                   "sekcii rope {%d,%d,%d,%d}, n_rot %d iz head_dim %d\n",
+                   h.arch.c_str(), nd, h.n_layer - nd, h.rope_sections[0], h.rope_sections[1],
+                   h.rope_sections[2], h.rope_sections[3], h.L(3).n_rot, h.L(3).head_dim);
+        }
         gstat.reset(new memex::GpuStatic());
         std::string serr;
         // TRI vetki, a ne dve. Zdes stojal ternarnik arch_g4 ? w4.out : w.out, i dlja
@@ -7236,6 +7409,24 @@ int main(int argc, char** argv) {
                     S.ffn_gate = L.gate;
                     S.ffn_down = L.down;
                 }
+            } else if (arch_q35) {
+                // DVA RODA SLOEV. Na sloe delta-seti pusty wq/wk/wv/wo/q_norm/k_norm, na sloe
+                // vnimanija pusta vsja ssm-polovina, i modul proverjaet imenno eto: slot,
+                // objazatelnyj dlja etogo roda i ostavshijsja nulevym, - otkaz po imeni. Bez
+                // takoj proverki nedostajushchij ves byl by ne padeniem, a nuljom v grafe.
+                const Qwen35Weights::Layer& L = w35.layers[std::size_t(il)];
+                S.attn_norm = L.attn_norm; S.ffn_norm = L.ffn_norm; S.router = L.router;
+                S.wq = L.wq; S.wk = L.wk; S.wv = L.wv; S.wo = L.wo;
+                S.q_norm = L.q_norm; S.k_norm = L.k_norm;
+                S.wqkv = L.wqkv; S.wqkv_gate = L.wqkv_gate;
+                S.ssm_conv1d = L.ssm_conv1d; S.ssm_dt = L.ssm_dt; S.ssm_a = L.ssm_a;
+                S.ssm_ba = L.ssm_ba; S.ssm_beta = L.ssm_beta; S.ssm_alpha = L.ssm_alpha;
+                S.ssm_norm = L.ssm_norm; S.ssm_out = L.ssm_out;
+                // OBSHCHIJ EKSPERT - na kazhdom sloe i kazhdom tokene. Eto staticheskij trafik,
+                // i imenno poetomu on zdes, a ne v ResidentSet: nabor schitaet bajty tolko
+                // marshrutiziruemyh ekspertov i schital by jomkost ot nevernogo znamenatelja.
+                S.shexp_gate = L.shexp_gate; S.gate_shexp = L.gate_shexp;
+                S.up_shexp = L.up_shexp; S.down_shexp = L.down_shexp;
             } else {
                 // Eto ne "vsjo ostalnoe", a ROVNO put qwen3moe: u qwen35moe/qwen3next w.layers
                 // PUST (zapolnjaetsja w35), i chtenie zdes ushlo by za granicu. Derzhitsja ono
@@ -7833,6 +8024,14 @@ int main(int argc, char** argv) {
         const bool want_cover = getenv("MEMEX_EXPERT_COVERAGE") != nullptr;
         const char* trace_path = getenv("MEMEX_EXPERT_TRACE");
         const bool want_sel = (rset != nullptr) || want_cover || (trace_path != nullptr);
+        // DAMP SKRYTOGO SOSTOJANIJA - vhod marshrutizatora kazhdogo sloja na kazhdom tokene.
+        // Sprosheno ZDES, ryadom s want_sel i po toj zhe prichine: ot etogo zavisit sam graf
+        // prefilla, a ne tolko chtenie iz nego. Poriadok tokenov u dampa i u sleda
+        // MEMEX_EXPERT_TRACE odin i tot zhe, potomu chto oba sobirajutsja v ODNOM prohode po
+        // kuskam - snimat ih raznymi progonami nelzja, i imenno eto proverjaet k=0 v
+        // bench/hidden_lab.py.
+        const char* hid_path = getenv("MEMEX_HIDDEN_TRACE");
+        const bool want_hid = hid_path != nullptr;
 
         // SHIRINA GRAFA PREFILLA: ves promt ili kusok. Ostatok idjot svoim grafom - dvuh
         // grafov hvataet na ljubuju dlinu, i eto chestnee, chem dopolnjat poslednij kusok
@@ -7878,6 +8077,7 @@ int main(int argc, char** argv) {
         pbo.gstat = gsp;
         pbo.ds = &hds;
         pbo.want_sel = want_sel;
+        pbo.want_hid = want_hid;
         const bool built_pre =
             build_any(am, &pre, buft, h, kv, pre_w, 0, n_kv_max, pbo);
         if (built_pre && pre_tail_w > 0) {
@@ -8007,6 +8207,19 @@ int main(int argc, char** argv) {
         // ot nih zavisit sam graf, a ne tolko chtenie iz nego.
         if (want_sel)
             rsel.assign(size_t(h.n_layer) * size_t(h.n_expert_used) * size_t(n), 0);
+        // Damp skrytogo sostojanija srazu v poriadke FAJLA - [token][sloj][n_embd], - chtoby
+        // mezhdu snjatiem i zapisju ne bylo perekladki osej, v kotoroj mozhno oshibitsja
+        // molcha. f16 na meste: 1900 x 48 x 2048 x 2 = 373 MB, v f32 bylo by 747.
+        std::vector<uint16_t> hid;
+        std::vector<float> hid_chunk;
+        long long hid_layers_taken = 0;
+        if (want_hid) {
+            hid.assign(size_t(n) * size_t(h.n_layer) * size_t(h.n_embd), 0);
+            hid_chunk.assign(size_t(pre_w) * size_t(h.n_embd), 0.0f);
+            printf("MEMEX_HIDDEN_TRACE: budet snjat vhod marshrutizatora, %d x %d x %d f16 "
+                   "= %.0f MB v \"%s\"\n", n, h.n_layer, h.n_embd,
+                   double(hid.size()) * 2.0 / 1e6, hid_path);
+        }
         for (int off = 0; off < n; off += pre_w) {
             const int cnt = std::min(pre_w, n - off);
             Graph& gp = (cnt == pre_w) ? pre : pre_tail;
@@ -8041,6 +8254,66 @@ int main(int argc, char** argv) {
                 }
                 rsel_filled = true;
             }
+            if (want_hid) {
+                if (int(gp.hid_outs.size()) != h.n_layer) {
+                    printf("MEMEX_HIDDEN_TRACE: kusok vernul %zu sloev vmesto %d - DAMP NE "
+                           "ZAPISAN\n", gp.hid_outs.size(), h.n_layer);
+                    return 1;
+                }
+                for (int il = 0; il < h.n_layer; ++il) {
+                    ggml_tensor* t = gp.hid_outs[size_t(il)];
+                    if (ggml_nelements(t) != int64_t(h.n_embd) * int64_t(cnt)) {
+                        printf("MEMEX_HIDDEN_TRACE: sloj %d vernul %lld chisel vmesto %d - "
+                               "DAMP NE ZAPISAN\n", il, (long long)ggml_nelements(t),
+                               h.n_embd * cnt);
+                        return 1;
+                    }
+                    ggml_backend_tensor_get(t, hid_chunk.data(), 0, ggml_nbytes(t));
+                    // [n_embd, cnt] -> [token][sloj][n_embd]. Perekladka odna i zdes, srazu
+                    // posle chtenija, poka forma tenzora ryadom i ejo vidno.
+                    for (int tt = 0; tt < cnt; ++tt) {
+                        ggml_fp32_to_fp16_row(
+                            hid_chunk.data() + size_t(tt) * size_t(h.n_embd),
+                            (ggml_fp16_t*)(hid.data() +
+                                (size_t(off + tt) * size_t(h.n_layer) + size_t(il)) *
+                                size_t(h.n_embd)),
+                            h.n_embd);
+                    }
+                    ++hid_layers_taken;
+                }
+            }
+        }
+        // ZAPIS DAMPA - po svoemu flagu i nichemu bolshe, srazu posle prohoda po kuskam.
+        // Ne vnutri bloka pokrytija: tam uslovie want_sel, i damp bez sleda ne zapisalsja by
+        // voobshche - molcha.
+        if (want_hid) {
+            FILE* hf = fopen(hid_path, "wb");
+            if (!hf) {
+                printf("MEMEX_HIDDEN_TRACE: fajl \"%s\" ne otkrylsja - DAMP NE ZAPISAN\n",
+                       hid_path);
+            } else {
+                // dtype 1 = f16. Zagolovok nazyvaet vse tri razmera, chtoby osi nelzja bylo
+                // pereputat na chtenii.
+                const int32_t hdr[4] = {n, h.n_layer, h.n_embd, 1};
+                const std::size_t wh4 = fwrite(hdr, sizeof(int32_t), 4, hf);
+                std::size_t wrote = 0;
+                if (wh4 == 4) {
+                    wrote = fwrite(hid.data(), sizeof(uint16_t), hid.size(), hf);
+                }
+                fclose(hf);
+                if (wh4 != 4 || wrote != hid.size()) {
+                    printf("MEMEX_HIDDEN_TRACE: zapisano %zu iz %zu chisel - DAMP NEPOLON I "
+                           "NEDEJSTVITELEN\n", wrote, hid.size());
+                } else {
+                    printf("damp skrytogo sostojanija zapisan: %s (%d tokenov x %d sloev x "
+                           "%d, f16, %.0f MB)\n", hid_path, n, h.n_layer, h.n_embd,
+                           double(hid.size()) * 2.0 / 1e6);
+                    printf("  snjato sloev-kuskov %lld; NE ZAPISANO: sostojanie na "
+                           "sgenerirovannyh tokenah (--gen idjot posle etogo mesta) i "
+                           "sostojanie sloev vnimanija otdelno - v dampe vhod marshrutizatora "
+                           "KAZHDOGO sloja, i sloja vnimanija tozhe\n", hid_layers_taken);
+                }
+            }
         }
 #ifdef MEMEX_FWD_GPU_EXPERTS
         // The prompt ran on the host, so the card's cache is empty - and an empty cache still
@@ -8055,6 +8328,16 @@ int main(int argc, char** argv) {
             }
             printf("  кэш промпта уехал на карту за %.0f мс (%.1f МБ)\n", ms_since(t_kv),
                    double(kv.bytes(h)) / 1e6);
+            // I PERENOSIMOE SOSTOJANIE DELTA-SETI - po toj zhe prichine i tem zhe odnim razom.
+            if (gsp->delta_layers() > 0) {
+                const auto t_ds = Clock::now();
+                if (!gsp->upload_delta(hds.s.data(), h.n_layer, &uerr)) {
+                    printf("sostojanie delta-seti ne uehalo na kartu: %s\n", uerr.c_str());
+                    return 1;
+                }
+                printf("  sostojanie delta-seti uehalo na kartu za %.0f ms (%.1f MB, %d sloev)\n",
+                       ms_since(t_ds), double(hds.bytes()) / 1e6, gsp->delta_layers());
+            }
         }
 #endif
 
