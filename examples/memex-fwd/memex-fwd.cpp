@@ -7662,7 +7662,18 @@ int main(int argc, char** argv) {
         // vsem promtom.
         // rsel nuzhen ne tolko rezidentnomu naboru: zond pokrytija ekspertov chitaet ego zhe.
         const bool want_cover = getenv("MEMEX_EXPERT_COVERAGE") != nullptr;
-        if (rset || want_cover) rsel.assign(size_t(h.n_layer) * size_t(h.n_expert_used) * size_t(n), 0);
+        // SLED MARSHRUTIZACII PO TOKENAM. Krivaja pokrytija otvechaet na vopros "skolko
+        // ekspertov derzhat, chtoby popadat", a predskazatel - na drugoj: "KAKIE imenno budut
+        // nuzhny na sledujushchem tokene". Vtoroj vopros po schjotchikam ne reshaetsja, nuzhen
+        // sled: kto vybran na kazhdom tokene i kazhdom sloe.
+        //
+        // Pishetsja fajlom, a ne schitaetsja vnutri, naroschno: togda vse predskazateli
+        // sravnivajutsja OFLAJN, bez peresborki i bez zanjatija mashiny, i potolok deshjovyh
+        // sposobov (chastota, uporstvo predydushchego tokena, sosednij sloj) izmerjaetsja
+        // PREZHDE chem pisat obuchaemyj.
+        const char* trace_path = getenv("MEMEX_EXPERT_TRACE");
+        if (rset || want_cover || trace_path)
+            rsel.assign(size_t(h.n_layer) * size_t(h.n_expert_used) * size_t(n), 0);
         for (int off = 0; off < n; off += pre_w) {
             const int cnt = std::min(pre_w, n - off);
             Graph& gp = (cnt == pre_w) ? pre : pre_tail;
@@ -7677,7 +7688,7 @@ int main(int argc, char** argv) {
                 ggml_backend_tensor_get(gp.logits, lg.data(), 0,
                                         sizeof(float) * size_t(h.n_vocab));
             }
-            if ((rset || want_cover) && !gp.sel_ids.empty()) {
+            if ((rset || want_cover || trace_path) && !gp.sel_ids.empty()) {
                 if (int(gp.sel_ids.size()) != h.n_layer) {
                     printf("prefill kuskami: kusok vernul %zu sloev marshrutizacii vmesto %d\n",
                            gp.sel_ids.size(), h.n_layer);
@@ -7729,7 +7740,7 @@ int main(int argc, char** argv) {
         // rather than the policy - which on a 24-token run is the whole run. The order matters:
         // the window is per layer but the refresh period counts tokens, so the walk is token
         // outer, layer inner.
-        if ((rset || want_cover) && !pre.sel_ids.empty()) {
+        if ((rset || want_cover || trace_path) && !pre.sel_ids.empty()) {
             if (int(pre.sel_ids.size()) != h.n_layer) {
                 printf("прогрев резидентного набора: граф префилла вернул %zu слоёв "
                        "маршрутизации вместо %d\n", pre.sel_ids.size(), h.n_layer);
@@ -7930,7 +7941,32 @@ int main(int argc, char** argv) {
                            "potolok uskorenija processornoj poloviny x%5.3f\n",
                            K, un, serial, un / serial, serial / un);
                 }
-                printf("  VNIMANIE: eto marshrutizacija NASHEGO prompta, a ne sobstvennogo "
+                if (trace_path) {
+                // Format nabroshen tak, chtoby ego chital python odnoj strokoj i chtoby v njom
+                // NELZJA bylo pereputat poriadok osej: zagolovok nazyvaet vse tri razmera.
+                FILE* tf = fopen(trace_path, "wb");
+                if (!tf) {
+                    printf("MEMEX_EXPERT_TRACE: fajl \"%s\" ne otkrylsja - SLED NE ZAPISAN\n",
+                           trace_path);
+                } else {
+                    const int32_t hdr[4] = {n, h.n_layer, h.n_expert_used, h.n_expert};
+                    std::size_t wrote = fwrite(hdr, sizeof(int32_t), 4, tf);
+                    // Poriadok: [token][sloj][mesto] - tot zhe, chto u rsel, chtoby ne bylo
+                    // pereklada, v kotorom mozhno oshibitsja.
+                    for (int t = 0; t < n && wrote == 4; ++t) {
+                        for (int il = 0; il < h.n_layer; ++il) {
+                            fwrite(rsel.data() + (std::size_t(il) * std::size_t(n)
+                                   + std::size_t(t)) * std::size_t(h.n_expert_used),
+                                   sizeof(int32_t), std::size_t(h.n_expert_used), tf);
+                        }
+                    }
+                    fclose(tf);
+                    printf("  sled marshrutizacii zapisan: %s (%d tokenov x %d sloev x %d "
+                           "mest, iz %d ekspertov)\n", trace_path, n, h.n_layer,
+                           h.n_expert_used, h.n_expert);
+                }
+            }
+            printf("  VNIMANIE: eto marshrutizacija NASHEGO prompta, a ne sobstvennogo "
                        "prodolzhenija modeli - populjacii raznye (pravilo 87)\n");
                 printf("  I eto POTOLOK: dolja prinjatyh chernovikov v nego ne vhodit\n");
             }
