@@ -3287,15 +3287,19 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
 // the routed half first and the shared expert afterwards is a different association from
 // adding both to the residual at the end, and this project has already paid for treating
 // that kind of difference as cosmetic.
-static ggml_tensor* qwen35_ffn(ggml_context* c, const HParams& h,
-                               const Qwen35Weights::Layer& L, ggml_tensor* attn_out,
-                               int n_tokens, ggml_tensor** normed_out,
-                               ggml_tensor** sel_out = nullptr, ggml_cgraph* gf = nullptr) {
-    const float eps = h.rms_eps;
-    ggml_tensor* x = fnorm(c, attn_out, L.ffn_norm, eps);
-    if (normed_out) *normed_out = x;
-
-    ggml_tensor* rlogits = ggml_mul_mat(c, L.router, x);
+// MARSHRUTIZIRUEMAJA POLOVINA S OSTATKOM, otdelno ot vsego, chto ejo okruzhaet.
+//
+// Vydeleno potomu, chto pri statike na karte imenno eto i ostajotsja hostu: normu ffn_norm,
+// logity marshrutizatora i obshchego eksperta schitaet karta, a mul_mat_id po 512 ekspertam -
+// processor. Vtoraja kopija etih vosmi uzlov razoshlas by s pervoj pervoj zhe pravkoj, i
+// raskhozhdenie bylo by ne oshibkoj formy, a drugim otvetom - poetomu funkcija odna.
+//
+// Vozvrashchaet routed + attn_out. Obshchij ekspert pribavljaetsja SNARUZHI i POSLE, potomu chto
+// poriadok etih dvuh slozhenij - eto poriadok etalona, i associativnost zdes uzhe stoila oshibok.
+static ggml_tensor* qwen35_moe_routed(ggml_context* c, const HParams& h,
+                                      const Qwen35Weights::Layer& L, ggml_tensor* attn_out,
+                                      ggml_tensor* x, ggml_tensor* rlogits, int n_tokens,
+                                      ggml_tensor** sel_out, ggml_cgraph* gf) {
     ggml_tensor* probs = ggml_soft_max(c, rlogits);
     ggml_tensor* sel = ggml_top_k(c, probs, h.n_expert_used);
     if (sel_out) {
@@ -3326,7 +3330,20 @@ static ggml_tensor* qwen35_ffn(ggml_context* c, const HParams& h,
     // Weight and fold in one node - see the note in build_gemma4_step. Eight slots means
     // eight nodes saved a layer, and this model has forty layers.
     ggml_tensor* routed = ggml_mul_multi_add(c, eo, weights);
-    routed = ggml_add(c, routed, attn_out);
+    return ggml_add(c, routed, attn_out);
+}
+
+static ggml_tensor* qwen35_ffn(ggml_context* c, const HParams& h,
+                               const Qwen35Weights::Layer& L, ggml_tensor* attn_out,
+                               int n_tokens, ggml_tensor** normed_out,
+                               ggml_tensor** sel_out = nullptr, ggml_cgraph* gf = nullptr) {
+    const float eps = h.rms_eps;
+    ggml_tensor* x = fnorm(c, attn_out, L.ffn_norm, eps);
+    if (normed_out) *normed_out = x;
+
+    ggml_tensor* rlogits = ggml_mul_mat(c, L.router, x);
+    ggml_tensor* routed = qwen35_moe_routed(c, h, L, attn_out, x, rlogits, n_tokens,
+                                            sel_out, gf);
 
     // The shared expert. Always active on every layer and every token - static traffic, not
     // expert traffic - and gated by a single sigmoid scalar per token.
@@ -3934,8 +3951,19 @@ static bool build_any(const ArchModel& am, Graph* g, ggml_backend_buffer_type_t 
                                  o.all_logits, o.keep_probes, o.gstat, o.rs, o.gx);
     }
     if (am.q35) {
+        // MEMEX_LAYOUT_SEL - PEREKLJUCHATEL RASKLADKI GRAFA, ne arifmetiki. Kopija top-k
+        // naruzhu dobavljaet na kazhdyj sloj ggml_cont i zakreplennyj vyhod, a zakreplennyj
+        // tenzor gallocr pereispolzovat ne mozhet - to est menjaetsja razmeshchenie VSEH
+        // buferov grafa. Na CPU v f32 chisla ot etogo menjatsja ne dolzhny; esli menjajutsja,
+        // kakoj-to uzel chitaet chuzhoj bufer. Bez etoj peremennoj takoj pereklyuchatel byl
+        // tolko u --gen (MEMEX_EXPERT_TRACE), a --decode-check s --gen nesovmestim, poetomu
+        // sravnit dve raskladki na glavnoj proverke bylo nechem.
+        static const bool force_sel = getenv("MEMEX_LAYOUT_SEL") != nullptr;
+        if (force_sel && !o.want_sel) {
+            printf("MEMEX_LAYOUT_SEL: tochka %s stroit kopiju top-k naruzhu - raskladka drugaja\n", wh);
+        }
         return build_qwen35_step(g, buft, h, *am.q35, kv, *o.ds, n_tokens, n_past, n_kv,
-                                 o.all_logits, o.keep_probes, o.gstat, o.want_sel);
+                                 o.all_logits, o.keep_probes, o.gstat, o.want_sel || force_sel);
     }
     return build_step(g, buft, h, *am.w, kv, n_tokens, n_past, n_kv, o.min_experts,
                       o.expert_thresh, o.all_logits, o.zc, o.keep_dbg, o.rs, o.gx,
@@ -5973,6 +6001,19 @@ int main(int argc, char** argv) {
     // at the flag's use - so this exists to compare against the arm the fork actually works
     // in rather than the arm we happen to imitate.
     bool ref_fa = false;
+    // OTDAJOT LI ETALON CHAST UZLOV NA KARTU. Model dlja etalona gruzitsja s
+    // n_gpu_layers 0, i iz etogo delalsja vyvod, chto llama_decode schitaet na processore.
+    // Eto neverno: planirovshchik smotrit ne tolko na to, gde lezhat vesa. Uzel, chi vesa
+    // na hoste, vsjo ravno predlagaetsja bolee prioritetnomu bekendu, i Vulkan berjot ego,
+    // esli ggml_backend_vk_offload_op skazhet da - a on govorit da pri ne[1] >= 32
+    // (ggml-vulkan.cpp:11706, min_batch_size 32). Vidno eto po strokam zagruzchika:
+    // "Vulkan0 compute buffer size = 548.19 MiB" i "graph splits = 951" PRI NULE sloev
+    // na karte. Nakoplenie tam f16 (lovushka 7.6), a nash put - CPU f32.
+    //
+    // Poetomu po umolchaniju vygruzka u etalona VYKLJUCHENA: --decode-check dolzhen merit
+    // nashu arifmetiku, a ne raznicu dvuh bekendov. --ref-offload vozvrashchaet staroe
+    // povedenie dlja sluchaev, kogda sravnit nado imenno so shtatnym forkom.
+    bool ref_offload = false;
     int n_predict = 256;           // chat mode's own budget; --gen drives the harness path
     int pre_chunk = 0;             // --prefill-chunk: 0 znachit odnim grafom, kak bylo
     bool want_ref = true;
@@ -6017,6 +6058,9 @@ int main(int argc, char** argv) {
 "                        как «модель чуть хуже», а не как поломка)\n"
 "  -n, --n-predict N    предел генерации в режиме --chat (%d)\n"
 "  --no-ref             не создавать эталонный llama_context и не сверять логиты\n"
+"  --ref-offload        razreshit etalonu vygruzhat uzly s ne[1] >= 32 na Vulkan\n"
+"                       (po umolchaniju NET: inache sverka merit raznicu bekendov,\n"
+"                        a ne nashu arifmetiku - nakoplenie na karte f16)\n"
 "\n"
 "перепаковка тензоров — включена по умолчанию, +38%%, побитово точна\n"
 "  --repack             включить несмотря на оценку памяти\n"
@@ -6142,6 +6186,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--ref-ubatch")) { if (want_val(i, a)) ref_ubatch = atoi(argv[++i]); }
         else if (!strcmp(a, "--ref-fa")) ref_fa = true;
         else if (!strcmp(a, "--no-ref-fa")) ref_fa = false;
+        else if (!strcmp(a, "--ref-offload")) ref_offload = true;
         else if (!strcmp(a, "--tokens")) { if (want_val(i, a)) max_tokens = atoi(argv[++i]); }
         else if (!strcmp(a, "--probe")) { if (want_val(i, a)) probe_name = argv[++i]; }
         else if (!strcmp(a, "--gen")) { if (want_val(i, a)) n_gen = atoi(argv[++i]); }
@@ -6944,6 +6989,18 @@ int main(int argc, char** argv) {
         if (!lctx) {
             printf("контекст не создался\n");
             return 1;
+        }
+        // Sm. kommentarij u objavlenija ref_offload. Odin vyzov s op < 0 gasit vygruzku dlja
+        // VSEH operacij srazu (ggml_backend_sched_set_op_offload, vetka int_op < 0).
+        if (!ref_offload) {
+            llama_set_offload_policy(lctx, -1, false);
+            printf("etalon posazhen na processor celikom: vygruzka uzlov na Vulkan vykljuchena "
+                   "(--ref-offload vozvrashchaet ejo). Bez etogo pri promte ot 32 tokenov "
+                   "prefill etalona schitalsja na karte v f16, i --decode-check merilo raznicu "
+                   "bekendov, a ne nashu arifmetiku\n");
+        } else {
+            printf("--ref-offload: etalonu razresheno otdavat uzly s ne[1] >= 32 na Vulkan - "
+                   "nakoplenie tam f16, i L2 nizhe merit raznicu bekendov TOZHE\n");
         }
         const auto t_ref = Clock::now();
         if (llama_decode(lctx, llama_batch_get_one(toks.data(), n, 0, 0))) {
