@@ -11,6 +11,7 @@
 #include "ggml-alloc.h"
 #include "ggml-vulkan.h"
 #include "resident_set.hpp"
+#include "hw_caps.hpp"
 
 #if defined(_WIN32)
 #  define NOMINMAX
@@ -26,7 +27,12 @@ namespace memex {
 
 namespace {
 
-constexpr std::size_t kBarHeapCeiling = 256u * 1024u * 1024u;
+// BAR window ceiling. Was 256 MiB hardcoded - the reference RX 6500 XT window. Now the
+// MEASURED device-local + host-visible heap size from hw_caps (measure_hardware() runs at
+// start-up before any of this), so a buffer is judged against THIS card's window; on the
+// reference box it is still exactly 256 MiB, on a ReBAR card it is the whole of VRAM and
+// nothing is treated as "in the window". Falls back to 256 MiB if the probe did not run.
+inline std::size_t kBarHeapCeiling() { return memex::hw_bar_bytes(); }
 
 // Free bytes on the largest device-local heap, and the size of the smallest one - which on a
 // discrete card is the BAR window and is the number that decides how the buffers have to be
@@ -82,7 +88,7 @@ bool device_heap_facts(std::size_t* free_large, std::size_t* smallest_device_hea
             ? std::size_t(budget.heapBudget[i] > budget.heapUsage[i]
                           ? budget.heapBudget[i] - budget.heapUsage[i] : 0)
             : std::size_t(h.size);
-        if (std::size_t(h.size) > kBarHeapCeiling) {
+        if (std::size_t(h.size) > kBarHeapCeiling()) {
             found_large = true;
             if (avail > best) best = avail;
         }
@@ -429,12 +435,13 @@ bool GpuExperts::alloc_weights(std::string* err) {
 
     const std::size_t smallest_group_bytes =
         std::size_t(base_layers) * std::size_t(cap) * (bpe_min_ ? bpe_min_ : bpe_);
-    if (smallest_group_bytes <= kBarHeapCeiling) {
+    if (smallest_group_bytes <= kBarHeapCeiling()) {
         char buf[320];
         snprintf(buf, sizeof(buf),
-                 "разбиение даёт буфер %.1f МиБ (<= 256 МиБ) — он сядет в BAR-кучу и "
-                 "чтения шейдера упадут в сорок раз; уменьшите число групп или ёмкость",
-                 double(smallest_group_bytes) / 1048576.0);
+                 "разбиение даёт буфер %.1f МиБ (<= %.0f МиБ, окно BAR) — он сядет в "
+                 "BAR-кучу и чтения шейдера упадут в сорок раз; уменьшите число групп или ёмкость",
+                 double(smallest_group_bytes) / 1048576.0,
+                 double(kBarHeapCeiling()) / 1048576.0);
         *err = buf;
         return false;
     }
@@ -489,7 +496,7 @@ bool GpuExperts::alloc_weights(std::string* err) {
         }
         const std::size_t sz = ggml_backend_buffer_get_size(b);
         bufs_.push_back(b);
-        bufs_info_.push_back({first, cnt, sz, sz > kBarHeapCeiling});
+        bufs_info_.push_back({first, cnt, sz, sz > kBarHeapCeiling()});
         vram_bytes_ += sz;
         first += cnt;
     }
@@ -2260,10 +2267,11 @@ int gpu_experts_selftest(int threads) {
         ggml_free(cw);
         return 1;
     }
+    const double bar_mib = double(kBarHeapCeiling()) / 1048576.0;
     for (const GpuExpertsBuffer& b : gx.buffers()) {
-        printf("  буфер: слои %2d..%-2d  %8.2f МиБ  %s\n", b.first_layer,
+        printf("  буфер: слои %2d..%-2d  %8.2f МиБ  %s (%.0f МиБ)\n", b.first_layer,
                b.first_layer + b.n_layers - 1, double(b.bytes) / 1048576.0,
-               b.over_bar ? "> 256 МиБ — не BAR" : "<= 256 МиБ — МОГ СЕСТЬ В BAR");
+               b.over_bar ? "> BAR — не BAR" : "<= BAR — МОГ СЕСТЬ В BAR", bar_mib);
     }
     gx.sync_slots(rs);
     gx.drain();

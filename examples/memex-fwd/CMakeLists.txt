@@ -29,7 +29,12 @@ set(MEMEX_KV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../memex-kv")
 #   sampler.cpp    - top2_gap / argmax_of / compare_logits; Sampling/Sampler live inline in
 #                    sampler.hpp. The token type is written as its underlying int32_t so the
 #                    library needs no llama include. Behaviour byte-for-byte the originals.
-set(MEMEX_CORE_SRC resident_set.cpp expert_store.cpp ggml_util.cpp sampler.cpp)
+#   hw_caps.cpp    - start-up hardware self-measurement (RAM via GlobalMemoryStatusEx, VRAM
+#                    and BAR via Vulkan memory heaps, disk type via DeviceIoControl) and the
+#                    strategy chooser. ggml-free; the Vulkan half is under MEMEX_FWD_VULKAN
+#                    exactly like gpu_experts. Replaces the hardcoded 256 MiB BAR / 3824 MiB
+#                    VRAM figures of the reference card with measured values.
+set(MEMEX_CORE_SRC resident_set.cpp expert_store.cpp ggml_util.cpp sampler.cpp hw_caps.cpp)
 
 # The GPU half needs a ggml that has the Vulkan backend in it, which is a property of the
 # build tree and not of this directory: build-vk has it and build does not, and the same

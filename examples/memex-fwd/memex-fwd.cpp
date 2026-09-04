@@ -184,6 +184,8 @@ struct ZonedKvCache;
 // below - and in main(), which sits outside the anonymous namespace - resolves unchanged.
 #include "ggml_util.hpp"
 #include "sampler.hpp"
+// Start-up hardware self-measurement and the strategy chooser. ggml-free, always compiled.
+#include "hw_caps.hpp"
 using memex::norm;
 using memex::fnorm;
 using memex::report_first_nonfinite;
@@ -6772,6 +6774,13 @@ int main(int argc, char** argv) {
     // figures rather than hoped for.
     const uint64_t file_bytes = file_size_bytes(model_path.c_str());
     const PhysMem mem = phys_mem();
+    // SAMOZAMER ZHELEZA pri starte: OZU (GlobalMemoryStatusEx), VRAM i okno BAR (kuchi Vulkan,
+    // NE po lzhivomu "svobodno" drajvera), tip diskov (DeviceIoControl). Pechataet, chto
+    // izmereno i chto ocenka. Izmerennye BAR/VRAM otsjuda zamenjajut byvshie vshitye 256/3824
+    // MiB v gpu_static/gpu_experts cherez hw_bar_bytes()/hw_vram_bytes(). Na etoj mashine
+    // izmerennoe sovpadaet s prezhnim hardkodom (BAR 256, VRAM 3824), tak chto povedenie to zhe.
+    const memex::HardwareCaps& hwcaps = memex::measure_hardware();
+    memex::print_hardware_caps(hwcaps);
     // The overhead the resident model has to share the machine with, counted rather than
     // guessed: our own F16 cache at the context we will ask for, the reference context's KV
     // if we are going to create one, and half a gigabyte for graph compute buffers, the
@@ -7331,11 +7340,12 @@ int main(int argc, char** argv) {
         printf("\nstaticheskaja golova na karte: %s\n", gsp->device_name().c_str());
         printf("  output.weight %s, %.1f MiB v videopamjati, blok do %d strok\n",
                gsp->head_type_name(), double(gsp->vram_bytes()) / 1048576.0, sopt.rows);
+        const double bar_mib = double(memex::hw_bar_bytes()) / 1048576.0;
         for (const memex::GpuStaticBuffer& b : gsp->buffers()) {
-            printf("  bufer: %-24s %8.2f MiB (nabivki %.2f MiB)  %s\n", b.what.c_str(),
-                   double(b.bytes) / 1048576.0, double(b.padding) / 1048576.0,
-                   b.over_bar ? "> 256 MiB - ne BAR"
-                              : "<= 256 MiB - MOG SEST V BAR");
+            printf("  bufer: %-24s %8.2f MiB (nabivki %.2f MiB)  %s (BAR %.0f MiB)\n",
+                   b.what.c_str(), double(b.bytes) / 1048576.0, double(b.padding) / 1048576.0,
+                   b.over_bar ? "> BAR - ne BAR"
+                              : "<= BAR - MOG SEST V BAR", bar_mib);
         }
     }
 #else
@@ -7484,6 +7494,30 @@ int main(int argc, char** argv) {
             L0.gate_exps, L0.up_exps, L0.down_exps);
         const PhysMem pm = phys_mem();
         const uint64_t reserve = uint64_t(eopt.reserve_mib) * 1048576ull;
+        // Svodnyj vybor strategii iz izmerennogo zheleza i geometrii modeli: golova/statika na
+        // kartu (VRAM), skolko ekspertov rezidentno (C ot svobodnoj OZU toj zhe formuloj, chto
+        // i hranilishche nizhe), nuzhny li urovni (eksperty > OZU). Sovetnyj vyvod s
+        // obosnovaniem; realnyj C nizhe schitaet ta zhe auto_capacity, javnyj C pereopredeljaet.
+        {
+            memex::ModelGeometry geo;
+            geo.n_layer          = h.n_layer;
+            geo.n_expert         = h.n_expert;
+            geo.n_expert_used    = h.n_expert_used;
+            geo.bytes_per_expert = bpe;
+            // Static set on the card is known only when the GPU-static module exists in this
+            // build (MEMEX_FWD_GPU_EXPERTS) and was asked for; else 0 and the strategy line
+            // reports "net geometrii". Guarded so the non-Vulkan build, where GpuStatic is an
+            // incomplete type, still compiles.
+            std::size_t static_bytes = 0;
+#ifdef MEMEX_FWD_GPU_EXPERTS
+            if (gsp) static_bytes = gsp->vram_bytes();
+#endif
+            geo.static_set_bytes = static_bytes;
+            geo.head_bytes       = static_bytes;
+            geo.file_bytes       = file_bytes;
+            geo.name             = h.arch.c_str();
+            memex::choose_strategy(hwcaps, geo, reserve, eopt.spares, /*print=*/true);
+        }
         memex::ExpertStoreConfig ec;
         ec.n_layer  = h.n_layer;
         ec.n_expert = h.n_expert;

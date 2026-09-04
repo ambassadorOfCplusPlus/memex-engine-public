@@ -14,6 +14,7 @@
 // arrangement that cannot be checked any other way: "device-local" in every other report is
 // exactly the word that hides a buffer the driver quietly moved to system memory.
 #include "gpu_experts.hpp"
+#include "hw_caps.hpp"
 
 // MEMEX_STATIC_TRUNC, read once. See the truncation block in the layer graph builder for what it
 // is for; in short, it is the only instrument on this backend that can attribute device cost,
@@ -27,7 +28,11 @@ namespace memex {
 
 namespace {
 
-constexpr std::size_t kBarHeapCeiling = 256u * 1024u * 1024u;
+// BAR window ceiling. Was 256 MiB hardcoded - the reference RX 6500 XT window. Now the
+// MEASURED device-local + host-visible heap size from hw_caps (measure_hardware() runs at
+// start-up, before this class is constructed). Same 256 MiB on the reference box; the whole
+// of VRAM on a ReBAR card. Falls back to 256 MiB if the probe did not run.
+inline std::size_t kBarHeapCeiling() { return memex::hw_bar_bytes(); }
 // How far past the ceiling to land. find_properties compares heap.size against the buffer
 // size, so anything strictly greater than the BAR heap cannot be typed onto it; a margin is
 // kept anyway because the comparison is against the heap's declared size and a driver that
@@ -200,8 +205,8 @@ bool GpuStatic::alloc_head(ggml_tensor* out, std::string* err) {
     // with system memory: shader reads fall to 3.1 GB/s while heapUsage still says
     // device-local. So if what we actually need is under the ceiling, ask for more.
     std::size_t pad = 0;
-    if (need <= kBarHeapCeiling) {
-        pad = kBarHeapCeiling + kOverBarMargin - need;
+    if (need <= kBarHeapCeiling()) {
+        pad = kBarHeapCeiling() + kOverBarMargin - need;
         // ggml pads each tensor to the buffer type's alignment, so the sum of the two tensors
         // is at least need + pad and the ceiling is cleared with room to spare either way.
         if (need + pad > max_buf) {
@@ -243,7 +248,7 @@ bool GpuStatic::alloc_head(ggml_tensor* out, std::string* err) {
     bi.what = "golova output.weight";
     bi.bytes = sz;
     bi.padding = pad;
-    bi.over_bar = sz > kBarHeapCeiling;
+    bi.over_bar = sz > kBarHeapCeiling();
     bufs_info_.push_back(bi);
     if (!bi.over_bar) {
         // Never reached with the padding above, and checked anyway: this is the one failure
@@ -840,7 +845,9 @@ bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::str
             // Pervaja versija etoj proverki sravnivala s konstantoj i ne mogla srabotat
             // nikogda; vidno eto stalo tolko potomu, chto pechat postavlena BEZUSLOVNO.
             const std::size_t placed = vram_bytes_;
-            const std::size_t budget = vk_total ? vk_total : (3824ull << 20);
+            // Fallback was the reference card's 3824 MiB hardcoded; now the MEASURED
+            // largest device-local heap from hw_caps when ggml's own total is unavailable.
+            const std::size_t budget = vk_total ? vk_total : memex::hw_vram_bytes();
             printf("sloi na kartu: razmeshcheno %.1f MiB, nuzhno eshchjo %.1f, bjudzhet "
                    "%.1f, zapas %.0f\n",
                    double(placed) / 1048576.0, double(need) / 1048576.0,
@@ -1034,7 +1041,7 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
     // buffer that fits the 256 MiB window is put in it, and once the window is committed the
     // driver backs the rest from system memory - a 40x penalty that measures as a working
     // feature. A buffer larger than the window cannot be typed onto that heap at all.
-    const std::size_t min_group = kBarHeapCeiling + kOverBarMargin;
+    const std::size_t min_group = kBarHeapCeiling() + kOverBarMargin;
     std::size_t n_groups = 1;
     if (max_buf > 0 && total > max_buf) n_groups = (total + max_buf - 1) / max_buf;
     const std::size_t cap_groups = total / min_group;
@@ -1160,7 +1167,7 @@ bool GpuStatic::alloc_layers(const GpuStaticLayer* src, std::string* err) {
         }
         bi.bytes = sz;
         bi.padding = pad;
-        bi.over_bar = sz > kBarHeapCeiling;
+        bi.over_bar = sz > kBarHeapCeiling();
         bufs_info_.push_back(bi);
         if (!bi.over_bar) {
             *err = "bufer sloev <= 256 MiB - on sjadet v BAR-kuchu i chtenija shejdera "
@@ -2634,10 +2641,11 @@ int gpu_static_selftest(int threads) {
         ggml_free(cw);
         return 1;
     }
+    const double bar_mib = double(kBarHeapCeiling()) / 1048576.0;
     for (const GpuStaticBuffer& b : gs.buffers()) {
-        printf("  bufer: %-24s %8.2f MiB (nabivki %.2f MiB)  %s\n", b.what.c_str(),
+        printf("  bufer: %-24s %8.2f MiB (nabivki %.2f MiB)  %s (BAR %.0f MiB)\n", b.what.c_str(),
                double(b.bytes) / 1048576.0, double(b.padding) / 1048576.0,
-               b.over_bar ? "> 256 MiB - ne BAR" : "<= 256 MiB - MOG SEST V BAR");
+               b.over_bar ? "> BAR - ne BAR" : "<= BAR - MOG SEST V BAR", bar_mib);
     }
     printf("  ustrojstvo: %s, v videopamjati %.1f MiB, tip %s\n",
            gs.device_name().c_str(), double(gs.vram_bytes()) / 1048576.0,
