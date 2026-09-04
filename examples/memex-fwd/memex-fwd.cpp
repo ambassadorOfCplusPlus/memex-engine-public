@@ -3831,6 +3831,9 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // ekspertov. Bez etogo krivuju pokrytija na Coder Next merit nechem: rezidentnyj nabor
         // dlja etoj vetki otkazan, a znachit i sel_ids nikto ne sobiral.
         ggml_tensor* sel_cp = nullptr;
+        // PREDZAGRUZKA PO R1 (shag 5): nuzhen vhod marshrutizatora x_l dazhe togda, kogda ni
+        // zondy, ni damp ego ne prosjat - iz nego stroitsja predskazanie ekspertov sloja l+K.
+        const bool need_norm_pref = es && es->on() && es->prefetch_on();
         if (card_x) {
             // Hvost na CPU: rovno te zhe uzly v tom zhe porjadke, chto vnutri qwen35_ffn -
             // eto odna i ta zhe funkcija, a ne ejo kopija. Poriadok dvuh poslednih slozhenij
@@ -3842,8 +3845,21 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
             normed = card_x;
         } else {
             cur = qwen35_ffn(c, h, L, attn_out, n_tokens,
-                             (keep_probes || want_hid) ? &normed : nullptr,
+                             (keep_probes || want_hid || need_norm_pref) ? &normed : nullptr,
                              want_sel ? &sel_cp : nullptr, g->gf, es, il);
+        }
+        // PREDZAGRUZKA: kogda x_l sloja l poschitan, predskazyvaem eksperty sloja l+K po R1 i
+        // stavim nerezidentnye iz nih v chtenie zaranee. Odin matvektor router_{l+K}*x_l na
+        // CPU (poparallelen), popravka Wc i top-B - vnutri uzla es. Uzel po zavisimosti ot x_l
+        // ljozhet na mesto sloja l, tak chto chtenie idjot na fone K sloev scheta. Otveta ne
+        // menjaet: lish zaranee kladjot v pamjat to, chto inache prochitalos by sinhronno.
+        if (need_norm_pref && normed) {
+            const int tgt = il + es->prefetch_k();
+            if (tgt < h.n_layer) {
+                ggml_tensor* xin = ggml_cont(c, normed);
+                ggml_tensor* pr  = ggml_mul_mat(c, w.layers[std::size_t(tgt)].router, xin);
+                es->prefetch_node(c, g->gf, tgt, pr);
+            }
         }
         if (sel_cp) g->sel_ids.push_back(sel_cp);
         if (want_hid) {
@@ -4942,6 +4958,10 @@ struct ExpertStoreOpt {
     bool repack  = false;    // --expert-store-repack: IQ3_XXS -> IQ3_XXS_R4 pryamo v slotah
     int reserve_mib = 2048;  // --expert-store-reserve: skolko OZU ne zanimat
     const char* prior = nullptr;  // --expert-prior: fajl zatravki schjotchikov
+    // PREDZAGRUZKA PO R1 (shag 5).
+    const char* prefetch = nullptr;  // --expert-prefetch: fajl popravok r1_corr_kK.bin
+    int prefetch_budget = 16;        // --prefetch-budget B
+    bool prefetch_sync = false;      // --prefetch-sync: chitat v uzle (A/B, ne prjachet)
 };
 
 // OTCHJOT HRANILISHCHA. Odna funkcija na oba puti (--decode-check i --gen), potomu chto
@@ -5003,6 +5023,27 @@ void print_store_report(const memex::ExpertStore& es, const HParams& h,
                "zhjostkie otdelno; eto verhnjaja granica chtenij s diska, a ne ih chislo\n");
     } else {
         printf("  pamjat processa: NE IZMERENA (GetProcessMemoryInfo ne otvetil)\n");
+    }
+    if (es.prefetch_on()) {
+        const double pv_pred = double(s.pref_predicted) / tok;
+        const double pv_iss  = double(s.pref_issued) / tok;
+        const double pv_use  = double(s.pref_used) / tok;
+        const double pv_wst  = double(s.pref_issued - s.pref_used) / tok;
+        printf("  PREDZAGRUZKA PO R1 (K=%d, B=%d, %s): predskazano %.1f/token, predzagruzheno "
+               "(chtenij v sloty) %.2f/token, ispolzovano %.2f, VPUSTUJU %.2f\n",
+               es.prefetch_k(), es.prefetch_budget(),
+               es.prefetch_sync() ? "sinhr" : "async", pv_pred, pv_iss, pv_use, pv_wst);
+        printf("    async-promahov (chtenie ne uspelo, zhdali v tochke ispolzovanija) %llu = "
+               "%.3f/token, %.3f ms/token; kuskov prochitano I/O-potokom %llu (%.2f GiB)\n",
+               (unsigned long long)s.pref_waits, double(s.pref_waits) / tok,
+               s.ms_pref_wait / tok, (unsigned long long)es.pref_reads(),
+               double(es.pref_read_bytes()) / 1073741824.0);
+        printf("PREFETCH_AB K %d B %d sync %d tokens %llu predicted_per_tok %.3f "
+               "issued_per_tok %.4f used_per_tok %.4f wasted_per_tok %.4f "
+               "sync_miss_per_tok %.4f async_wait_per_tok %.4f ms_wait_per_tok %.4f\n",
+               es.prefetch_k(), es.prefetch_budget(), es.prefetch_sync() ? 1 : 0,
+               (unsigned long long)s.tokens, pv_pred, pv_iss, pv_use, pv_wst,
+               s.misses_per_token(), double(s.pref_waits) / tok, s.ms_pref_wait / tok);
     }
     printf("  CHEGO ETOT OTCHJOT NE MERIT: skolko iz kopij v sloty prishlo s diska, a skolko "
            "iz strannichnogo kesha (razdeljaet tolko schjotchik promahov stranic vyshe); "
@@ -6423,6 +6464,10 @@ int main(int argc, char** argv) {
 "  --expert-store-repack    perepakovat sloty v _R4 (bystree schjot, DRUGIE BAJTY otveta)\n"
 "  --expert-prior FAJL  zatravka schjotchikov s kalibrovochnogo korpusa\n"
 "                       (gotovitsja bench/expert_prior.py po sledam MEMEX_EXPERT_TRACE)\n"
+"  --expert-prefetch FAJL  predzagruzka ekspertov po R1 (shag 5): fajl r1_corr_kK.bin,\n"
+"                       K iz zagolovka; trebuet --expert-store; net fajla - otkaz vsluh\n"
+"  --prefetch-budget B  skolko idov predzagruzhat na sloj (top-B, po umolchaniju 16)\n"
+"  --prefetch-sync      chitat predzagruzku SINHRONNO v uzle (A/B: NE prjachet chtenie)\n"
 "\n"
 "staticheskie vesa v videopamjati, VYKLJUCHENY po umolchaniju\n"
 "  --gpu-static         schitat vyhodnuju golovu (output.weight) na Vulkan. Eto 243.4 MB\n"
@@ -6567,6 +6612,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--expert-store-repack")) { eopt.repack = true; }
         else if (!strcmp(a, "--expert-store-reserve")) { if (want_val(i, a)) eopt.reserve_mib = atoi(argv[++i]); }
         else if (!strcmp(a, "--expert-prior")) { if (want_val(i, a)) eopt.prior = argv[++i]; }
+        else if (!strcmp(a, "--expert-prefetch")) { if (want_val(i, a)) eopt.prefetch = argv[++i]; }
+        else if (!strcmp(a, "--prefetch-budget")) { if (want_val(i, a)) eopt.prefetch_budget = atoi(argv[++i]); }
+        else if (!strcmp(a, "--prefetch-sync")) { eopt.prefetch_sync = true; }
         else if (!strcmp(a, "--gpu-static")) { sopt.on = true; }
         else if (!strcmp(a, "--gpu-static-verify")) { sopt.on = true; sopt.verify = true; }
         else if (!strcmp(a, "--gpu-static-layers")) { sopt.on = true; sopt.layers = true; }
@@ -7685,7 +7733,26 @@ int main(int argc, char** argv) {
     std::unique_ptr<memex::ExpertStore> estore;
     memex::ExpertStore* esp = nullptr;
     auto make_store = [&]() -> bool {
+        if (eopt.prefetch && eopt.capacity == 0) {
+            printf("--expert-prefetch trebuet --expert-store: predzagruzka po R1 stavit "
+                   "eksperty v ZAPASNYE sloty hranilishcha, a bez hranilishcha ih net - OTKAZ\n");
+            return false;
+        }
         if (eopt.capacity == 0) return true;
+        // PREDZAGRUZKA (shag 5): zapasnyh dolzhno hvatit na hudshem tokene i na B
+        // predzagruzhennyh (oni zakrepleny na token), i na do top-k sinhronnyh promahov, ni
+        // odin iz kotoryh ne imeet prava vytesnit predzagruzhennyj slot. Inache pick_victim
+        // vernjot -1 i mesto obnulitsja - eto izmenilo by otvet. Poetomu Z >= top-k + B.
+        if (eopt.prefetch) {
+            const int bud = std::max(1, eopt.prefetch_budget);
+            const int need_sp = h.n_expert_used + bud;
+            if (eopt.spares < need_sp) {
+                printf("  --expert-prefetch: podnimaju zapasnye sloty s %d do %d (top-k %d + "
+                       "budget %d) - chtoby na hudshem tokene hvatilo i na predzagruzhennye, i "
+                       "na sinhronnye promahi\n", eopt.spares, need_sp, h.n_expert_used, bud);
+                eopt.spares = need_sp;
+            }
+        }
         if (!arch_q35) {
             printf("--expert-store poka tolko dlja qwen35moe/qwen3next: u %s tenzory "
                    "ekspertov razlozheny inache (u gemma4 gate i up v odnom) - OTKAZ\n",
@@ -7803,6 +7870,23 @@ int main(int argc, char** argv) {
             printf("  ZATRAVKI NET (--expert-prior ne zadan): nabor stroitsja tolko po "
                    "vyboram samogo dokumenta, i na holodnom starte on zavedomo huzhe - "
                    "plato pervyh pojavlenij 98,6%% (bench/first_seen.py)\n");
+        }
+        // PREDZAGRUZKA PO R1 (shag 5). Otsutstvie fajla ili nesovpadenie form - otkaz vsluh.
+        if (eopt.prefetch) {
+            std::string ferr;
+            if (!estore->load_prefetch(eopt.prefetch, eopt.prefetch_budget,
+                                       eopt.prefetch_sync, &ferr)) {
+                printf("  OTKAZ predzagruzki: %s\n", ferr.c_str());
+                estore.reset();
+                return false;
+            }
+            printf("  PREDZAGRUZKA PO R1: fajl %s, K = %d (iz zagolovka), budget B = %d, "
+                   "rezhim %s\n", eopt.prefetch, estore->prefetch_k(),
+                   estore->prefetch_budget(),
+                   estore->prefetch_sync()
+                       ? "SINHRONNYJ v uzle (A/B: chtenie NE prjachetsja, potok grafa stoit)"
+                       : "ASINHRONNYJ (I/O-potok, chtenie na fone K sloev, promah zhdjot v "
+                         "tochke ispolzovanija)");
         }
         esp = estore.get();
         return true;

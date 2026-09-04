@@ -76,6 +76,11 @@ ExpertStoreStats ExpertStoreStats::since(const ExpertStoreStats& b) const {
     d.ms_fill     = ms_fill     - b.ms_fill;
     d.ms_repack   = ms_repack   - b.ms_repack;
     d.ms_map      = ms_map      - b.ms_map;
+    d.pref_predicted = pref_predicted - b.pref_predicted;
+    d.pref_issued    = pref_issued    - b.pref_issued;
+    d.pref_used      = pref_used      - b.pref_used;
+    d.pref_waits     = pref_waits     - b.pref_waits;
+    d.ms_pref_wait   = ms_pref_wait   - b.ms_pref_wait;
     return d;
 }
 
@@ -96,6 +101,16 @@ ProcMem proc_mem() {
 }
 
 ExpertStore::~ExpertStore() {
+    // Ostanovit I/O-potok do osvobozhdenija buferov: on pishet v sloty i v io_buf_pref_.
+    if (worker_up_) {
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) worker_.join();
+        worker_up_ = false;
+    }
     for (Layer& L : layers_) {
         if (L.buf) ggml_backend_buffer_free(L.buf);
         L.buf = nullptr;
@@ -105,9 +120,13 @@ ExpertStore::~ExpertStore() {
 #if defined(_WIN32)
     if (fh_ && fh_ != INVALID_HANDLE_VALUE) CloseHandle((HANDLE)fh_);
     if (io_buf_) _aligned_free(io_buf_);
+    if (fh_pref_ && fh_pref_ != INVALID_HANDLE_VALUE) CloseHandle((HANDLE)fh_pref_);
+    if (io_buf_pref_) _aligned_free(io_buf_pref_);
 #endif
     fh_ = nullptr;
     io_buf_ = nullptr;
+    fh_pref_ = nullptr;
+    io_buf_pref_ = nullptr;
 }
 
 namespace {
@@ -188,11 +207,14 @@ bool ExpertStore::open_direct(std::string* err) {
 #endif
 }
 
-// Prjamoe chtenie [foff, foff+len) v dst mimo strannichnogo kesha. Krajа vyravnivajutsja po
-// sektoru; chitaem vyrovnennyj diapazon v io_buf_, kopiruem nuzhnyj poddiapazon.
-bool ExpertStore::read_chunk(uint64_t foff, std::size_t len, void* dst) {
+// Prjamoe chtenie [foff, foff+len) v dst mimo strannichnogo kesha cherez UKAZANNYE hendl i
+// bufer. Krajа vyravnivajutsja po sektoru; chitaem vyrovnennyj diapazon v buf, kopiruem
+// nuzhnyj poddiapazon. Schjotchikov ne trogaet - eto delaet vyzyvajushchij (potok grafa i
+// I/O-potok schitajut razdelno).
+bool ExpertStore::read_range(void* fh, void* buf, std::size_t cap, uint64_t foff,
+                             std::size_t len, void* dst) {
 #if !defined(_WIN32)
-    (void)foff; (void)len; (void)dst;
+    (void)fh; (void)buf; (void)cap; (void)foff; (void)len; (void)dst;
     return false;
 #else
     const uint64_t astart = foff & ~(uint64_t)(kSector - 1);
@@ -203,18 +225,23 @@ bool ExpertStore::read_chunk(uint64_t foff, std::size_t len, void* dst) {
     const uint64_t fend = align_up(std::size_t(file_size_), kSector);
     if (aend > fend) aend = fend;
     const std::size_t alen = std::size_t(aend - astart);
-    if (alen > io_cap_ || head + len > alen) return false;
+    if (alen > cap || head + len > alen) return false;
 
     LARGE_INTEGER li;
     li.QuadPart = (LONGLONG)astart;
-    if (!SetFilePointerEx((HANDLE)fh_, li, nullptr, FILE_BEGIN)) return false;
+    if (!SetFilePointerEx((HANDLE)fh, li, nullptr, FILE_BEGIN)) return false;
     DWORD got = 0;
-    if (!ReadFile((HANDLE)fh_, io_buf_, (DWORD)alen, &got, nullptr)) return false;
+    if (!ReadFile((HANDLE)fh, buf, (DWORD)alen, &got, nullptr)) return false;
     if ((std::size_t)got < head + len) return false;
-    std::memcpy(dst, (const char*)io_buf_ + head, len);
-    direct_reads_++;
+    std::memcpy(dst, (const char*)buf + head, len);
     return true;
 #endif
+}
+
+bool ExpertStore::read_chunk(uint64_t foff, std::size_t len, void* dst) {
+    if (!read_range(fh_, io_buf_, io_cap_, foff, len, dst)) return false;
+    direct_reads_++;
+    return true;
 }
 
 std::size_t ExpertStore::bytes_per_expert(const ggml_tensor* gate, const ggml_tensor* up,
@@ -353,6 +380,8 @@ bool ExpertStore::init(const ExpertStoreConfig& cfg,
         L.seen.assign(std::size_t(cfg_.n_expert), 0);
         L.id_of.assign(std::size_t(n_slots_), -1);
         L.touched.assign(std::size_t(n_slots_), 0);
+        L.filling.assign(std::size_t(n_slots_), 0);
+        L.pref_tag.assign(std::size_t(n_slots_), 0);
         L.ring = 0;
     }
 
@@ -551,6 +580,21 @@ void ExpertStore::do_map(int il, ggml_tensor* dst, const ggml_tensor* sel) {
                 L.seen[std::size_t(id)] = 1;
                 s = L.slot_of[std::size_t(id)];
                 if (s >= 0) {
+                    // PREDZAGRUZKA MOGLA NE USPET. Esli slot zapolnjaet I/O-potok (filling),
+                    // zhdjom ego zdes - eto tot samyj "sinhronnyj promah, kotoryj predzagruzka
+                    // ne uspela zakryt". Bajty ot ozhidanija te zhe, chto ot sinhronnogo
+                    // chtenija, tak chto otvet ne menjaetsja; menjaetsja tolko, spryatalos li
+                    // chtenie za schjotom K sloev ili net.
+                    if (pref_on_) {
+                        std::unique_lock<std::mutex> lk(mu_);
+                        if (L.filling[std::size_t(s)]) {
+                            const auto tw = Clock::now();
+                            cv_.wait(lk, [&] { return L.filling[std::size_t(s)] == 0; });
+                            st_.ms_pref_wait += ms_since(tw);
+                            st_.pref_waits++;
+                        }
+                        if (L.pref_tag[std::size_t(s)] == token_) st_.pref_used++;
+                    }
                     st_.hits++;
                     // POPADANIE TOZHE ZAKREPLJAET SLOT NA ETOT TOKEN, i eto ne
                     // optimizacija, a uslovie pravilnosti. Bez etoj stroki byl real'nyj
@@ -706,6 +750,12 @@ void ExpertStore::refresh() {
 
 void ExpertStore::end_token() {
     if (!on()) return;
+    // DRENAZH PREDZAGRUZKI mezhdu tokenami: dozhdatsja, poka I/O-potok dopishet vse sloty
+    // etogo tokena. Bez etogo refresh ili pick_victim sledujushchego tokena mogli by vzjat
+    // slot, v kotoryj potok eshchjo pishet - gonka za bajty. Chtenija bystrye (2,7 ms) na
+    // fone tokena, poetomu obychno eto mgnovenno; esli net - eto chestnaja cena, i ona vidna
+    // v ms_pref_wait ne popadaet (zdes zhdjom hvost, kotoryj v etom tokene ne ponadobilsja).
+    drain_prefetch();
     st_.tokens++;
     token_++;
     if (cfg_.period > 0 && cfg_.capacity < cfg_.n_expert &&
@@ -765,6 +815,269 @@ bool ExpertStore::verify_slot(int il, int slot, std::string* why) const {
         }
     }
     return true;
+}
+
+// ================= PREDZAGRUZKA PO R1 (shag 5) =================
+
+bool ExpertStore::open_pref_handle(std::string* err) {
+#if !defined(_WIN32)
+    if (err) *err = "predzagruzka realizovana tolko dlja Windows";
+    return false;
+#else
+    if (!direct_) {
+        if (err) *err = "predzagruzka trebuet prjamogo chtenija (gguf_path u hranilishcha)";
+        return false;
+    }
+    HANDLE h = CreateFileA(cfg_.gguf_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING,
+                           FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (err) *err = "predzagruzka: vtoroj CreateFile ne otkryl fajl, kod " +
+                        std::to_string((unsigned long)GetLastError());
+        return false;
+    }
+    io_cap_pref_ = io_cap_;   // ta zhe geometrija, chto u osnovnogo io-bufera
+    io_buf_pref_ = _aligned_malloc(io_cap_pref_, kSector);
+    if (!io_buf_pref_) {
+        CloseHandle(h);
+        io_cap_pref_ = 0;
+        if (err) *err = "predzagruzka: io-bufer ne vydelilsja";
+        return false;
+    }
+    fh_pref_ = (void*)h;
+    return true;
+#endif
+}
+
+bool ExpertStore::load_prefetch(const char* path, int budget, bool sync, std::string* err) {
+    if (!on()) {
+        if (err) *err = "predzagruzka bez hranilishcha (--expert-store) ne imeet smysla";
+        return false;
+    }
+    if (!direct_) {
+        if (err) *err = "predzagruzka trebuet prjamogo chtenija fajla (gguf_path)";
+        return false;
+    }
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        if (err) *err = std::string("fajl popravok R1 ne otkrylsja: ") + path;
+        return false;
+    }
+    int32_t hd[4] = {0, 0, 0, 0};
+    if (fread(hd, sizeof(int32_t), 4, f) != 4) {
+        fclose(f);
+        if (err) *err = "zagolovok popravok R1 ne prochitalsja";
+        return false;
+    }
+    const int n_layer = hd[0], n_in = hd[1], n_out = hd[2], k = hd[3];
+    if (n_layer != cfg_.n_layer || n_out != cfg_.n_expert || n_in != cfg_.n_expert + 1) {
+        fclose(f);
+        char b[192];
+        snprintf(b, sizeof(b),
+                 "popravki R1 na %d sloev, n_in %d, n_out %d, a model %d sloev, n_expert %d "
+                 "(zhdu n_in = n_expert+1)", n_layer, n_in, n_out, cfg_.n_layer, cfg_.n_expert);
+        if (err) *err = b;
+        return false;
+    }
+    if (k < 0 || k >= cfg_.n_layer) {
+        fclose(f);
+        if (err) *err = "K iz zagolovka popravok vne predelov [0, n_layer)";
+        return false;
+    }
+    // Telo f16 -> f32. ggml_fp16_to_fp32 est v ggml.h.
+    const std::size_t n = std::size_t(n_layer) * std::size_t(n_in) * std::size_t(n_out);
+    std::vector<uint16_t> raw(n);
+    if (fread(raw.data(), sizeof(uint16_t), n, f) != n) {
+        fclose(f);
+        if (err) *err = "telo popravok R1 koroche zagolovka";
+        return false;
+    }
+    fclose(f);
+    pref_corr_.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        pref_corr_[i] = ggml_fp16_to_fp32((ggml_fp16_t)raw[i]);
+    }
+    pref_n_in_   = n_in;
+    pref_n_out_  = n_out;
+    pref_k_      = k;
+    pref_budget_ = budget > 0 ? budget : 16;
+    if (pref_budget_ > cfg_.n_expert) pref_budget_ = cfg_.n_expert;
+    pref_sync_   = sync;
+    pref_sites_.resize(std::size_t(cfg_.n_layer));
+    for (int il = 0; il < cfg_.n_layer; ++il) {
+        pref_sites_[std::size_t(il)].self = this;
+        pref_sites_[std::size_t(il)].tgt  = il;
+    }
+    pref_score_.assign(std::size_t(cfg_.n_expert), 0.0f);
+    pref_idx_.assign(std::size_t(cfg_.n_expert), 0);
+    pref_on_ = true;
+
+    if (!pref_sync_) {
+        // Vtoroj fajlovyj hendl+bufer i I/O-potok - tolko dlja asinhronnogo rezhima.
+        if (!open_pref_handle(err)) {
+            pref_on_ = false;
+            return false;
+        }
+        stop_ = false;
+        worker_ = std::thread(&ExpertStore::worker_main, this);
+        worker_up_ = true;
+    }
+    return true;
+}
+
+void ExpertStore::worker_main() {
+    for (;;) {
+        Job j;
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [&] { return stop_ || !jobs_.empty(); });
+            if (jobs_.empty()) {
+                if (stop_) return;
+                continue;
+            }
+            j = jobs_.front();
+            jobs_.pop_front();
+        }
+        Layer& L = layers_[std::size_t(j.il)];
+        // Bajty slota j.slot pishem BEZ zamka: slot zashchishchjon flagom filling==1, tak chto
+        // ni pick_victim, ni do_map na etot slot ne pretendujut, poka my ne snimem flag.
+        read_slot(L, j.slot, j.id, fh_pref_, io_buf_pref_, io_cap_pref_, &pref_reads_,
+                  &pref_read_bytes_);
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            L.filling[std::size_t(j.slot)] = 0;
+            --inflight_;
+        }
+        cv_.notify_all();
+    }
+}
+
+void ExpertStore::drain_prefetch() {
+    if (!pref_on_ || pref_sync_) return;
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_.wait(lk, [&] { return jobs_.empty() && inflight_ == 0; });
+}
+
+// Chtenie treh kuskov (gate/up/down) eksperta id v slot cherez ukazannye hendl+bufer, potom -
+// esli vkljuchjon repak i ne idjot bulk - poslotovyj repak, kak v fill_slot.
+void ExpertStore::read_slot(Layer& L, int slot, int id, void* fh, void* buf, std::size_t cap,
+                            std::atomic<uint64_t>* reads, std::atomic<uint64_t>* rbytes) {
+    const ggml_tensor* src[3] = {L.src_gate, L.src_up, L.src_down};
+    ggml_tensor* dst[3] = {L.gate, L.up, L.down};
+    const uint64_t off[3] = {L.off_gate, L.off_up, L.off_down};
+    for (int k = 0; k < 3; ++k) {
+        const std::size_t nb2 = std::size_t(dst[k]->nb[2]);
+        char* d = (char*)dst[k]->data + std::size_t(slot) * nb2;
+        const uint64_t foff = off[k] + std::size_t(id) * nb2;
+        if (read_range(fh, buf, cap, foff, nb2, d)) {
+            if (reads) reads->fetch_add(1, std::memory_order_relaxed);
+            if (rbytes) rbytes->fetch_add(nb2, std::memory_order_relaxed);
+        } else {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                printf("predzagruzka: PRJAMOE CHTENIE ne udalos (sloj-tenzor %d, ekspert %d) - "
+                       "slot NE zapolnen, ostajotsja sinhronnyj promah kak straxovka\n", k, id);
+                fflush(stdout);
+            }
+        }
+    }
+    if (repacked_ && !bulk_) {
+        for (int k = 0; k < 3; ++k) {
+            ggml_tensor d = slice_descr(k == 2 ? L.src_down->type
+                                               : (k == 0 ? L.src_gate->type : L.src_up->type),
+                                        dst[k],
+                                        (char*)dst[k]->data +
+                                            std::size_t(slot) * std::size_t(dst[k]->nb[2]));
+            iqk_repack_tensor(&d);
+        }
+    }
+}
+
+// Postavit eksperta id sloja tgt v zapasnoj slot. Vyzyvaetsja tolko s potoka grafa (vnutri
+// pref_map_op), tak chto vsja rabota s metadannymi slotov (id_of/slot_of/touched/pref_tag) -
+// bez zamka; s I/O-potokom delitsja tolko flag filling i ochered (pod mu_).
+void ExpertStore::prefetch_expert(Layer& L, int tgt, int id) {
+    if (id < 0 || id >= cfg_.n_expert) return;
+    if (L.slot_of[std::size_t(id)] >= 0) return;   // uzhe v slote (rezident, zapasnoj ili v ocheredi)
+    const int v = pick_victim(L);
+    if (v < 0) return;                              // net zhertvy - ostanetsja sinhronnym promahom
+    st_.pref_issued++;
+    if (pref_sync_) {
+        // Sinhronno pryamo v uzle: fill_slot sam vytesnjaet, chitaet bajty i stavit metadannye
+        // (touched, id_of, slot_of). Eto NE prjachet chtenie - potok grafa stoit, - no daot
+        // chestnoe A/B protiv asinhronnogo rezhima.
+        fill_slot(L, v, id);
+        L.pref_tag[std::size_t(v)] = token_;
+        return;
+    }
+    // Asinhronno: metadannye stavim SEJCHAS (chtoby do_map videl popadanie), a bajty otdajom
+    // I/O-potoku. filling==1 zapreshchaet komu-libo tronut slot, poka potok pishet.
+    const int32_t old = L.id_of[std::size_t(v)];
+    if (old >= 0) {
+        L.slot_of[std::size_t(old)] = -1;
+        st_.evictions++;
+    }
+    L.id_of[std::size_t(v)]    = id;
+    L.slot_of[std::size_t(id)] = v;
+    L.touched[std::size_t(v)]  = token_;
+    L.pref_tag[std::size_t(v)] = token_;
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        L.filling[std::size_t(v)] = 1;
+        jobs_.push_back(Job{tgt, v, id});
+        ++inflight_;
+    }
+    cv_.notify_one();
+}
+
+void ExpertStore::do_prefetch(int tgt, const ggml_tensor* pred_logits) {
+    if (!pref_on_ || tgt < 0 || tgt >= cfg_.n_layer) return;
+    if (tgt < pref_k_) return;   // dlja etih sloev popravka tozhdestvennaja, a istochnika net
+    Layer& L = layers_[std::size_t(tgt)];
+    const int E = cfg_.n_expert;
+    // Vhod - syrye logity R0 (router_tgt * x_l), [n_expert] f32.
+    const float* r0 = (const float*)pred_logits->data;
+    const float* Wc = pref_corr_.data() + std::size_t(tgt) * std::size_t(pref_n_in_) *
+                                              std::size_t(pref_n_out_);
+    // score[e] = sum_i r0[i]*Wc[i][e] + 1*Wc[n_out][e]. Wc razlozhen strokami po n_in.
+    const int nin = pref_n_in_, nout = pref_n_out_;
+    float* sc = pref_score_.data();
+    const float* bias = Wc + std::size_t(nin - 1) * std::size_t(nout);
+    for (int e = 0; e < nout; ++e) sc[e] = bias[e];
+    for (int i = 0; i < E; ++i) {
+        const float ri = r0[i];
+        if (ri == 0.0f) continue;
+        const float* row = Wc + std::size_t(i) * std::size_t(nout);
+        for (int e = 0; e < nout; ++e) sc[e] += ri * row[e];
+    }
+    // top-B po score.
+    int B = pref_budget_;
+    if (B > E) B = E;
+    int* idx = pref_idx_.data();
+    for (int e = 0; e < E; ++e) idx[e] = e;
+    std::nth_element(idx, idx + B, idx + E,
+                     [&](int a, int b) { return sc[a] > sc[b]; });
+    st_.pref_predicted += (uint64_t)B;
+    for (int t = 0; t < B; ++t) prefetch_expert(L, tgt, idx[t]);
+}
+
+void ExpertStore::pref_map_op(ggml_tensor* /*dst*/, const ggml_tensor* a, int ith,
+                              int /*nth*/, void* ud) {
+    if (ith != 0) return;
+    PrefSite* s = (PrefSite*)ud;
+    s->self->do_prefetch(s->tgt, a);
+}
+
+ggml_tensor* ExpertStore::prefetch_node(ggml_context* c, ggml_cgraph* gf, int tgt,
+                                        ggml_tensor* pred_logits) {
+    if (!pref_on_ || tgt < 0 || tgt >= cfg_.n_layer) return nullptr;
+    ggml_tensor* t = ggml_map_custom1(c, pred_logits, pref_map_op, /*n_tasks=*/1,
+                                      &pref_sites_[std::size_t(tgt)]);
+    // Pobochnoe dejstvie bez potrebitelja - javno v graf, inache gallocr ne dast emu bufera
+    // i pervoe chtenie upadjot (ta zhe lovushka, chto u slots_node/sel).
+    if (gf) ggml_build_forward_expand(gf, t);
+    return t;
 }
 
 }  // namespace memex

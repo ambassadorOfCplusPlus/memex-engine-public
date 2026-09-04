@@ -53,9 +53,14 @@
 // nikakih bajt rezultata ona ne kasaetsja.
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ggml.h"
@@ -108,6 +113,13 @@ struct ExpertStoreStats {
     double   ms_fill      = 0.0; // vsjo vremja kopirovanij (zalivka + perestanovki + promahi)
     double   ms_repack    = 0.0;
     double   ms_map       = 0.0; // vremja samogo perevoda id -> slot (bez chtenij)
+    // PREDZAGRUZKA PO R1 (shag 5). Vsjo schitaetsja na potoke grafa, tak chto delitel st_ ne
+    // trogaetsja iz I/O-potoka.
+    uint64_t pref_predicted = 0; // top-B idov, predskazannyh po R1 (summa po slojam za token)
+    uint64_t pref_issued    = 0; // iz nih te, kotoryh ne bylo v slotah => postavleny v chtenie
+    uint64_t pref_used       = 0; // popadanij, chej slot byl zapolnen imenno predzagruzkoj
+    uint64_t pref_waits      = 0; // popadanij, gde chtenie ne uspelo i prishlos zhdat sinhronno
+    double   ms_pref_wait    = 0.0; // vremja etih ozhidanij (async promah, ne spryatannyj)
 
     double hit_rate() const { return picks ? double(hits) / double(picks) : 0.0; }
     double misses_per_token() const {
@@ -164,6 +176,28 @@ class ExpertStore {
     // Uzel perevoda id -> slot dlja sloja il. Vstavljaetsja mezhdu top-k i mul_mat_id.
     ggml_tensor* slots_node(ggml_context* c, int il, ggml_tensor* sel, ggml_cgraph* gf);
 
+    // PREDZAGRUZKA PO R1 (shag 5).
+    //
+    // Popravki R1: logity sloja tgt ~ [router_tgt * x_l ; 1] * Wc_tgt, gde Wc_tgt eto
+    // matrica [n_in=513][n_out=512]. Fajl r1_corr_kK.bin: zagolovok int32[4] =
+    // {n_layer, 513, 512, K}, telo f16 [n_layer][513][512]; dlja tgt < K - tozhdestvo.
+    // K berjotsja iz zagolovka. budget - skolko idov brat (top-B). sync - chitat sinhronno
+    // pryamo v uzle (dlja A/B: NE prjachet chtenie, tak kak potok grafa stoit), inache -
+    // otdat na potok vvoda-vyvoda i zhdat tolko v tochke ispolzovanija, esli ne uspelo.
+    // Otsutstvie fajla ili nesovpadenie form - otkaz vsluh (false + err).
+    bool load_prefetch(const char* path, int budget, bool sync, std::string* err);
+    bool prefetch_on() const { return pref_on_; }
+    int  prefetch_k() const { return pref_k_; }
+    int  prefetch_budget() const { return pref_budget_; }
+    bool prefetch_sync() const { return pref_sync_; }
+
+    // Uzel predskazanija+predzagruzki dlja celevogo sloja tgt. Vhod - syrye logity R0
+    // (router_tgt * x_l, [n_expert]); uzel primenjaet popravku Wc_tgt, berjot top-B i stavit
+    // nerezidentnye v chtenie v zapasnye sloty tgt. Vozvrata net (pobochnoe dejstvie), poetomu
+    // uzel javno raskryvaetsja v graf.
+    ggml_tensor* prefetch_node(ggml_context* c, ggml_cgraph* gf, int tgt,
+                               ggml_tensor* pred_logits);
+
     ggml_tensor* gate(int il) const { return layers_[std::size_t(il)].gate; }
     ggml_tensor* up(int il)   const { return layers_[std::size_t(il)].up; }
     ggml_tensor* down(int il) const { return layers_[std::size_t(il)].down; }
@@ -202,6 +236,10 @@ class ExpertStore {
         std::vector<uint64_t> touched;  // [S] nomer tokena, na kotorom slot zapolnjali
         std::vector<uint8_t> seen;      // [n_expert] vstrechalsja li v dokumente
         int  ring = 0;                  // kursor po zapasnym slotam
+        // PREDZAGRUZKA: filling[s]=1 poka I/O-potok pishet bajty slota s (dostup pod mu_);
+        // pref_tag[s] = nomer tokena, na kotorom slot zapolnjala imenno predzagruzka.
+        std::vector<uint8_t>  filling;
+        std::vector<uint64_t> pref_tag;
     };
     // Odna eta struktura na sloj: userdata u ggml_map_custom odin void*.
     struct Site { ExpertStore* self = nullptr; int il = 0; };
@@ -212,10 +250,31 @@ class ExpertStore {
     void fill_slot(Layer& L, int slot, int id);
     void refresh();
     int  pick_victim(Layer& L);
+
+    // --- PREDZAGRUZKA PO R1 (shag 5) ---
+    static void pref_map_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth,
+                            void* ud);
+    void do_prefetch(int tgt, const ggml_tensor* pred_logits);
+    // Postavit eksperta id sloja tgt v zapasnoj slot: sinhronno (fill_slot) ili cherez potok.
+    void prefetch_expert(Layer& L, int tgt, int id);
+    // Chtenie treh kuskov eksperta id v slot cherez UKAZANNYE hendl+bufer (potok grafa i
+    // I/O-potok imejut svoi, chtoby ne delit stateful fajlovyj ukazatel).
+    void read_slot(Layer& L, int slot, int id, void* fh, void* buf, std::size_t cap,
+                   std::atomic<uint64_t>* reads, std::atomic<uint64_t>* rbytes);
+    void worker_main();
+    void drain_prefetch();
+    bool open_pref_handle(std::string* err);   // vtoroj hendl+bufer pod I/O-potok
+
+    struct PrefSite { ExpertStore* self = nullptr; int tgt = 0; };
+    struct Job { int il = 0; int slot = 0; int id = 0; };
     // Prjamoe chtenie fajla mimo strannichnogo kesha: kusok [foff, foff+len) v dst. Diapazon
     // vyravnivaetsja po sektoru (4096) pod FILE_FLAG_NO_BUFFERING, chitaetsja v io_buf_, nuzhnyj
     // poddiapazon kopiruetsja v dst. Vozvrashchaet false pri oshibke I/O.
     bool read_chunk(uint64_t foff, std::size_t len, void* dst);
+    // Nizkourovnevoe sektorno-vyrovnennoe chtenie cherez ukazannye hendl i bufer (bez
+    // schjotchikov): odin i tot zhe kod dlja potoka grafa (fh_/io_buf_) i I/O-potoka.
+    bool read_range(void* fh, void* buf, std::size_t cap, uint64_t foff, std::size_t len,
+                    void* dst);
     // Odin raz v init: otkryt gguf, najti fajlovye smeshchenija tenzorov ekspertov po imenam,
     // otkryt fajl s NO_BUFFERING, vydelit vyrovnennyj io_buf_. err - prichina otkaza.
     bool open_direct(std::string* err);
@@ -241,7 +300,38 @@ class ExpertStore {
     void*              io_buf_    = nullptr;   // vyrovnennyj po 4096 bufer pod odin kusok
     std::size_t        io_cap_    = 0;
     uint64_t           file_size_ = 0;
-    uint64_t           direct_reads_ = 0;      // skolko kuskov prochitano s diska
+    uint64_t           direct_reads_ = 0;      // skolko kuskov prochitano s diska (potok grafa)
+
+    // --- PREDZAGRUZKA PO R1 (shag 5) ---
+    bool                    pref_on_     = false;
+    bool                    pref_sync_   = false;   // chitat v uzle, ne na potoke (A/B)
+    int                     pref_k_      = 0;       // K iz zagolovka fajla popravok
+    int                     pref_budget_ = 16;      // B: skolko idov predzagruzhat
+    int                     pref_n_in_   = 0;       // 513
+    int                     pref_n_out_  = 0;       // 512 (== n_expert)
+    std::vector<float>      pref_corr_;             // [n_layer * n_in * n_out] f32 (iz f16)
+    std::vector<PrefSite>   pref_sites_;            // po celevomu sloju
+    std::vector<float>      pref_score_;            // [n_expert], bufer scora (potok grafa)
+    std::vector<int>        pref_idx_;              // [n_expert], bufer idov (potok grafa)
+    // Vtoroj fajlovyj hendl i bufer - tolko dlja I/O-potoka.
+    void*                   fh_pref_     = nullptr;
+    void*                   io_buf_pref_ = nullptr;
+    std::size_t             io_cap_pref_ = 0;
+    std::atomic<uint64_t>   pref_reads_{0};         // kuskov prochitano I/O-potokom
+    std::atomic<uint64_t>   pref_read_bytes_{0};
+    // Ochered i sinhronizacija I/O-potoka.
+    std::thread             worker_;
+    std::mutex              mu_;
+    std::condition_variable cv_;
+    std::deque<Job>         jobs_;
+    int                     inflight_    = 0;       // postavleno v chtenie, no ne zaversheno
+    bool                    stop_        = false;
+    bool                    worker_up_   = false;
+
+  public:
+    // Statistika predzagruzki dlja otchjota (I/O-potok).
+    uint64_t pref_reads() const { return pref_reads_.load(); }
+    uint64_t pref_read_bytes() const { return pref_read_bytes_.load(); }
 };
 
 }  // namespace memex
