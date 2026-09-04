@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <climits>
 #include <stdexcept>
 #include <cerrno>
@@ -54,6 +55,63 @@ static std::string llama_format_win_err(DWORD err) {
     std::string ret(buf, size);
     LocalFree(buf);
     return ret;
+}
+
+// Skolko bajt razresheno prognat cherez PrefetchVirtualMemory.
+//
+// ZACHEM. Zagruzchik zovjot llama_mmap s prefetch = (size_t) -1 (llama-model-loader.cpp,
+// init_mappings: "prefetch ? -1 : 0"), i Windows-vetka prosit prefetch na VES fajl. Dlja Coder Next
+// eto 26,5-41,5 GiB posledovatelnogo chtenija na KAZHDOM starte, i vykljuchit eto bylo nechem:
+// --defer-experts rabotaet tolko pod Linux (llama.cpp, vetka __linux__ vozle build_expert_tensor_index).
+//
+// RUChKA. LLAMA_MMAP_PREFETCH:
+//   ne zadana - povedenie kak bylo (ves fajl);
+//   0         - PrefetchVirtualMemory ne zovjotsja vovse, stranicy prihodjat po oshibkam dostupa;
+//   N         - prefetch tolko pervyh N bajt (dopuskaetsja suffiks K/M/G).
+// Otkaz pechataetsja vsluh odnoj strokoj: molchalivoe otkljuchenie prefetcha nevozmozhno otlichit
+// ot medlennogo diska.
+static size_t llama_win_prefetch_limit(size_t prefetch) {
+    const char * env = std::getenv("LLAMA_MMAP_PREFETCH");
+    if (env == nullptr || *env == '\0') {
+        return prefetch;
+    }
+
+    char * end = nullptr;
+    const unsigned long long raw = std::strtoull(env, &end, 10);
+    if (end == env) {
+        LLAMA_LOG_WARN("llama_mmap: LLAMA_MMAP_PREFETCH='%s' ne chislo - ruchka ignoriruetsja\n", env);
+        return prefetch;
+    }
+
+    unsigned long long want = raw;
+    switch (*end) {
+        case 'k': case 'K': want = raw * 1024ull; break;
+        case 'm': case 'M': want = raw * 1024ull * 1024ull; break;
+        case 'g': case 'G': want = raw * 1024ull * 1024ull * 1024ull; break;
+        default: break;
+    }
+
+    // Odna stroka na process, a ne na fajl: u mnogochastnogo gguf otobrazhenij neskolko.
+    static bool said = false;
+
+    if (want == 0) {
+        if (!said) {
+            LLAMA_LOG_INFO("llama_mmap: prefetch OTKLJUCHEN (LLAMA_MMAP_PREFETCH=0)\n");
+            said = true;
+        }
+        return 0;
+    }
+
+    if (want < (unsigned long long) prefetch) {
+        if (!said) {
+            LLAMA_LOG_INFO("llama_mmap: prefetch ogranichen do %llu bajt (LLAMA_MMAP_PREFETCH=%s)\n",
+                    want, env);
+            said = true;
+        }
+        return (size_t) want;
+    }
+
+    return prefetch;
 }
 #endif
 
@@ -465,6 +523,8 @@ struct llama_mmap::impl {
         if (addr == NULL) {
             throw std::runtime_error(format("MapViewOfFile failed: %s", llama_format_win_err(error).c_str()));
         }
+
+        prefetch = llama_win_prefetch_limit(prefetch);
 
         if (prefetch > 0) {
 #if _WIN32_WINNT >= 0x602
