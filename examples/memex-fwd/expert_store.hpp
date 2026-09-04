@@ -98,6 +98,14 @@ struct ExpertStoreConfig {
     // mmap teh zhe ekspertov ne fol'tjatsja i ne konkurirujut za pamjat. Pustaja stroka -
     // staroe povedenie (memcpy iz mmap), ostavleno dlja sverki.
     std::string gguf_path;
+
+    // TRJOHUROVNEVOE HRANILISHCHE (ideja polzovatelja). Krome rezidentnyh slotov v OZU (uroven 1)
+    // zavoditsja "tjoploe hranilishche" - kopija chasti NErezidentnyh ekspertov v otdelnom fajle
+    // na BYSTROM diske (SSD, uroven 2). Ostalnye NErezidentnye ostajutsja v ishodnom gguf na
+    // MEDLENNOM diske (HDD, uroven 3). Promah chitaetsja s togo urovnja, gde ekspert lezhit:
+    // SSD ~2,7 ms, HDD ~23 ms. warm_dir pust => tjoplogo urovnja net (vsjo nerezidentnoe = HDD).
+    std::string warm_dir;        // --warm-dir: katalog pod tjoplyj fajl na SSD
+    double      warm_cap_gib = 0.0;  // --warm-cap: predel razmera tjoplogo fajla (GiB)
 };
 
 struct ExpertStoreStats {
@@ -120,6 +128,15 @@ struct ExpertStoreStats {
     uint64_t pref_used       = 0; // popadanij, chej slot byl zapolnen imenno predzagruzkoj
     uint64_t pref_waits      = 0; // popadanij, gde chtenie ne uspelo i prishlos zhdat sinhronno
     double   ms_pref_wait    = 0.0; // vremja etih ozhidanij (async promah, ne spryatannyj)
+
+    // TRJOHUROVNEVYJ UCHJOT (graf-potok). Sinhronnye promahi i bajty razbivajutsja po urovnju,
+    // otkuda ekspert prochitan: SSD (tjoplyj fajl) ili HDD (ishodnyj gguf).
+    uint64_t sync_ssd  = 0;   // sinhronnyh promahov, prochitannyh s tjoplogo urovnja (SSD)
+    uint64_t sync_hdd  = 0;   // sinhronnyh promahov, prochitannyh s holodnogo urovnja (HDD)
+    uint64_t bytes_ssd = 0;   // bajt, prochitannyh graf-potokom s SSD (zalivka+refresh+promah+sync-pref)
+    uint64_t bytes_hdd = 0;   // bajt, prochitannyh graf-potokom s HDD
+    uint64_t wait_ssd  = 0;   // async-ozhidanij, gde nedochitannyj slot byl s SSD
+    uint64_t wait_hdd  = 0;   // async-ozhidanij, gde nedochitannyj slot byl s HDD
 
     double hit_rate() const { return picks ? double(hits) / double(picks) : 0.0; }
     double misses_per_token() const {
@@ -185,18 +202,43 @@ class ExpertStore {
     // pryamo v uzle (dlja A/B: NE prjachet chtenie, tak kak potok grafa stoit), inache -
     // otdat na potok vvoda-vyvoda i zhdat tolko v tochke ispolzovanija, esli ne uspelo.
     // Otsutstvie fajla ili nesovpadenie form - otkaz vsluh (false + err).
-    bool load_prefetch(const char* path, int budget, bool sync, std::string* err);
+    // conf_hi / conf_lo - DVA POROGA UVERENNOSTI po rangu top-B (ideja polzovatelja): rang
+    // predskazannogo eksperta < hi => predzagruzka objazatelna S LJUBOGO urovnja; hi <= rang <
+    // lo => predzagruzka tolko esli ekspert na HDD (medlennyj uroven, gde uprezhdenie cenno) i
+    // ochered ne zabita; rang >= lo => ne trogat. Znachenie <= 1.0 - dolja B, > 1.0 - absoljutnyj
+    // rang. Po umolchaniju hi = lo = 1.0 (== B): staroe povedenie (ves top-B s ljubogo urovnja).
+    // hdd_lead - na skolko sloev RANSHE nachinat predzagruzku HDD-ekspertov (23 ms nado prjatat
+    // glubzhe): dobavljaetsja vtoroj uzel na sloj l, celjashchij v l+K+lead i vydajushchij tolko
+    // HDD-eksperty (popravka Wc[l+K+lead] primenjaetsja k x_l - priblizhenie, K v fajle fiksirovan).
+    bool load_prefetch(const char* path, int budget, bool sync, double conf_hi, double conf_lo,
+                       int hdd_lead, std::string* err);
     bool prefetch_on() const { return pref_on_; }
     int  prefetch_k() const { return pref_k_; }
     int  prefetch_budget() const { return pref_budget_; }
     bool prefetch_sync() const { return pref_sync_; }
+    int  prefetch_hdd_lead() const { return pref_hdd_lead_; }
+    double prefetch_conf_hi() const { return pref_conf_hi_; }
+    double prefetch_conf_lo() const { return pref_conf_lo_; }
+
+    // TRJOHUROVNEVOE HRANILISHCHE (ideja polzovatelja).
+    bool     warm_on() const { return warm_on_; }
+    int      warm_per_layer() const { return warm_w_; }      // tjoplyh ekspertov na sloj
+    uint64_t warm_bytes() const { return warm_size_; }        // razmer tjoplogo fajla
+    const std::string& warm_path() const { return warm_path_; }
+    double   warm_build_ms() const { return warm_build_ms_; }
+    // Skolko iz nerezidentnyh ekspertov videli s SSD i s HDD (async-potok).
+    uint64_t pref_reads_ssd() const { return pref_reads_ssd_.load(); }
+    uint64_t pref_reads_hdd() const { return pref_reads_hdd_.load(); }
+    uint64_t pref_bytes_ssd() const { return pref_bytes_ssd_.load(); }
+    uint64_t pref_bytes_hdd() const { return pref_bytes_hdd_.load(); }
 
     // Uzel predskazanija+predzagruzki dlja celevogo sloja tgt. Vhod - syrye logity R0
     // (router_tgt * x_l, [n_expert]); uzel primenjaet popravku Wc_tgt, berjot top-B i stavit
     // nerezidentnye v chtenie v zapasnye sloty tgt. Vozvrata net (pobochnoe dejstvie), poetomu
-    // uzel javno raskryvaetsja v graf.
+    // uzel javno raskryvaetsja v graf. hdd_only - uzel HDD-uprezhdenija (hdd_lead): vydajot
+    // TOLKO ekspertov na HDD-urovne, chtoby dat im bolshe fory.
     ggml_tensor* prefetch_node(ggml_context* c, ggml_cgraph* gf, int tgt,
-                               ggml_tensor* pred_logits);
+                               ggml_tensor* pred_logits, bool hdd_only = false);
 
     ggml_tensor* gate(int il) const { return layers_[std::size_t(il)].gate; }
     ggml_tensor* up(int il)   const { return layers_[std::size_t(il)].up; }
@@ -240,6 +282,10 @@ class ExpertStore {
         // pref_tag[s] = nomer tokena, na kotorom slot zapolnjala imenno predzagruzka.
         std::vector<uint8_t>  filling;
         std::vector<uint64_t> pref_tag;
+        // TRJOHUROVNEVOE: smeshchenie eksperta v TJOPLOM fajle (SSD) ili -1, esli on ne tjoplyj
+        // (togda promah chitaetsja s HDD-gguf). [n_expert]. Rasklad fiksiruetsja v prime po
+        // rangu chastoty: verhnie C - rezidentnye (OZU), sledujushchie W - tjoplye (SSD).
+        std::vector<int64_t> warm_base;
     };
     // Odna eta struktura na sloj: userdata u ggml_map_custom odin void*.
     struct Site { ExpertStore* self = nullptr; int il = 0; };
@@ -254,7 +300,7 @@ class ExpertStore {
     // --- PREDZAGRUZKA PO R1 (shag 5) ---
     static void pref_map_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth,
                             void* ud);
-    void do_prefetch(int tgt, const ggml_tensor* pred_logits);
+    void do_prefetch(int tgt, const ggml_tensor* pred_logits, bool hdd_only);
     // Postavit eksperta id sloja tgt v zapasnoj slot: sinhronno (fill_slot) ili cherez potok.
     void prefetch_expert(Layer& L, int tgt, int id);
     // Chtenie treh kuskov eksperta id v slot cherez UKAZANNYE hendl+bufer (potok grafa i
@@ -265,16 +311,27 @@ class ExpertStore {
     void drain_prefetch();
     bool open_pref_handle(std::string* err);   // vtoroj hendl+bufer pod I/O-potok
 
-    struct PrefSite { ExpertStore* self = nullptr; int tgt = 0; };
+    struct PrefSite { ExpertStore* self = nullptr; int tgt = 0; bool hdd_only = false; };
     struct Job { int il = 0; int slot = 0; int id = 0; };
     // Prjamoe chtenie fajla mimo strannichnogo kesha: kusok [foff, foff+len) v dst. Diapazon
     // vyravnivaetsja po sektoru (4096) pod FILE_FLAG_NO_BUFFERING, chitaetsja v io_buf_, nuzhnyj
     // poddiapazon kopiruetsja v dst. Vozvrashchaet false pri oshibke I/O.
     bool read_chunk(uint64_t foff, std::size_t len, void* dst);
     // Nizkourovnevoe sektorno-vyrovnennoe chtenie cherez ukazannye hendl i bufer (bez
-    // schjotchikov): odin i tot zhe kod dlja potoka grafa (fh_/io_buf_) i I/O-potoka.
-    bool read_range(void* fh, void* buf, std::size_t cap, uint64_t foff, std::size_t len,
-                    void* dst);
+    // schjotchikov): odin i tot zhe kod dlja potoka grafa (fh_/io_buf_) i I/O-potoka. fsize -
+    // razmer imenno etogo fajla (gguf ili tjoplogo), nuzhen dlja kljona sektornogo hvosta.
+    bool read_range(void* fh, void* buf, std::size_t cap, uint64_t fsize, uint64_t foff,
+                    std::size_t len, void* dst);
+
+    // --- TRJOHUROVNEVOE HRANILISHCHE ---
+    // Sobrat tjoplyj fajl na SSD: warm_ids po slojam (verhnie posle rezidentnyh po chastote)
+    // kopirujutsja iz gguf v otdelnyj fajl na warm_dir, ustanavlivaetsja L.warm_base. Potom
+    // fajl otkryvaetsja na chtenie s NO_BUFFERING (dva hendla: graf i I/O-potok). err - prichina.
+    bool build_warm(const std::vector<std::vector<int>>& warm_ids, std::string* err);
+    // Uroven eksperta: true - tjoplyj (SSD), false - holodnyj (HDD).
+    bool is_warm(const Layer& L, int id) const {
+        return warm_on_ && id >= 0 && L.warm_base[std::size_t(id)] >= 0;
+    }
     // Odin raz v init: otkryt gguf, najti fajlovye smeshchenija tenzorov ekspertov po imenam,
     // otkryt fajl s NO_BUFFERING, vydelit vyrovnennyj io_buf_. err - prichina otkaza.
     bool open_direct(std::string* err);
@@ -302,15 +359,31 @@ class ExpertStore {
     uint64_t           file_size_ = 0;
     uint64_t           direct_reads_ = 0;      // skolko kuskov prochitano s diska (potok grafa)
 
+    // --- TRJOHUROVNEVOE HRANILISHCHE (SSD-tjoplyj uroven) ---
+    bool         warm_on_    = false;
+    int          warm_w_     = 0;              // tjoplyh ekspertov na sloj
+    std::string  warm_path_;                  // put tjoplogo fajla
+    void*        fh_warm_      = nullptr;       // hendl tjoplogo fajla (potok grafa), NO_BUFFERING
+    void*        fh_warm_pref_ = nullptr;       // hendl tjoplogo fajla (I/O-potok)
+    uint64_t     warm_size_    = 0;             // razmer tjoplogo fajla (sektorno-vyrovnen)
+    double       warm_build_ms_ = 0.0;         // vremja postrojki tjoplogo fajla
+    // Vnutri odnogo tjoplogo eksperta gate/up/down lezhat podrjad; eti dliny nuzhny, chtoby
+    // najti up i down po baze gate. Berutsja iz sloja 0 (u vseh sloev odinakovy).
+    std::size_t  warm_nb_g_ = 0, warm_nb_u_ = 0, warm_nb_d_ = 0;
+
     // --- PREDZAGRUZKA PO R1 (shag 5) ---
     bool                    pref_on_     = false;
     bool                    pref_sync_   = false;   // chitat v uzle, ne na potoke (A/B)
     int                     pref_k_      = 0;       // K iz zagolovka fajla popravok
     int                     pref_budget_ = 16;      // B: skolko idov predzagruzhat
+    double                  pref_conf_hi_ = 1.0;    // rang < hi (dolja B ili absolut) => ljuboj uroven
+    double                  pref_conf_lo_ = 1.0;    // hi <= rang < lo => tolko HDD; >= lo => ne trogat
+    int                     pref_hdd_lead_ = 0;     // na skolko sloev ranshe uprezhdat HDD
     int                     pref_n_in_   = 0;       // 513
     int                     pref_n_out_  = 0;       // 512 (== n_expert)
     std::vector<float>      pref_corr_;             // [n_layer * n_in * n_out] f32 (iz f16)
-    std::vector<PrefSite>   pref_sites_;            // po celevomu sloju
+    std::vector<PrefSite>   pref_sites_;            // po celevomu sloju (osnovnoj, ljuboj uroven)
+    std::vector<PrefSite>   pref_hdd_sites_;        // po celevomu sloju (HDD-uprezhdenie, hdd_lead)
     std::vector<float>      pref_score_;            // [n_expert], bufer scora (potok grafa)
     std::vector<int>        pref_idx_;              // [n_expert], bufer idov (potok grafa)
     // Vtoroj fajlovyj hendl i bufer - tolko dlja I/O-potoka.
@@ -319,6 +392,11 @@ class ExpertStore {
     std::size_t             io_cap_pref_ = 0;
     std::atomic<uint64_t>   pref_reads_{0};         // kuskov prochitano I/O-potokom
     std::atomic<uint64_t>   pref_read_bytes_{0};
+    // Razbivka chtenij I/O-potoka po urovnju (SSD-tjoplyj / HDD-gguf).
+    std::atomic<uint64_t>   pref_reads_ssd_{0};
+    std::atomic<uint64_t>   pref_reads_hdd_{0};
+    std::atomic<uint64_t>   pref_bytes_ssd_{0};
+    std::atomic<uint64_t>   pref_bytes_hdd_{0};
     // Ochered i sinhronizacija I/O-potoka.
     std::thread             worker_;
     std::mutex              mu_;

@@ -81,6 +81,12 @@ ExpertStoreStats ExpertStoreStats::since(const ExpertStoreStats& b) const {
     d.pref_used      = pref_used      - b.pref_used;
     d.pref_waits     = pref_waits     - b.pref_waits;
     d.ms_pref_wait   = ms_pref_wait   - b.ms_pref_wait;
+    d.sync_ssd       = sync_ssd       - b.sync_ssd;
+    d.sync_hdd       = sync_hdd       - b.sync_hdd;
+    d.bytes_ssd      = bytes_ssd      - b.bytes_ssd;
+    d.bytes_hdd      = bytes_hdd      - b.bytes_hdd;
+    d.wait_ssd       = wait_ssd       - b.wait_ssd;
+    d.wait_hdd       = wait_hdd       - b.wait_hdd;
     return d;
 }
 
@@ -122,11 +128,15 @@ ExpertStore::~ExpertStore() {
     if (io_buf_) _aligned_free(io_buf_);
     if (fh_pref_ && fh_pref_ != INVALID_HANDLE_VALUE) CloseHandle((HANDLE)fh_pref_);
     if (io_buf_pref_) _aligned_free(io_buf_pref_);
+    if (fh_warm_ && fh_warm_ != INVALID_HANDLE_VALUE) CloseHandle((HANDLE)fh_warm_);
+    if (fh_warm_pref_ && fh_warm_pref_ != INVALID_HANDLE_VALUE) CloseHandle((HANDLE)fh_warm_pref_);
 #endif
     fh_ = nullptr;
     io_buf_ = nullptr;
     fh_pref_ = nullptr;
     io_buf_pref_ = nullptr;
+    fh_warm_ = nullptr;
+    fh_warm_pref_ = nullptr;
 }
 
 namespace {
@@ -211,10 +221,10 @@ bool ExpertStore::open_direct(std::string* err) {
 // bufer. Krajа vyravnivajutsja po sektoru; chitaem vyrovnennyj diapazon v buf, kopiruem
 // nuzhnyj poddiapazon. Schjotchikov ne trogaet - eto delaet vyzyvajushchij (potok grafa i
 // I/O-potok schitajut razdelno).
-bool ExpertStore::read_range(void* fh, void* buf, std::size_t cap, uint64_t foff,
+bool ExpertStore::read_range(void* fh, void* buf, std::size_t cap, uint64_t fsize, uint64_t foff,
                              std::size_t len, void* dst) {
 #if !defined(_WIN32)
-    (void)fh; (void)buf; (void)cap; (void)foff; (void)len; (void)dst;
+    (void)fh; (void)buf; (void)cap; (void)fsize; (void)foff; (void)len; (void)dst;
     return false;
 #else
     const uint64_t astart = foff & ~(uint64_t)(kSector - 1);
@@ -222,7 +232,7 @@ bool ExpertStore::read_range(void* fh, void* buf, std::size_t cap, uint64_t foff
     uint64_t aend = align_up(std::size_t(foff + len), kSector);
     // Ne chitat za sektornyj hvost fajla: poslednij sektor mozhet byt nepolnym, i ReadFile
     // vernjot menshe bajt - eto normal'no, poka pokryt head+len.
-    const uint64_t fend = align_up(std::size_t(file_size_), kSector);
+    const uint64_t fend = align_up(std::size_t(fsize), kSector);
     if (aend > fend) aend = fend;
     const std::size_t alen = std::size_t(aend - astart);
     if (alen > cap || head + len > alen) return false;
@@ -239,7 +249,7 @@ bool ExpertStore::read_range(void* fh, void* buf, std::size_t cap, uint64_t foff
 }
 
 bool ExpertStore::read_chunk(uint64_t foff, std::size_t len, void* dst) {
-    if (!read_range(fh_, io_buf_, io_cap_, foff, len, dst)) return false;
+    if (!read_range(fh_, io_buf_, io_cap_, file_size_, foff, len, dst)) return false;
     direct_reads_++;
     return true;
 }
@@ -294,6 +304,10 @@ bool ExpertStore::init(const ExpertStoreConfig& cfg,
         if (err) *err = "razmer eksperta poluchilsja nulevym";
         return false;
     }
+    // Dliny treh kuskov odnogo eksperta - dlja raskladki v tjoplom fajle (gate/up/down podrjad).
+    warm_nb_g_ = std::size_t(gate[0]->nb[2]);
+    warm_nb_u_ = std::size_t(up[0]->nb[2]);
+    warm_nb_d_ = std::size_t(down[0]->nb[2]);
 
     ggml_init_params ip = {};
     ip.mem_size   = ggml_tensor_overhead() * std::size_t(3 * cfg_.n_layer + 8) + 4096;
@@ -382,6 +396,7 @@ bool ExpertStore::init(const ExpertStoreConfig& cfg,
         L.touched.assign(std::size_t(n_slots_), 0);
         L.filling.assign(std::size_t(n_slots_), 0);
         L.pref_tag.assign(std::size_t(n_slots_), 0);
+        L.warm_base.assign(std::size_t(cfg_.n_expert), int64_t(-1));
         L.ring = 0;
     }
 
@@ -497,14 +512,34 @@ void ExpertStore::fill_slot(Layer& L, int slot, int id) {
     const ggml_tensor* src[3] = {L.src_gate, L.src_up, L.src_down};
     ggml_tensor* dst[3] = {L.gate, L.up, L.down};
     const uint64_t off[3] = {L.off_gate, L.off_up, L.off_down};
+    // TRJOHUROVNEVOE: tjoplyj ekspert chitaetsja s SSD-fajla, holodnyj - s HDD-gguf. Vnutri
+    // tjoplogo fajla gate/up/down lezhat podrjad, poetomu smeshchenija - baza + wintra.
+    const bool warm = is_warm(L, id);
+    const std::size_t wintra[3] = {0, warm_nb_g_, warm_nb_g_ + warm_nb_u_};
     for (int k = 0; k < 3; ++k) {
         const std::size_t nb2 = std::size_t(dst[k]->nb[2]);
         char* d = (char*)dst[k]->data + std::size_t(slot) * nb2;
-        if (direct_) {
+        if (warm) {
+            const uint64_t foff = (uint64_t)L.warm_base[std::size_t(id)] + wintra[k];
+            if (read_range(fh_warm_, io_buf_, io_cap_, warm_size_, foff, nb2, d)) {
+                direct_reads_++;
+                st_.bytes_ssd += nb2;
+            } else {
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    printf("hranilishche ekspertov: chtenie s TJOPLOGO fajla ne udalos "
+                           "(sloj-tenzor %d, ekspert %d) - slot NE zapolnen\n", k, id);
+                    fflush(stdout);
+                }
+            }
+        } else if (direct_) {
             // Prjamoe chtenie s diska: NE trogaet stranicy mmap etogo eksperta, tak chto oni
             // ostajutsja holodnymi i ne konkurirujut za pamjat s privatnym slotom.
             const uint64_t foff = off[k] + std::size_t(id) * nb2;
-            if (!read_chunk(foff, nb2, d)) {
+            if (read_chunk(foff, nb2, d)) {
+                st_.bytes_hdd += nb2;
+            } else {
                 static bool said = false;
                 if (!said) {
                     said = true;
@@ -516,6 +551,7 @@ void ExpertStore::fill_slot(Layer& L, int slot, int id) {
             }
         } else {
             std::memcpy(d, (const char*)src[k]->data + std::size_t(id) * nb2, nb2);
+            st_.bytes_hdd += nb2;
         }
     }
     st_.ms_fill += ms_since(t0);
@@ -592,6 +628,7 @@ void ExpertStore::do_map(int il, ggml_tensor* dst, const ggml_tensor* sel) {
                             cv_.wait(lk, [&] { return L.filling[std::size_t(s)] == 0; });
                             st_.ms_pref_wait += ms_since(tw);
                             st_.pref_waits++;
+                            if (is_warm(L, id)) st_.wait_ssd++; else st_.wait_hdd++;
                         }
                         if (L.pref_tag[std::size_t(s)] == token_) st_.pref_used++;
                     }
@@ -633,6 +670,7 @@ void ExpertStore::do_map(int il, ggml_tensor* dst, const ggml_tensor* sel) {
                         s = v;
                     }
                     st_.sync_misses++;
+                    if (is_warm(L, id)) st_.sync_ssd++; else st_.sync_hdd++;
                     st_.ms_sync += ms_since(t0);
                 }
             }
@@ -663,6 +701,22 @@ ggml_tensor* ExpertStore::slots_node(ggml_context* c, int il, ggml_tensor* sel,
 bool ExpertStore::prime(std::string* err) {
     if (!on()) return true;
     bulk_ = true;
+    // TRJOHUROVNEVOE: skolko tjoplyh ekspertov na sloj vlezaet v warm-cap na SSD. Kazhdyj v
+    // fajle zanimaet per_expert_, vyrovnennyj do sektora (chtoby sledujushchij nachinalsja na
+    // granice sektora - uslovie NO_BUFFERING chtenija).
+    warm_w_ = 0;
+    if (!cfg_.warm_dir.empty() && cfg_.warm_cap_gib > 0.0 && direct_ &&
+        cfg_.capacity < cfg_.n_expert) {
+        const uint64_t cap_bytes = uint64_t(cfg_.warm_cap_gib * 1073741824.0);
+        const std::size_t ebytes = align_up(per_expert_, kSector);
+        const uint64_t per_layer_cap = cap_bytes / uint64_t(cfg_.n_layer);
+        int w = int(per_layer_cap / uint64_t(ebytes));
+        const int overflow = cfg_.n_expert - cfg_.capacity;
+        if (w > overflow) w = overflow;
+        if (w < 0) w = 0;
+        warm_w_ = w;
+    }
+    std::vector<std::vector<int>> warm_ids(std::size_t(cfg_.n_layer));
     std::vector<int> ord(std::size_t(cfg_.n_expert));
     for (int il = 0; il < cfg_.n_layer; ++il) {
         Layer& L = layers_[std::size_t(il)];
@@ -681,6 +735,23 @@ bool ExpertStore::prime(std::string* err) {
             L.want[std::size_t(id)] = 1;
             fill_slot(L, k, id);
             L.touched[std::size_t(k)] = 0;   // zalivka byla do pervogo tokena
+        }
+        // Tjoplyj uroven: sledujushchie W po chastote (srazu za rezidentnymi) - kandidaty na
+        // promah, kotorye deshevle derzhat na SSD, chem chitat s HDD.
+        if (warm_w_ > 0) {
+            warm_ids[std::size_t(il)].reserve(std::size_t(warm_w_));
+            for (int w = 0; w < warm_w_ && cfg_.capacity + w < cfg_.n_expert; ++w) {
+                warm_ids[std::size_t(il)].push_back(ord[std::size_t(cfg_.capacity + w)]);
+            }
+        }
+    }
+    // Sobrat tjoplyj fajl na SSD i otkryt ego na chtenie. Otkaz - vsluh (ne tihij otkat na HDD).
+    if (warm_w_ > 0) {
+        std::string werr;
+        if (!build_warm(warm_ids, &werr)) {
+            bulk_ = false;
+            if (err) *err = werr;
+            return false;
         }
     }
     // Repak celym tenzorom, a ne po slotam: eto te zhe bajty (gruppa iz chetyrjoh strok
@@ -709,6 +780,106 @@ bool ExpertStore::prime(std::string* err) {
     bulk_ = false;
     primed_ = true;
     return true;
+}
+
+// ================= TRJOHUROVNEVOE HRANILISHCHE: TJOPLYJ FAJL NA SSD =================
+//
+// warm_ids[il] - eksperty, kotorye idut na SSD (srazu za rezidentnymi po chastote). Kazhdyj
+// kopiruetsja iz gguf (HDD) v otdelnyj fajl na SSD: gate/up/down podrjad, zapis vyrovnena po
+// sektoru, chtoby potom chitatsja s NO_BUFFERING. L.warm_base[id] = smeshchenie eksperta (gate)
+// v tjoplom fajle. Posle zapisi fajl otkryvaetsja na chtenie dvumja hendlami (graf i I/O-potok).
+bool ExpertStore::build_warm(const std::vector<std::vector<int>>& warm_ids, std::string* err) {
+#if !defined(_WIN32)
+    (void)warm_ids;
+    if (err) *err = "tjoplyj uroven realizovan tolko dlja Windows";
+    return false;
+#else
+    if (!direct_) {
+        if (err) *err = "tjoplyj uroven trebuet prjamogo chtenija gguf (gguf_path)";
+        return false;
+    }
+    const auto t0 = Clock::now();
+    // Katalog. CreateDirectory na sushchestvujushchij - ne oshibka (ERROR_ALREADY_EXISTS).
+    CreateDirectoryA(cfg_.warm_dir.c_str(), nullptr);
+    warm_path_ = cfg_.warm_dir;
+    if (!warm_path_.empty() && warm_path_.back() != '\\' && warm_path_.back() != '/') {
+        warm_path_ += '\\';
+    }
+    warm_path_ += "memex_warm.bin";
+
+    // Zapis - obychnaja buferizovannaja (CREATE_ALWAYS userekaet staryj fajl, osvobozhdaja mesto).
+    HANDLE hw = CreateFileA(warm_path_.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hw == INVALID_HANDLE_VALUE) {
+        if (err) *err = "tjoplyj fajl ne sozdalsja (" + warm_path_ + "), kod " +
+                        std::to_string((unsigned long)GetLastError());
+        return false;
+    }
+    const std::size_t entry = align_up(per_expert_, kSector);   // odin ekspert v fajle
+    std::vector<char> wbuf(entry, 0);
+    uint64_t foff = 0;
+    bool ok = true;
+    std::string why;
+    for (int il = 0; il < cfg_.n_layer && ok; ++il) {
+        Layer& L = layers_[std::size_t(il)];
+        const uint64_t goff[3] = {L.off_gate, L.off_up, L.off_down};
+        const std::size_t nb2[3] = {warm_nb_g_, warm_nb_u_, warm_nb_d_};
+        const std::size_t wintra[3] = {0, warm_nb_g_, warm_nb_g_ + warm_nb_u_};
+        for (int id : warm_ids[std::size_t(il)]) {
+            std::memset(wbuf.data(), 0, entry);
+            for (int k = 0; k < 3 && ok; ++k) {
+                const uint64_t src = goff[k] + std::size_t(id) * nb2[k];
+                if (!read_range(fh_, io_buf_, io_cap_, file_size_, src, nb2[k],
+                                wbuf.data() + wintra[k])) {
+                    ok = false;
+                    why = "chtenie eksperta " + std::to_string(id) + " sloja " +
+                          std::to_string(il) + " iz gguf ne udalos";
+                }
+            }
+            if (!ok) break;
+            DWORD wrote = 0;
+            if (!WriteFile(hw, wbuf.data(), (DWORD)entry, &wrote, nullptr) ||
+                (std::size_t)wrote != entry) {
+                ok = false;
+                why = "zapis v tjoplyj fajl ne udalas (mesto na SSD?), kod " +
+                      std::to_string((unsigned long)GetLastError());
+                break;
+            }
+            L.warm_base[std::size_t(id)] = (int64_t)foff;
+            foff += entry;
+        }
+    }
+    warm_size_ = foff;
+    CloseHandle(hw);
+    if (!ok) {
+        if (err) *err = "tjoplyj uroven: " + why;
+        return false;
+    }
+
+    // Otkryt na chtenie s NO_BUFFERING - dva hendla, kak u gguf: odin dlja grafa, odin dlja
+    // I/O-potoka predzagruzki (statejnyj fajlovyj ukazatel delit nelzja).
+    HANDLE hr = CreateFileA(warm_path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                            OPEN_EXISTING,
+                            FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    if (hr == INVALID_HANDLE_VALUE) {
+        if (err) *err = "tjoplyj fajl ne otkrylsja na chtenie, kod " +
+                        std::to_string((unsigned long)GetLastError());
+        return false;
+    }
+    fh_warm_ = (void*)hr;
+    HANDLE hr2 = CreateFileA(warm_path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                             OPEN_EXISTING,
+                             FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    if (hr2 == INVALID_HANDLE_VALUE) {
+        if (err) *err = "tjoplyj fajl: vtoroj hendl (I/O-potok) ne otkrylsja, kod " +
+                        std::to_string((unsigned long)GetLastError());
+        return false;
+    }
+    fh_warm_pref_ = (void*)hr2;
+    warm_on_ = true;
+    warm_build_ms_ = ms_since(t0);
+    return true;
+#endif
 }
 
 void ExpertStore::refresh() {
@@ -849,7 +1020,8 @@ bool ExpertStore::open_pref_handle(std::string* err) {
 #endif
 }
 
-bool ExpertStore::load_prefetch(const char* path, int budget, bool sync, std::string* err) {
+bool ExpertStore::load_prefetch(const char* path, int budget, bool sync, double conf_hi,
+                                double conf_lo, int hdd_lead, std::string* err) {
     if (!on()) {
         if (err) *err = "predzagruzka bez hranilishcha (--expert-store) ne imeet smysla";
         return false;
@@ -903,10 +1075,34 @@ bool ExpertStore::load_prefetch(const char* path, int budget, bool sync, std::st
     pref_budget_ = budget > 0 ? budget : 16;
     if (pref_budget_ > cfg_.n_expert) pref_budget_ = cfg_.n_expert;
     pref_sync_   = sync;
+    // Dva poroga po rangu top-B (ideja polzovatelja). Znachenie <= 1.0 - dolja B, > 1.0 -
+    // absoljutnyj rang. hi <= lo. Po umolchaniju hi = lo = B => staroe povedenie.
+    auto to_rank = [&](double v) -> int {
+        if (v <= 0.0) return 0;
+        int r = (v <= 1.0) ? int(v * double(pref_budget_) + 0.5) : int(v + 0.5);
+        if (r < 0) r = 0;
+        if (r > pref_budget_) r = pref_budget_;
+        return r;
+    };
+    pref_conf_hi_ = conf_hi;
+    pref_conf_lo_ = conf_lo;
+    // Sohranjajem doli/rangi kak est dlja otchjota; primenjajutsja v do_prefetch cherez to_rank
+    // (pereschityvaetsja tam zhe, chtoby ne dublirovat pole). Zdes tolko proverka poriadka.
+    if (to_rank(conf_lo) < to_rank(conf_hi)) {
+        // lo dolzhen byt ne menshe hi (bolshij rang = shire pul). Menjaem mestami vsluh nizhe
+        // v otchjote ne nado - prosto vyravnivaem lo do hi.
+        pref_conf_lo_ = conf_hi;
+    }
+    pref_hdd_lead_ = hdd_lead > 0 ? hdd_lead : 0;
     pref_sites_.resize(std::size_t(cfg_.n_layer));
+    pref_hdd_sites_.resize(std::size_t(cfg_.n_layer));
     for (int il = 0; il < cfg_.n_layer; ++il) {
-        pref_sites_[std::size_t(il)].self = this;
-        pref_sites_[std::size_t(il)].tgt  = il;
+        pref_sites_[std::size_t(il)].self     = this;
+        pref_sites_[std::size_t(il)].tgt      = il;
+        pref_sites_[std::size_t(il)].hdd_only = false;
+        pref_hdd_sites_[std::size_t(il)].self     = this;
+        pref_hdd_sites_[std::size_t(il)].tgt      = il;
+        pref_hdd_sites_[std::size_t(il)].hdd_only = true;
     }
     pref_score_.assign(std::size_t(cfg_.n_expert), 0.0f);
     pref_idx_.assign(std::size_t(cfg_.n_expert), 0);
@@ -965,13 +1161,26 @@ void ExpertStore::read_slot(Layer& L, int slot, int id, void* fh, void* buf, std
     const ggml_tensor* src[3] = {L.src_gate, L.src_up, L.src_down};
     ggml_tensor* dst[3] = {L.gate, L.up, L.down};
     const uint64_t off[3] = {L.off_gate, L.off_up, L.off_down};
+    // TRJOHUROVNEVOE: tjoplyj ekspert - s SSD-fajla (svoj hendl potoka), holodnyj - s gguf.
+    const bool warm = is_warm(L, id);
+    const std::size_t wintra[3] = {0, warm_nb_g_, warm_nb_g_ + warm_nb_u_};
     for (int k = 0; k < 3; ++k) {
         const std::size_t nb2 = std::size_t(dst[k]->nb[2]);
         char* d = (char*)dst[k]->data + std::size_t(slot) * nb2;
-        const uint64_t foff = off[k] + std::size_t(id) * nb2;
-        if (read_range(fh, buf, cap, foff, nb2, d)) {
+        const void*  rh   = warm ? fh_warm_pref_ : fh;
+        const uint64_t fsz = warm ? warm_size_ : file_size_;
+        const uint64_t foff = warm ? ((uint64_t)L.warm_base[std::size_t(id)] + wintra[k])
+                                   : (off[k] + std::size_t(id) * nb2);
+        if (read_range((void*)rh, buf, cap, fsz, foff, nb2, d)) {
             if (reads) reads->fetch_add(1, std::memory_order_relaxed);
             if (rbytes) rbytes->fetch_add(nb2, std::memory_order_relaxed);
+            if (warm) {
+                pref_reads_ssd_.fetch_add(1, std::memory_order_relaxed);
+                pref_bytes_ssd_.fetch_add(nb2, std::memory_order_relaxed);
+            } else {
+                pref_reads_hdd_.fetch_add(1, std::memory_order_relaxed);
+                pref_bytes_hdd_.fetch_add(nb2, std::memory_order_relaxed);
+            }
         } else {
             static bool said = false;
             if (!said) {
@@ -1031,7 +1240,7 @@ void ExpertStore::prefetch_expert(Layer& L, int tgt, int id) {
     cv_.notify_one();
 }
 
-void ExpertStore::do_prefetch(int tgt, const ggml_tensor* pred_logits) {
+void ExpertStore::do_prefetch(int tgt, const ggml_tensor* pred_logits, bool hdd_only) {
     if (!pref_on_ || tgt < 0 || tgt >= cfg_.n_layer) return;
     if (tgt < pref_k_) return;   // dlja etih sloev popravka tozhdestvennaja, a istochnika net
     Layer& L = layers_[std::size_t(tgt)];
@@ -1058,22 +1267,57 @@ void ExpertStore::do_prefetch(int tgt, const ggml_tensor* pred_logits) {
     for (int e = 0; e < E; ++e) idx[e] = e;
     std::nth_element(idx, idx + B, idx + E,
                      [&](int a, int b) { return sc[a] > sc[b]; });
-    st_.pref_predicted += (uint64_t)B;
-    for (int t = 0; t < B; ++t) prefetch_expert(L, tgt, idx[t]);
+    // Dva poroga trebujut RANGA vnutri top-B, poetomu sortiruem imenno eti B (B mal: 16-32).
+    std::sort(idx, idx + B, [&](int a, int b) { return sc[a] > sc[b]; });
+    auto to_rank = [&](double v) -> int {
+        if (v <= 0.0) return 0;
+        int r = (v <= 1.0) ? int(v * double(B) + 0.5) : int(v + 0.5);
+        if (r < 0) r = 0;
+        if (r > B) r = B;
+        return r;
+    };
+    int hi = to_rank(pref_conf_hi_);
+    int lo = to_rank(pref_conf_lo_);
+    if (lo < hi) lo = hi;
+    // Predskazano schitaem odin raz - na osnovnom uzle (lead-uzel dublirует te zhe eksperty).
+    if (!hdd_only) st_.pref_predicted += (uint64_t)B;
+    // "Zapas polosy" dlja srednego poroga: ne razduvat ochered async-chtenij. V sync-rezhime
+    // ocheredi net, poetomu srednij porog razreshjon vsegda.
+    int infl = 0;
+    if (!pref_sync_) {
+        std::unique_lock<std::mutex> lk(mu_);
+        infl = inflight_;
+    }
+    const bool band_ok = pref_sync_ || infl < pref_budget_;
+    for (int t = 0; t < lo; ++t) {
+        const int id = idx[t];
+        const bool warm = is_warm(L, id);
+        bool issue;
+        if (t < hi) {
+            // Vysokaja uverennost: predzagruzhaem s ljubogo urovnja. Lead-uzel (hdd_only) beret
+            // iz nih tolko HDD - imenno im nuzhna dopolnitelnaja fora.
+            issue = hdd_only ? !warm : true;
+        } else {
+            // Srednjaja uverennost ("naverno ponadobitsja"): tolko HDD i tolko pri zapase polosy.
+            issue = (!warm) && band_ok;
+        }
+        if (issue) prefetch_expert(L, tgt, id);
+    }
 }
 
 void ExpertStore::pref_map_op(ggml_tensor* /*dst*/, const ggml_tensor* a, int ith,
                               int /*nth*/, void* ud) {
     if (ith != 0) return;
     PrefSite* s = (PrefSite*)ud;
-    s->self->do_prefetch(s->tgt, a);
+    s->self->do_prefetch(s->tgt, a, s->hdd_only);
 }
 
 ggml_tensor* ExpertStore::prefetch_node(ggml_context* c, ggml_cgraph* gf, int tgt,
-                                        ggml_tensor* pred_logits) {
+                                        ggml_tensor* pred_logits, bool hdd_only) {
     if (!pref_on_ || tgt < 0 || tgt >= cfg_.n_layer) return nullptr;
-    ggml_tensor* t = ggml_map_custom1(c, pred_logits, pref_map_op, /*n_tasks=*/1,
-                                      &pref_sites_[std::size_t(tgt)]);
+    PrefSite* site = hdd_only ? &pref_hdd_sites_[std::size_t(tgt)]
+                              : &pref_sites_[std::size_t(tgt)];
+    ggml_tensor* t = ggml_map_custom1(c, pred_logits, pref_map_op, /*n_tasks=*/1, site);
     // Pobochnoe dejstvie bez potrebitelja - javno v graf, inache gallocr ne dast emu bufera
     // i pervoe chtenie upadjot (ta zhe lovushka, chto u slots_node/sel).
     if (gf) ggml_build_forward_expand(gf, t);

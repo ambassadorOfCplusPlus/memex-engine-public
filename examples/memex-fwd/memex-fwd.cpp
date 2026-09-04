@@ -3794,11 +3794,23 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
         // ljozhet na mesto sloja l, tak chto chtenie idjot na fone K sloev scheta. Otveta ne
         // menjaet: lish zaranee kladjot v pamjat to, chto inache prochitalos by sinhronno.
         if (need_norm_pref && normed) {
-            const int tgt = il + es->prefetch_k();
+            const int K = es->prefetch_k();
+            const int tgt = il + K;
+            ggml_tensor* xin = nullptr;
             if (tgt < h.n_layer) {
-                ggml_tensor* xin = ggml_cont(c, normed);
+                xin = ggml_cont(c, normed);
                 ggml_tensor* pr  = ggml_mul_mat(c, w.layers[std::size_t(tgt)].router, xin);
-                es->prefetch_node(c, g->gf, tgt, pr);
+                es->prefetch_node(c, g->gf, tgt, pr, /*hdd_only=*/false);
+            }
+            // HDD-UPREZHDENIE (hdd_lead): dlja HDD-ekspertov predskazyvaem GLUBZHE (l+K+lead),
+            // chtoby 23 ms chtenija uspeli sprjatatsja. Popravka Wc[l+K+lead] primenjaetsja k
+            // x_l - eto priblizhenie (K v fajle fiksirovan), no dajot fору na lead sloev bolshe.
+            const int lead = es->prefetch_hdd_lead();
+            const int tgt2 = il + K + lead;
+            if (lead > 0 && tgt2 < h.n_layer) {
+                if (!xin) xin = ggml_cont(c, normed);
+                ggml_tensor* pr2 = ggml_mul_mat(c, w.layers[std::size_t(tgt2)].router, xin);
+                es->prefetch_node(c, g->gf, tgt2, pr2, /*hdd_only=*/true);
             }
         }
         if (sel_cp) g->sel_ids.push_back(sel_cp);
@@ -4718,6 +4730,12 @@ struct ExpertStoreOpt {
     const char* prefetch = nullptr;  // --expert-prefetch: fajl popravok r1_corr_kK.bin
     int prefetch_budget = 16;        // --prefetch-budget B
     bool prefetch_sync = false;      // --prefetch-sync: chitat v uzle (A/B, ne prjachet)
+    // TRJOHUROVNEVOE HRANILISHCHE (ideja polzovatelja): OZU (rezidentnye) + SSD (tjoplye) + HDD.
+    const char* warm_dir = nullptr;  // --warm-dir: katalog pod tjoplyj fajl na SSD
+    double warm_cap = 0.0;           // --warm-cap: predel razmera tjoplogo fajla (GiB)
+    double conf_hi = 1.0;            // --conf-hi: rang top-B < hi => predzagruzka s ljubogo urovnja
+    double conf_lo = 1.0;            // --conf-lo: hi <= rang < lo => tolko HDD; >= lo => ne trogat
+    int hdd_lead = 0;                // --hdd-lead: na skolko sloev ranshe uprezhdat HDD-eksperty
 };
 
 // OTCHJOT HRANILISHCHA. Odna funkcija na oba puti (--decode-check i --gen), potomu chto
@@ -4755,6 +4773,32 @@ void print_store_report(const memex::ExpertStore& es, const HParams& h,
            es.direct() ? "PRJAMOE CHTENIE fajla mimo mmap (NO_BUFFERING)"
                        : "memcpy iz mmap (staryj put)",
            (unsigned long long)es.direct_reads());
+    // TRJOHUROVNEVYJ RAZBOR (ideja polzovatelja): OZU (rezidentnye popadanija) + SSD (tjoplye) +
+    // HDD (holodnye). Promahi i bajty - po urovnju, otkuda ekspert prochitan.
+    if (es.warm_on()) {
+        printf("  TRI UROVNJA: OZU %d rezidentnyh/sloj + SSD tjoplyj fajl %d ekspertov/sloj "
+               "(%.2f GiB, postrojka %.0f ms, %s) + HDD ostalnoe\n",
+               es.cfg().capacity, es.warm_per_layer(),
+               double(es.warm_bytes()) / 1073741824.0, es.warm_build_ms(),
+               es.warm_path().c_str());
+    } else {
+        printf("  TRI UROVNJA: tjoplyj SSD-uroven VYKLJUCHEN (--warm-dir ne zadan) => vsjo "
+               "nerezidentnoe chitaetsja s HDD-gguf\n");
+    }
+    {
+        const double t2 = tok;
+        printf("  sinhronnye promahi po urovnju: SSD %llu (%.3f/token), HDD %llu (%.3f/token); "
+               "bajt s SSD %.3f GiB, s HDD %.3f GiB\n",
+               (unsigned long long)s.sync_ssd, double(s.sync_ssd) / t2,
+               (unsigned long long)s.sync_hdd, double(s.sync_hdd) / t2,
+               double(s.bytes_ssd) / 1073741824.0, double(s.bytes_hdd) / 1073741824.0);
+        const double miss_pt = s.misses_per_token();
+        printf("  PROMAHOV OKOLO NULJA? cel polzovatelja: %.3f sinhr.promaha/token "
+               "(HDD %.3f/token) - %s\n", miss_pt, double(s.sync_hdd) / t2,
+               (double(s.sync_hdd) / t2 < 0.5)
+                   ? "HDD-promahi PODAVLENY (blizko k nulju)"
+                   : "HDD-promahi ESHCHJO zametny");
+    }
     if (phase_ms > 0.0 && s.tokens > 0) {
         printf("  dolja fazy: %.1f ms/token vsego, iz nih %.1f ms sinhronnye chtenija "
                "(%.1f%%)\n", phase_ms / tok, s.ms_sync / tok,
@@ -4794,6 +4838,13 @@ void print_store_report(const memex::ExpertStore& es, const HParams& h,
                (unsigned long long)s.pref_waits, double(s.pref_waits) / tok,
                s.ms_pref_wait / tok, (unsigned long long)es.pref_reads(),
                double(es.pref_read_bytes()) / 1073741824.0);
+        printf("    async-chtenij po urovnju: SSD %llu (%.2f GiB), HDD %llu (%.2f GiB); "
+               "async-ozhidanij po urovnju: SSD %llu, HDD %llu\n",
+               (unsigned long long)es.pref_reads_ssd(),
+               double(es.pref_bytes_ssd()) / 1073741824.0,
+               (unsigned long long)es.pref_reads_hdd(),
+               double(es.pref_bytes_hdd()) / 1073741824.0,
+               (unsigned long long)s.wait_ssd, (unsigned long long)s.wait_hdd);
         printf("PREFETCH_AB K %d B %d sync %d tokens %llu predicted_per_tok %.3f "
                "issued_per_tok %.4f used_per_tok %.4f wasted_per_tok %.4f "
                "sync_miss_per_tok %.4f async_wait_per_tok %.4f ms_wait_per_tok %.4f\n",
@@ -4811,6 +4862,16 @@ void print_store_report(const memex::ExpertStore& es, const HParams& h,
            es.cfg().capacity, es.cfg().spares, es.cfg().period, es.repacked() ? 1 : 0,
            (unsigned long long)s.tokens, s.hit_rate(), s.misses_per_token(), s.ms_sync / tok,
            (unsigned long long)s.fills);
+    // Odna stroka po urovnjam dlja skriptov (ideja polzovatelja: tri urovnja).
+    printf("ESTORE_LEVEL warm %d warm_w %d warm_gib %.3f tokens %llu sync_ssd_pt %.4f "
+           "sync_hdd_pt %.4f bytes_ssd_gib %.3f bytes_hdd_gib %.3f async_ssd %llu async_hdd %llu "
+           "wait_ssd_pt %.4f wait_hdd_pt %.4f\n",
+           es.warm_on() ? 1 : 0, es.warm_per_layer(),
+           double(es.warm_bytes()) / 1073741824.0, (unsigned long long)s.tokens,
+           double(s.sync_ssd) / tok, double(s.sync_hdd) / tok,
+           double(s.bytes_ssd) / 1073741824.0, double(s.bytes_hdd) / 1073741824.0,
+           (unsigned long long)es.pref_reads_ssd(), (unsigned long long)es.pref_reads_hdd(),
+           double(s.wait_ssd) / tok, double(s.wait_hdd) / tok);
     fflush(stdout);
 }
 
@@ -6113,6 +6174,15 @@ int main(int argc, char** argv) {
 "                       K iz zagolovka; trebuet --expert-store; net fajla - otkaz vsluh\n"
 "  --prefetch-budget B  skolko idov predzagruzhat na sloj (top-B, po umolchaniju 16)\n"
 "  --prefetch-sync      chitat predzagruzku SINHRONNO v uzle (A/B: NE prjachet chtenie)\n"
+"trjohurovnevoe hranilishche (OZU + SSD tjoplyj + HDD): ideja polzovatelja\n"
+"  --warm-dir DIR       tjoplyj fajl na SSD: verhnie po chastote overflow-eksperty (za\n"
+"                       rezidentnymi) kopirujutsja tuda; promah s SSD ~2,7 ms vmesto HDD ~23\n"
+"  --warm-cap G         predel razmera tjoplogo fajla v GiB (skolko ekspertov na SSD)\n"
+"  --conf-hi X          DVA POROGA po rangu top-B: rang < hi => predzagruzka s ljubogo\n"
+"                       urovnja (dolja B esli X<=1, inache absoljutnyj rang)\n"
+"  --conf-lo X          hi <= rang < lo => predzagruzka TOLKO esli ekspert na HDD i est\n"
+"                       zapas polosy; rang >= lo => ne trogat (po umolchaniju hi=lo=1=B)\n"
+"  --hdd-lead N         HDD-eksperty predskazyvat na N sloev glubzhe (23 ms prjatat ranshe)\n"
 "\n"
 "staticheskie vesa v videopamjati, VYKLJUCHENY po umolchaniju\n"
 "  --gpu-static         schitat vyhodnuju golovu (output.weight) na Vulkan. Eto 243.4 MB\n"
@@ -6260,6 +6330,11 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--expert-prefetch")) { if (want_val(i, a)) eopt.prefetch = argv[++i]; }
         else if (!strcmp(a, "--prefetch-budget")) { if (want_val(i, a)) eopt.prefetch_budget = atoi(argv[++i]); }
         else if (!strcmp(a, "--prefetch-sync")) { eopt.prefetch_sync = true; }
+        else if (!strcmp(a, "--warm-dir")) { if (want_val(i, a)) eopt.warm_dir = argv[++i]; }
+        else if (!strcmp(a, "--warm-cap")) { if (want_val(i, a)) eopt.warm_cap = atof(argv[++i]); }
+        else if (!strcmp(a, "--conf-hi")) { if (want_val(i, a)) eopt.conf_hi = atof(argv[++i]); }
+        else if (!strcmp(a, "--conf-lo")) { if (want_val(i, a)) eopt.conf_lo = atof(argv[++i]); }
+        else if (!strcmp(a, "--hdd-lead")) { if (want_val(i, a)) eopt.hdd_lead = atoi(argv[++i]); }
         else if (!strcmp(a, "--gpu-static")) { sopt.on = true; }
         else if (!strcmp(a, "--gpu-static-verify")) { sopt.on = true; sopt.verify = true; }
         else if (!strcmp(a, "--gpu-static-layers")) { sopt.on = true; sopt.layers = true; }
@@ -7420,6 +7495,10 @@ int main(int argc, char** argv) {
         // dvojnoj pamjati). Bez etogo hranilishche kopiruet iz mmap i fol'tit ves ekspertnyj
         // region v strannichnyj kesh - rovno tot trjoshing, kotoryj my ubiraem.
         ec.gguf_path = model_path;
+        // TRJOHUROVNEVOE: tjoplyj uroven na SSD (ideja polzovatelja). Pustoj warm_dir - net
+        // urovnja (vsjo nerezidentnoe = HDD-gguf).
+        if (eopt.warm_dir) ec.warm_dir = eopt.warm_dir;
+        ec.warm_cap_gib = eopt.warm_cap;
         printf("\nrezidentnoe hranilishche ekspertov: ekspert %.3f MiB "
                "(gate %s + up %s + down %s), na sloj %d ekspertov, sloev %d\n",
                double(bpe) / 1048576.0, ggml_type_name(L0.gate_exps->type),
@@ -7520,7 +7599,8 @@ int main(int argc, char** argv) {
         if (eopt.prefetch) {
             std::string ferr;
             if (!estore->load_prefetch(eopt.prefetch, eopt.prefetch_budget,
-                                       eopt.prefetch_sync, &ferr)) {
+                                       eopt.prefetch_sync, eopt.conf_hi, eopt.conf_lo,
+                                       eopt.hdd_lead, &ferr)) {
                 printf("  OTKAZ predzagruzki: %s\n", ferr.c_str());
                 estore.reset();
                 return false;
@@ -7532,6 +7612,10 @@ int main(int argc, char** argv) {
                        ? "SINHRONNYJ v uzle (A/B: chtenie NE prjachetsja, potok grafa stoit)"
                        : "ASINHRONNYJ (I/O-potok, chtenie na fone K sloev, promah zhdjot v "
                          "tochke ispolzovanija)");
+            printf("    DVA POROGA: conf-hi %.3f (rang < hi => ljuboj uroven), conf-lo %.3f "
+                   "(hi<=rang<lo => tolko HDD pri zapase polosy); hdd-lead %d sloev\n",
+                   estore->prefetch_conf_hi(), estore->prefetch_conf_lo(),
+                   estore->prefetch_hdd_lead());
         }
         esp = estore.get();
         return true;
