@@ -23,7 +23,13 @@ set(MEMEX_KV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../memex-kv")
 # memex-fwd.cpp (the names HParams/Graph/Weights/DeltaState do not appear in
 # them at all), so they compile in a library with zero header surgery.
 # ============================================================================
-set(MEMEX_CORE_SRC resident_set.cpp expert_store.cpp)
+# Refactor step 1 adds two more self-contained translation units, both ggml-only (no llama,
+# no memex-fwd structures):
+#   ggml_util.cpp  - norm / fnorm / report_first_nonfinite, the pure ggml graph helpers.
+#   sampler.cpp    - top2_gap / argmax_of / compare_logits; Sampling/Sampler live inline in
+#                    sampler.hpp. The token type is written as its underlying int32_t so the
+#                    library needs no llama include. Behaviour byte-for-byte the originals.
+set(MEMEX_CORE_SRC resident_set.cpp expert_store.cpp ggml_util.cpp sampler.cpp)
 
 # The GPU half needs a ggml that has the Vulkan backend in it, which is a property of the
 # build tree and not of this directory: build-vk has it and build does not, and the same

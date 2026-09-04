@@ -179,6 +179,21 @@ using ZonedKvCache = memex::ZonedCache;
 struct ZonedKvCache;
 #endif
 
+// Refactor step 1: the pure ggml graph helpers and the token sampler / logit-comparison
+// helpers now live in memex_core. Included here and pulled into scope so every call site
+// below - and in main(), which sits outside the anonymous namespace - resolves unchanged.
+#include "ggml_util.hpp"
+#include "sampler.hpp"
+using memex::norm;
+using memex::fnorm;
+using memex::report_first_nonfinite;
+using memex::Sampling;
+using memex::Sampler;
+using memex::top2_gap;
+using memex::argmax_of;
+using memex::LogitCmp;
+using memex::compare_logits;
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -702,28 +717,6 @@ void print_present_tensors(const char* path, const char* filter) {
 // product reduces over positions.
 int pad32(int n) { return (n + 31) / 32 * 32; }
 
-// RMS norm followed by the learned scale, which is what every llama-family norm is.
-ggml_tensor* norm(ggml_context* c, ggml_tensor* x, ggml_tensor* w, float eps) {
-    return ggml_mul(c, ggml_rms_norm(c, x, eps), w);
-}
-
-// The same thing as one op, which is what the reference's llm_build_norm actually calls
-// (llama-build-context.cpp: LLM_NORM_RMS with a weight goes to ggml_fused_rms_norm).
-//
-// It matters that it is the same OP and not merely the same arithmetic. The fused kernel
-// computes (scale*w[j])*x[j] and the pair above computes (scale*x[j])*w[j]; in f32 those
-// differ in the last bit, which is harmless on its own and is exactly the kind of harmless
-// that compounds through thirty layers into a divergence nobody can attribute afterwards.
-// This project has already lost days to a 3-6% logit difference that turned out to be pure
-// reassociation, so the two new architectures are built out of the reference's own ops
-// wherever one exists.
-//
-// norm() above is deliberately left alone: the qwen3moe path is verified against the
-// reference with it, and re-verifying that is a separate job from landing two architectures.
-ggml_tensor* fnorm(ggml_context* c, ggml_tensor* x, ggml_tensor* w, float eps) {
-    return ggml_fused_rms_norm(c, x, w, eps);
-}
-
 // The output head, on whichever processor owns it.
 //
 // One function rather than a conditional at each site, because the two qwen3moe builders
@@ -731,59 +724,6 @@ ggml_tensor* fnorm(ggml_context* c, ggml_tensor* x, ggml_tensor* w, float eps) {
 // same quantity, from the same input, that ggml_mul_mat would have. `cur` is the already
 // normalised hidden state in both, F32 and contiguous, and the returned tensor is
 // [n_vocab, n_rows] F32 either way - so every consumer of g->logits is unchanged.
-// First non-finite probe in a graph, by name - and TWO of them, because one of the two is
-// routinely a false alarm.
-//
-// `kq-<il>` is the raw Q.K product over the WHOLE cache extent, including positions the prefill
-// never wrote: that memory is not zeroed, so a NaN there is normal and the mask kills it in the
-// softmax that follows. Reporting it as "the first non-finite tensor" sends the reader into the
-// attention block when the fault is three hundred lines further down. So the scan reports the
-// first non-finite overall AND the first among the quantities that MUST be finite.
-//
-// Discovered the hard way: the locator's first use named kq-1 in a graph whose real defect was
-// elsewhere, and the probe counter added the same hour showed why nobody had noticed - kq is one
-// of twelve names the reference never emits, so it had never once been compared.
-static void report_first_nonfinite(const char* what,
-                                   const std::vector<std::pair<std::string, ggml_tensor*>>& probes) {
-    if (probes.empty()) return;
-    auto is_premask_score = [](const std::string& nm) {
-        return nm.rfind("kq-", 0) == 0 || nm.rfind("q-", 0) == 0;
-    };
-    std::vector<float> pv;
-    std::string first_any, first_must;
-    std::size_t idx_any = 0, idx_must = 0, n_any = 0, n_must = 0;
-    float val_any = 0.0f, val_must = 0.0f;
-    for (const auto& pr : probes) {
-        const std::size_t np = std::size_t(ggml_nelements(pr.second));
-        pv.resize(np);
-        ggml_backend_tensor_get(pr.second, pv.data(), 0, np * sizeof(float));
-        for (std::size_t q = 0; q < np; ++q) {
-            if (std::isfinite(pv[q])) continue;
-            if (first_any.empty()) {
-                first_any = pr.first; idx_any = q; n_any = np; val_any = pv[q];
-            }
-            if (first_must.empty() && !is_premask_score(pr.first)) {
-                first_must = pr.first; idx_must = q; n_must = np; val_must = pv[q];
-            }
-            break;
-        }
-        if (!first_must.empty()) break;
-    }
-    if (first_any.empty()) {
-        printf("  %s: vse %zu zondov finitny\n", what, probes.size());
-        return;
-    }
-    printf("  %s: pervyj nefinitnyj VOOBSHCHE - %s (element %zu iz %zu, %g)\n",
-           what, first_any.c_str(), idx_any, n_any, val_any);
-    if (first_must.empty()) {
-        printf("  %s: sredi velichin, OBJAZANNYH byt konechnymi, nefinitnyh net - NaN vyshe "
-               "sidit v syrom kq do maski i eto normalno\n", what);
-    } else {
-        printf("  %s: pervyj nefinitnyj sredi OBJAZATELNYH - %s (element %zu iz %zu, %g)\n",
-               what, first_must.c_str(), idx_must, n_must, val_must);
-    }
-}
-
 ggml_tensor* head_matmul(ggml_context* c, ggml_tensor* out_w, ggml_tensor* cur,
                          memex::GpuStatic* gstat) {
 #ifdef MEMEX_FWD_GPU_EXPERTS
@@ -4619,190 +4559,6 @@ void report(const char* what, const std::vector<float>& ours,
 }
 
 // ---------------------------------------------------------------------------------------
-// Sampling
-// ---------------------------------------------------------------------------------------
-
-// Ours, over our own logits. Not a choice of taste: llama's sampler chain hangs off a
-// llama_context, and the generation path here deliberately never creates one - the reference
-// context that exists for the logit comparison is torn down before generation matters and is
-// absent entirely under --no-ref. So the fifty lines below are the price of not calling
-// llama_decode, and they are the same fifty lines llama's own samplers are.
-//
-// The default is plain greedy and it takes its own branch on purpose. Every change in this
-// project is guarded by comparing twenty-four generated tokens against the previous binary,
-// and that comparison is worth something only while the default path still reaches
-// std::max_element over untouched logits - not a temperature-1 softmax that happens to have
-// the same argmax.
-struct Sampling {
-    float temp = 0.0f;             // 0 or below is greedy
-    int   top_k = 0;               // 0 means the whole vocabulary
-    float top_p = 1.0f;
-    float min_p = 0.0f;
-    float repeat_penalty = 1.0f;
-    int   repeat_last_n = 64;
-    uint64_t seed = 1234;          // fixed, never clock-derived: a default run must repeat
-
-    bool plain_argmax() const { return temp <= 0.0f && repeat_penalty == 1.0f; }
-    bool stochastic() const { return temp > 0.0f; }
-};
-
-struct Sampler {
-    Sampling s;
-    std::mt19937_64 rng;
-    std::vector<float> work;       // penalised logits
-    std::vector<int> idx;          // candidate ids, sorted when a nucleus rule needs it
-
-    explicit Sampler(const Sampling& in) : s(in), rng(in.seed) {}
-
-    // llama.cpp's own rule: divide a positive logit and multiply a negative one, so the
-    // penalty always moves a token down instead of flipping its sign around zero.
-    void penalise(const std::vector<llama_token>& hist) {
-        if (s.repeat_penalty == 1.0f || s.repeat_last_n <= 0 || hist.empty()) return;
-        const size_t take = std::min(size_t(s.repeat_last_n), hist.size());
-        for (size_t i = hist.size() - take; i < hist.size(); ++i) {
-            const long long t = (long long)hist[i];
-            if (t < 0 || size_t(t) >= work.size()) continue;
-            float& l = work[size_t(t)];
-            l = l > 0.0f ? l / s.repeat_penalty : l * s.repeat_penalty;
-        }
-    }
-
-    // The distribution a draw would come from, over the whole vocabulary, zero outside the
-    // surviving candidate set. Produced explicitly rather than folded into the draw because
-    // speculative acceptance needs both models' distributions in hand, and one function
-    // producing both is the only way the acceptance test cannot be comparing two differently
-    // transformed things.
-    //
-    // Order is llama.cpp's: penalties, temperature, top-k, top-p, min-p. It matters - min-p
-    // is relative to the best surviving candidate, so moving it before top-p changes the set.
-    bool dist(const std::vector<float>& logits, const std::vector<llama_token>& hist,
-              std::vector<float>* out) {
-        if (logits.empty()) {
-            printf("сэмплер: пустой вектор логитов\n");
-            return false;
-        }
-        work = logits;
-        penalise(hist);
-
-        const float lmax = *std::max_element(work.begin(), work.end());
-        if (!std::isfinite(lmax)) {
-            printf("сэмплер: логиты не конечны (max %g)\n", double(lmax));
-            return false;
-        }
-        const float inv_t = 1.0f / (s.temp > 0.0f ? s.temp : 1.0f);
-        out->assign(work.size(), 0.0f);
-        double sum = 0.0;
-        // Candidates are the ids whose exponential did not underflow to zero. That is an
-        // exact statement about float arithmetic, not a heuristic cutoff: a token whose
-        // probability is exactly zero cannot be drawn and cannot enter a nucleus.
-        idx.clear();
-        for (size_t i = 0; i < work.size(); ++i) {
-            const float e = std::exp((work[i] - lmax) * inv_t);
-            (*out)[i] = e;
-            if (e > 0.0f) {
-                sum += double(e);
-                idx.push_back(int(i));
-            }
-        }
-        if (!(sum > 0.0) || idx.empty()) {
-            printf("сэмплер: вся вероятностная масса обнулилась\n");
-            return false;
-        }
-        for (int i : idx) (*out)[size_t(i)] = float(double((*out)[size_t(i)]) / sum);
-
-        const bool need_order = (s.top_k > 0 && size_t(s.top_k) < idx.size()) || s.top_p < 1.0f;
-        if (need_order) {
-            std::sort(idx.begin(), idx.end(), [&](int a, int b) {
-                if ((*out)[size_t(a)] != (*out)[size_t(b)]) {
-                    return (*out)[size_t(a)] > (*out)[size_t(b)];
-                }
-                return a < b;   // a stable tie-break, so the nucleus is well defined
-            });
-        }
-        size_t keep = idx.size();
-        if (s.top_k > 0 && size_t(s.top_k) < keep) keep = size_t(s.top_k);
-        if (s.top_p < 1.0f) {
-            double c = 0.0;
-            size_t k = 0;
-            while (k < keep) {
-                c += double((*out)[size_t(idx[k])]);
-                ++k;
-                if (c >= double(s.top_p)) break;
-            }
-            keep = std::max<size_t>(1, k);
-        }
-        for (size_t i = keep; i < idx.size(); ++i) (*out)[size_t(idx[i])] = 0.0f;
-        idx.resize(keep);
-
-        if (s.min_p > 0.0f) {
-            float best = 0.0f;
-            for (int i : idx) best = std::max(best, (*out)[size_t(i)]);
-            const float floor_p = s.min_p * best;
-            size_t w = 0;
-            for (size_t i = 0; i < idx.size(); ++i) {
-                if ((*out)[size_t(idx[i])] >= floor_p) {
-                    idx[w++] = idx[i];
-                } else {
-                    (*out)[size_t(idx[i])] = 0.0f;
-                }
-            }
-            // Never empty: min_p is relative to the best candidate, so the best always
-            // survives its own threshold - but an all-zero set would be a silent hang, so it
-            // is asserted rather than assumed.
-            if (w == 0) {
-                printf("сэмплер: min-p %.4f не оставил ни одного кандидата\n",
-                       double(s.min_p));
-                return false;
-            }
-            idx.resize(w);
-        }
-
-        double renorm = 0.0;
-        for (int i : idx) renorm += double((*out)[size_t(i)]);
-        if (!(renorm > 0.0)) {
-            printf("сэмплер: после отсечения сумма вероятностей нулевая\n");
-            return false;
-        }
-        for (int i : idx) (*out)[size_t(i)] = float(double((*out)[size_t(i)]) / renorm);
-        return true;
-    }
-
-    // Inverse-CDF draw over the surviving candidates, in the order `idx` currently holds -
-    // which is the order dist() left them in, so a given seed and a given logit vector always
-    // produce the same token.
-    llama_token draw(const std::vector<float>& probs) {
-        std::uniform_real_distribution<double> u(0.0, 1.0);
-        const double r = u(rng);
-        double c = 0.0;
-        for (int i : idx) {
-            c += double(probs[size_t(i)]);
-            if (r < c) return llama_token(i);
-        }
-        return llama_token(idx.back());   // only reachable through rounding of the last cell
-    }
-
-    llama_token pick(const std::vector<float>& logits, const std::vector<llama_token>& hist,
-                     bool* ok) {
-        *ok = true;
-        if (s.plain_argmax()) {
-            return llama_token(std::max_element(logits.begin(), logits.end()) -
-                               logits.begin());
-        }
-        work = logits;
-        penalise(hist);
-        if (!s.stochastic()) {
-            return llama_token(std::max_element(work.begin(), work.end()) - work.begin());
-        }
-        std::vector<float> p;
-        if (!dist(logits, hist, &p)) {
-            *ok = false;
-            return 0;
-        }
-        return draw(p);
-    }
-};
-
-// ---------------------------------------------------------------------------------------
 // The byte budget
 // ---------------------------------------------------------------------------------------
 
@@ -5420,117 +5176,6 @@ bool apply_chat(const std::string& tmpl, const std::vector<ChatMsg>& msgs, bool 
 // ---------------------------------------------------------------------------------------
 // The generation loop
 // ---------------------------------------------------------------------------------------
-
-// How much the winning logit won by. A greedy sequence can diverge from the reference on a
-// near-tie without anything being wrong, and after the fact that is indistinguishable from a
-// real fault - so the margin is recorded as it is produced, per step.
-double top2_gap(const std::vector<float>& v) {
-    float best = -INFINITY, second = -INFINITY;
-    for (float x : v) {
-        if (x > best) { second = best; best = x; }
-        else if (x > second) { second = x; }
-    }
-    return double(best) - double(second);
-}
-
-int argmax_of(const std::vector<float>& v) {
-    return int(std::max_element(v.begin(), v.end()) - v.begin());
-}
-
-// The logit comparison, lifted verbatim in definition from examples/memex-test
-// (compare_logits / LogitCmp there) rather than reinvented, because a second definition of
-// the same metric is a second number to argue about. The one that decides anything is
-// flip_margin: twice the largest absolute difference inside the reference's own top-100,
-// over the reference's own top-2 gap. Under one, the argmax cannot move - that is a proof,
-// not a threshold, and it is the reason this file can say "the token is safe" about an
-// approximation rather than "the error looked small".
-//
-// Relative L2 over the whole vocabulary is reported too and should not be read as alarming:
-// softmax is invariant to an additive shift, so any constant offset lands in the numerator
-// while changing no probability, and the denominator averages over ~150k tokens no sampler
-// will ever reach.
-struct LogitCmp {
-    bool ok = false;
-    const char* why = "";
-    std::size_t n_ours = 0, n_ref = 0;
-    double rel_full = -1.0;
-    double rel_top100 = -1.0;
-    double max_abs_top = 0.0;
-    double gap = 0.0;
-    double flip_margin = -1.0;
-    double norm_ours = 0.0, norm_ref = 0.0;
-    int argmax_ours = -1, argmax_ref = -1;
-};
-
-LogitCmp compare_logits(const std::vector<float>& ours, const std::vector<float>& ref) {
-    LogitCmp r;
-    r.n_ours = ours.size();
-    r.n_ref = ref.size();
-    if (ours.empty() || ref.empty()) {
-        r.why = "пустой операнд";
-        return r;
-    }
-    // Refused, not truncated and not broadcast. A comparison against a wrong-shaped or
-    // all-zero reference has read as a perfect match in this project before, so both are
-    // refusals rather than numbers.
-    if (ours.size() != ref.size()) {
-        r.why = "размеры не совпадают";
-        return r;
-    }
-    const std::size_t n = ref.size();
-    double num = 0.0, den = 0.0, sq_ours = 0.0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const double a = double(ours[i]);
-        const double b = double(ref[i]);
-        if (!std::isfinite(a) || !std::isfinite(b)) {
-            r.why = "NaN или бесконечность в данных";
-            return r;
-        }
-        const double d = a - b;
-        num += d * d;
-        den += b * b;
-        sq_ours += a * a;
-    }
-    r.norm_ours = std::sqrt(sq_ours);
-    r.norm_ref = std::sqrt(den);
-    if (!(den > 0.0)) {
-        r.why = "норма эталона равна нулю — сравнивать не с чем";
-        return r;
-    }
-    if (!(sq_ours > 0.0)) {
-        r.why = "норма нашего вектора равна нулю — мы ничего не посчитали";
-        return r;
-    }
-    r.rel_full = std::sqrt(num / den);
-
-    // The reference's own ordering picks the candidate set: those are the entries a sampler
-    // can reach, and the only ones whose error can change the emitted token.
-    const int kmax = int(std::min<std::size_t>(n, 100));
-    std::vector<int> ids;
-    ids.assign(n, 0);
-    for (std::size_t i = 0; i < n; ++i) ids[i] = int(i);
-    std::partial_sort(ids.begin(), ids.begin() + kmax, ids.end(), [&](int a, int b) {
-        if (ref[std::size_t(a)] != ref[std::size_t(b)]) {
-            return ref[std::size_t(a)] > ref[std::size_t(b)];
-        }
-        return a < b;   // a stable tie-break, so the set is well defined
-    });
-    double tn = 0.0, td = 0.0;
-    for (int i = 0; i < kmax; ++i) {
-        const std::size_t id = std::size_t(ids[std::size_t(i)]);
-        const double d = double(ours[id]) - double(ref[id]);
-        tn += d * d;
-        td += double(ref[id]) * double(ref[id]);
-        if (std::abs(d) > r.max_abs_top) r.max_abs_top = std::abs(d);
-    }
-    if (td > 0.0) r.rel_top100 = std::sqrt(tn / td);
-    r.gap = top2_gap(ref);
-    if (r.gap > 0.0) r.flip_margin = 2.0 * r.max_abs_top / r.gap;
-    r.argmax_ours = argmax_of(ours);
-    r.argmax_ref = argmax_of(ref);
-    r.ok = true;
-    return r;
-}
 
 struct GenStats {
     double prefill_ms = 0.0;
