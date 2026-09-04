@@ -10,6 +10,16 @@
 #include <unordered_set>
 #include <algorithm>
 
+// MemeX: GPU-rezidentnaja golova (mehanizm gpu_static::head) podkljuchaetsja kak opcija.
+// Zavisit tolko ot ggml (sm. gpu_static.hpp). Dostupna tolko kogda memex_core slinkovan s
+// jadrom (MEMEX_HEAD_AVAILABLE stavit CMake pri GGML_VULKAN+LLAMA_BUILD_EXAMPLES) i sboroshka
+// s Vulkan (GGML_USE_VULKAN). V ljubom drugom dereve golova prosto otsutstvuet.
+#if defined(GGML_USE_VULKAN) && defined(MEMEX_HEAD_AVAILABLE)
+#include "gpu_static.hpp"
+#include <memory>
+#include <cstdlib>
+#endif
+
 uint32_t llm_build_context::llama_kv_qnext_state_slots(const llama_kv_cache & kv_self) {
     uint32_t n_slots = 0;
 
@@ -2671,6 +2681,71 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
     return cur;
 }
 
+#if defined(GGML_USE_VULKAN) && defined(MEMEX_HEAD_AVAILABLE)
+// ============================================================================
+// MemeX: golova na karte (gpu_static::head) kak OPCIJA servera/jadra.
+// Vkljuchaetsja env MEMEX_GPU_HEAD=1. Finalnyj vyhodnoj matmul v build_output
+// (nizhe, nerazdeljonnaja vetka) zamenjaetsja na memex::GpuStatic::head - te zhe
+// logity [n_vocab, n_tokens], schitannye na Vulkan-karte. Gejt: tolko odin slot
+// (--parallel 1 => n_seq_max==1) I ne[1]==1 (dekod odnoj posledovatelnosti),
+// inache shtatnyj put. Sm. docs/server_integration_map.md, mehanizm (a).
+// ============================================================================
+namespace memex_head {
+
+static bool env_on() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("MEMEX_GPU_HEAD");
+        v = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return v == 1;
+}
+
+// Init odin raz na pervom podhodjashchem dekode: geometrija i vyhodnoj ves izvestny tolko
+// posle zagruzki modeli - rovno kak v harnesse (memex-fwd.cpp:7233). Pri ljuboj neudache
+// vozvrashchaet nullptr, i vyzyvajushchij tiho beret shtatnyj llm_build_lora_mm.
+static memex::GpuStatic * get(llama_context & lctx, ggml_tensor * output) {
+    static bool tried = false;
+    static memex::GpuStatic * gs = nullptr;
+    if (tried) return gs;
+    tried = true;
+
+    if (lctx.cparams.n_seq_max > 1) {
+        fprintf(stderr, "MemeX GPU-head: OTKAZ - golova na karte trebuet odnogo slota "
+                        "(--parallel 1), a n_seq_max=%u. Ostajus na shtatnom puti.\n",
+                (unsigned) lctx.cparams.n_seq_max);
+        return nullptr;
+    }
+    if (!output) {
+        fprintf(stderr, "MemeX GPU-head: net vyhodnogo tenzora - shtatnyj put.\n");
+        return nullptr;
+    }
+
+    memex::GpuStaticConfig sc;
+    sc.n_embd   = (int) lctx.model.hparams.n_embd;
+    sc.n_vocab  = (int) lctx.model.hparams.n_vocab;
+    sc.max_rows = 8;
+    sc.head     = true;
+    sc.layers   = false;
+
+    memex::GpuStatic * g = new memex::GpuStatic();
+    std::string err;
+    if (!g->init(sc, output, &err)) {
+        fprintf(stderr, "MemeX GPU-head: init ne udalsja (%s). Shtatnyj put. Golova dolzhna "
+                        "byt dostupna hostu - zapustite s -ot output.weight=CPU.\n",
+                err.c_str());
+        delete g;
+        return nullptr;
+    }
+    gs = g;
+    fprintf(stderr, "MemeX GPU-head: golova na karte '%s' (n_vocab=%d, n_embd=%d, tip %s)\n",
+            gs->device_name().c_str(), sc.n_vocab, sc.n_embd, gs->head_type_name());
+    return gs;
+}
+
+}  // namespace memex_head
+#endif
+
 ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
         ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name) {
     // lm_head
@@ -2724,6 +2799,19 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
                 cb(cur, "result_norm", -1);
             }
         }
+#if defined(GGML_USE_VULKAN) && defined(MEMEX_HEAD_AVAILABLE)
+        // MemeX: golova na karte. Gejt - odin token (dekod odnoj posledovatelnosti); prefill
+        // (ne[1]>1) i multislot idut shtatnym matmulom. cur zdes uzhe normirovan i F32 -
+        // rovno to, chto GpuStatic::head zhdjot vmesto ggml_mul_mat(output, cur).
+        if (memex_head::env_on() && cur->ne[1] == 1) {
+            memex::GpuStatic * gs = memex_head::get(lctx, output);
+            if (gs && gs->head_on()) {
+                cur = gs->head(ctx, cur);
+            } else {
+                cur = llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);
+            }
+        } else
+#endif
         cur = llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);
     }
     return cur;

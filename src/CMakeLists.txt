@@ -142,6 +142,17 @@ target_compile_features   (llama PUBLIC cxx_std_17)
 
 target_link_libraries(llama PUBLIC ggml)
 
+# MemeX: golova na karte (gpu_static::head) vstraivaetsja v build_output (llama-build-context.cpp).
+# Kod zhivjot vnutri biblioteki llama, poetomu imenno llama linkuet memex_core (nashu biblioteku
+# mehanizmov, zavisit tolko ot ggml; sm. examples/memex-fwd/CMakeLists.txt). Cel memex_core opredeljona
+# v podkataloge examples/memex-fwd, kotoryj dobavljaetsja pozzhe - CMake razreshaet ssylku na cel,
+# opredeljonnuju dalshe. Tolko pod Vulkan (togda u memex_core est gpu_static.cpp) i tolko kogda primery
+# sobirajutsja (inache celi memex_core net). MEMEX_HEAD_AVAILABLE vkljuchaet #if-vetku golovy v kode.
+if (GGML_VULKAN AND LLAMA_BUILD_EXAMPLES)
+    target_link_libraries(llama PRIVATE memex_core)
+    target_compile_definitions(llama PRIVATE MEMEX_HEAD_AVAILABLE)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_SHARED LLAMA_BUILD)

@@ -81,6 +81,14 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_link_libraries(${TARGET} PRIVATE common mtmd cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
+# MemeX: slinkovat biblioteku mehanizmov s serverom, chtoby servernyj kod mog zvat memex::GpuStatic
+# i dr. naprjamuju (sm. docs/server_integration_map.md). Sama golova podkljuchaetsja vnutri llama.dll
+# (build_output), no eta linkovka otkryvaet put ostalnym mehanizmam (hranilishche/predskazatel/KV) v
+# servernom sloe. memex_core zavisit tolko ot ggml. Tolko pod Vulkan i kogda primery sobirajutsja.
+if (GGML_VULKAN AND LLAMA_BUILD_EXAMPLES)
+    target_link_libraries(${TARGET} PRIVATE memex_core)
+endif()
+
 if (LLAMA_SERVER_SSL)
     find_package(OpenSSL REQUIRED)
     target_link_libraries(${TARGET} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
