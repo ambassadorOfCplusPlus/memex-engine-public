@@ -1181,6 +1181,24 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// ---------------------------------------------------------------- MemeX, shag 4
+// To zhe samoe, no "GB/s" v rezhime perf schitajutsja TOLKO po vesam src0.
+//
+// Zachem otdelnyj klass. Bazovyj op_size u test_mul_mat schitaet
+//   a = nbytes(src0)*n*nr0*nr1,  b = nbytes(src1)*m,  c = nbytes(dst)
+// to est umnozhaet vektor src1 na chislo strok m. Pri m = 196608 i k = 2048 eto 1,5 GiB
+// vydumannogo trafika poverh 315 MiB nastojashchih vesov, i pechataemaja polosa okazyvaetsja
+// zavyshena v shest raz. Dlja matvektora edinstvennyj chestnyj znamenatel - vesa: imenno ih
+// karta objazana prochitat celikom, vsjo ostalnoe (8 KiB vhoda, 0,8 MiB vyhoda) - okruglenie.
+struct test_mul_mat_w : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+
+    size_t op_size(ggml_tensor * t) override {
+        return ggml_nbytes(t->src[0]);
+    }
+};
+// ---------------------------------------------------------------- MemeX end
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -2540,6 +2558,109 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     // Sluchaja s nulevymi sekcijami zdes NET namerenno: ggml_rope_multi v etom dereve padaet
     // na GGML_ASSERT(sections[0] > 0 || sections[1] > 0 || sections[2] > 0) (ggml.c:21050),
     // to est tekstovaja forma cherez rope_multi zapreshchena samim ggml, a ne bekendom.
+    // ---------------------------------------------------------------- MemeX end
+
+    // ---------------------------------------------------------------- MemeX, shag 4: mul_mat_vec
+    // Sverka na formah, blizkih k statike Coder Next: k = 2048 (n_embd) i k = 4096
+    // (ssm inner). Melkie sluchai 16x1x256 nizhe trogajut tolko odin superblok na stroku i
+    // NE trogajut ni ostatok strok, ni polnyj put po blokam - a menjaem my imenno chislo
+    // strok na rabochuju gruppu. m = 513 vybrano nekratnym ljubomu rm, chtoby vetka
+    // "strok menshe, chem NUM_ROWS" ispolnjalas.
+    for (ggml_type type_a : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 1, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 513, 1, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 1, 4096, {1, 1}, {1, 1}));
+    }
+
+    // Zamer polosy matvektora. Vsjo, chto zdes vazhno znat pro razmery:
+    //
+    //   1. BAR-okno etoj karty 256 MiB, a ggml_vk_create_buffer_device SNACHALA prosit
+    //      DEVICE_LOCAL|HOST_VISIBLE (stroka "use rebar if available"). Poetomu ljuboj bufer
+    //      do 256 MiB ljozhet v BAR i chitaetsja 3,1 GB/s vmesto 127 - zamer na formah
+    //      samoj modeli (13,8 MB u attn_qkv) meril by ne to, chto schitaet karta v dvizhke,
+    //      gde bufera sloev po 797 MiB. Poetomu m podobrano tak, chtoby vesa byli >256 MiB;
+    //      podtverzhdenie v vyvode - stroka "prosil host-visible, poluchil tolko device-local".
+    //   2. U karty 16 MiB Infinity Cache. Vesa menshe etogo v cikle perf (odin i tot zhe uzel
+    //      povtorjaetsja sotni raz) chitalis by iz kesha, i polosa vyshla by vyshe potolka
+    //      VRAM. 315 MiB ne keshiruetsja.
+    //
+    // k sohranjono nastojashchee (2048 i 4096), potomu chto ot nego zavisit chislo blokov na
+    // stroku; m razdut - on vlijaet tolko na chislo rabochih grupp.
+    if (mode == MODE_PERF) {
+        struct memex_mmv_case { ggml_type type; int64_t m; int64_t k; };
+        static const memex_mmv_case memex_mmv_cases[] = {
+            { GGML_TYPE_Q6_K, 196608, 2048 },   // 315,0 MiB
+            { GGML_TYPE_Q6_K,  98304, 4096 },   // 315,0 MiB
+            { GGML_TYPE_Q8_0, 147456, 2048 },   // 306,0 MiB
+            { GGML_TYPE_Q8_0,  73728, 4096 },   // 306,0 MiB
+            { GGML_TYPE_Q4_0, 294912, 2048 },   // 324,0 MiB
+            { GGML_TYPE_Q4_K, 262144, 2048 },   // 288,0 MiB
+            { GGML_TYPE_F16,   81920, 2048 },   // 320,0 MiB - kontrol bez dekvantizacii
+        };
+        for (const auto & c : memex_mmv_cases) {
+            test_cases.emplace_back(new test_mul_mat_w(c.type, GGML_TYPE_F32, c.m, 1, c.k, {1, 1}, {1, 1}));
+        }
+
+        // ROVNO formy statiki Coder Next, no razmnozhennye po tretjemu izmereniju.
+        // Zachem tak. Sami po sebe eti matricy 7-14 MB, to est menshe 16 MiB Infinity Cache
+        // etoj karty, i v cikle perf oni chitalis by iz kesha: kontrolnyj zamer dal
+        // 800-1160 GB/s na 5-10 MB, vshestero vyshe potolka VRAM. bs = {N,1} daet N RAZNYH
+        // matric toj zhe formy v odnom vyzove (mul_mat_vec beryot ih batchem, ne[1] po-prezhnemu
+        // 1), summa >300 MiB - keshu ne po zubam, a geometrija stroki i chislo blokov na stroku
+        // te zhe, chto v modeli.
+        struct memex_mmv_batched { ggml_type type; int64_t m; int64_t k; int64_t nb; const char * what; };
+        static const memex_mmv_batched memex_mmv_batched_cases[] = {
+            { GGML_TYPE_Q6_K, 8192, 2048, 24, "attn_qkv 13,12 MiB" },
+            { GGML_TYPE_Q6_K, 4096, 2048, 48, "gate 6,56 MiB"      },
+            { GGML_TYPE_Q6_K, 2048, 4096, 48, "ssm_out 6,56 MiB"   },
+            { GGML_TYPE_Q8_0, 8192, 2048, 24, "attn_qkv v q8_0"    },
+            { GGML_TYPE_Q8_0, 4096, 2048, 48, "gate v q8_0"        },
+            { GGML_TYPE_Q8_0, 2048, 4096, 48, "ssm_out v q8_0"     },
+        };
+        for (const auto & c : memex_mmv_batched_cases) {
+            test_cases.emplace_back(new test_mul_mat_w(c.type, GGML_TYPE_F32, c.m, 1, c.k, {c.nb, 1}, {1, 1}));
+        }
+
+        // ne[1] > 1: tot zhe mul_mat_vec, no s NUM_COLS = ne[1] (do 8). Vesa chitajutsja ODIN
+        // raz na vse stolbcy, poetomu "GB/s po vesam" zdes - ne polosa pamjati, a to, naskolko
+        // blizko jadro derzhitsja k nej pri roste registrovogo davlenija: temp[NUM_COLS][NUM_ROWS]
+        // plus NUM_COLS vektorov B v registrah.
+        //
+        // ZACHEM eto zdes. Istoricheskij zamer golovy v gpu_static.cpp (kommentarij okolo stroki
+        // 694) dal "243 MB pri okolo 50 GB/s" - i on snjat na PREFILLE, gde riadov vosem. Zamer
+        // dekoda v STATE.md dal 2,049 ms i 119 GB/s na toj zhe golove. Esli mnogostolbcovyj put
+        // dejstvitelno vdvoe-vtroe nizhe potolka, to rashozhdenie ob'jasneno i lezhit imenno zdes.
+        for (int64_t ncols : {2, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat_w(GGML_TYPE_Q6_K, GGML_TYPE_F32, 196608, ncols, 2048, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_w(GGML_TYPE_Q8_0, GGML_TYPE_F32, 147456, ncols, 2048, {1, 1}, {1, 1}));
+        }
+
+        // KONTROL: te zhe formy, no vesa MENSHE 16 MiB Infinity Cache, to est chtenija iz
+        // VRAM posle pervogo progona net vovse. Eto edinstvennyj sposob otdelit "jadro upiraetsja
+        // v pamjat" ot "jadro upiraetsja v sebja": esli keshirovannyj sluchaj dajot te zhe
+        // ~128 GB/s, potolok stavit jadro; esli sushchestvenno bolshe - potolok stavit VRAM.
+        // m vzjato tak, chtoby rabochih grupp byli tysjachi (na m = 512 zamer byl by pro zapusk).
+        test_cases.emplace_back(new test_mul_mat_w(GGML_TYPE_Q6_K, GGML_TYPE_F32,  8192, 1, 2048, {1, 1}, {1, 1})); // 13,4 MiB
+        test_cases.emplace_back(new test_mul_mat_w(GGML_TYPE_Q6_K, GGML_TYPE_F32,  4096, 1, 2048, {1, 1}, {1, 1})); //  6,7 MiB
+        test_cases.emplace_back(new test_mul_mat_w(GGML_TYPE_Q6_K, GGML_TYPE_F32,  2048, 1, 4096, {1, 1}, {1, 1})); //  6,7 MiB
+        test_cases.emplace_back(new test_mul_mat_w(GGML_TYPE_Q8_0, GGML_TYPE_F32,  4096, 1, 2048, {1, 1}, {1, 1})); //  8,5 MiB
+        test_cases.emplace_back(new test_mul_mat_w(GGML_TYPE_Q8_0, GGML_TYPE_F32,  2048, 1, 4096, {1, 1}, {1, 1})); //  8,5 MiB
+        // I te zhe keshirovannye formy pri ne[1] = 8 - proverka, chto obval mnogostolbcovogo
+        // puti ne pro VRAM: vesa v keshe, a padenie dolzhno ostatsja.
+        test_cases.emplace_back(new test_mul_mat_w(GGML_TYPE_Q6_K, GGML_TYPE_F32,  8192, 8, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_w(GGML_TYPE_Q8_0, GGML_TYPE_F32,  4096, 8, 2048, {1, 1}, {1, 1}));
+    }
+
+    // MEMEX_MMV_ONLY - gonjat TOLKO to, chto dobavleno vyshe. Bez etogo `perf -o MUL_MAT`
+    // stroit i merjaet vse 1500 sluchaev dereva (dvenadcat minut na krug), a pri podbore
+    // parametrov shejdera krug nuzhen kazhdyj raz. Filtr `-o` ne pomogaet: eval_perf stroit
+    // graf KAZHDOGO sluchaja i tolko potom sravnivaet imja operacii.
+    if (mode == MODE_PERF && getenv("MEMEX_MMV_ONLY") != nullptr) {
+        for (auto & test : test_cases) {
+            test->eval_perf(backend, op_name);
+        }
+        return true;
+    }
     // ---------------------------------------------------------------- MemeX end
 
 #if 1
