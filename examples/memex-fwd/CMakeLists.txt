@@ -9,7 +9,10 @@ set(MEMEX_DIR "C:/Users/User11/Desktop/MemeX/cpp")
 set(MEMEX_KV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../memex-kv")
 # The resident expert set, by contrast, is unconditional: it is ours, it lives here, and it
 # needs nothing but ggml. Off by default at run time through --resident 0, not at build time.
-set(MEMEX_FWD_SRC memex-fwd.cpp resident_set.cpp)
+# The resident expert STORE (step 4) is the same story as resident_set: ours, local, and it
+# needs nothing but ggml - no Vulkan, because the bytes it holds are host RAM by definition.
+# Off by default at run time through --expert-store 0, not at build time.
+set(MEMEX_FWD_SRC memex-fwd.cpp resident_set.cpp expert_store.cpp)
 # The GPU half needs a ggml that has the Vulkan backend in it, which is a property of the
 # build tree and not of this directory: build-vk has it and build does not, and the same
 # source has to configure in both. --gpu-experts refuses at run time in the tree without it

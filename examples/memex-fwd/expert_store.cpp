@@ -1,0 +1,626 @@
+#include "expert_store.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <numeric>
+
+#if defined(_WIN32)
+// NOMINMAX objazatelen: windows.h objavljaet min i max MAKROSAMI, i togda std::min nizhe
+// razbiraetsja kak std::(...) - oshibka C2589 v strochke, kotoraja k Windows otnoshenija ne
+// imeet. Odin raz na etom uzhe stojali polchasa.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#endif
+
+// Repak zhivjot v ggml/src/iqk/iqk_quantize.h, kotoryj ne lezhit v puti vkljuchenij primerov.
+// Objavlenija zdes - te zhe samye, i oni pod extern "C", kak v samom zagolovke, tak chto
+// nesovpadenie signatury bylo by oshibkoj komponovki, a ne tihoj oshibkoj vyzova.
+extern "C" {
+void iqk_repack_tensor(struct ggml_tensor* tensor);
+int  iqk_repacked_type(const struct ggml_tensor* tensor);
+}
+
+namespace memex {
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double ms_since(Clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+}
+
+std::size_t align_up(std::size_t v, std::size_t a) {
+    return a ? ((v + a - 1) / a) * a : v;
+}
+
+// Opisatel sreza odnogo slota kak otdelnogo tenzora - dlja iqk_repack_tensor, kotoryj
+// prinimaet imenno ggml_tensor. Vsjo pole obnuljaetsja: imja dolzhno byt pustym (spisok
+// zapreshchennyh tenzorov u repaka sravnivaet imenno imja), view_src i buffer - nulevymi.
+ggml_tensor slice_descr(ggml_type base, const ggml_tensor* t, void* data) {
+    ggml_tensor d;
+    std::memset(&d, 0, sizeof(d));
+    d.type = base;
+    d.ne[0] = t->ne[0];
+    d.ne[1] = t->ne[1];
+    d.ne[2] = 1;
+    d.ne[3] = 1;
+    d.nb[0] = t->nb[0];
+    d.nb[1] = t->nb[1];
+    d.nb[2] = t->nb[2];
+    d.nb[3] = t->nb[2];
+    d.data = data;
+    return d;
+}
+
+}  // namespace
+
+ExpertStoreStats ExpertStoreStats::since(const ExpertStoreStats& b) const {
+    ExpertStoreStats d;
+    d.tokens      = tokens      - b.tokens;
+    d.picks       = picks       - b.picks;
+    d.hits        = hits        - b.hits;
+    d.sync_misses = sync_misses - b.sync_misses;
+    d.refreshes   = refreshes   - b.refreshes;
+    d.fills       = fills       - b.fills;
+    d.fill_bytes  = fill_bytes  - b.fill_bytes;
+    d.evictions   = evictions   - b.evictions;
+    d.ms_sync     = ms_sync     - b.ms_sync;
+    d.ms_fill     = ms_fill     - b.ms_fill;
+    d.ms_repack   = ms_repack   - b.ms_repack;
+    d.ms_map      = ms_map      - b.ms_map;
+    return d;
+}
+
+ProcMem proc_mem() {
+    ProcMem m;
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc;
+    std::memset(&pmc, 0, sizeof(pmc));
+    pmc.cb = sizeof(pmc);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        m.ok     = true;
+        m.rss    = uint64_t(pmc.WorkingSetSize);
+        m.peak   = uint64_t(pmc.PeakWorkingSetSize);
+        m.faults = uint64_t(pmc.PageFaultCount);
+    }
+#endif
+    return m;
+}
+
+ExpertStore::~ExpertStore() {
+    for (Layer& L : layers_) {
+        if (L.buf) ggml_backend_buffer_free(L.buf);
+        L.buf = nullptr;
+    }
+    if (ctx_) ggml_free(ctx_);
+    ctx_ = nullptr;
+}
+
+std::size_t ExpertStore::bytes_per_expert(const ggml_tensor* gate, const ggml_tensor* up,
+                                          const ggml_tensor* down) {
+    if (!gate || !up || !down) return 0;
+    return std::size_t(gate->nb[2]) + std::size_t(up->nb[2]) + std::size_t(down->nb[2]);
+}
+
+int ExpertStore::auto_capacity(uint64_t avail, uint64_t reserve, std::size_t bpe,
+                               int n_layer, int spares, int n_expert) {
+    if (bpe == 0 || n_layer <= 0) return 0;
+    if (avail <= reserve) return 0;
+    const double room = double(avail - reserve);
+    const double slots = room / (double(bpe) * double(n_layer));
+    int c = int(slots) - spares;
+    if (c < 0) c = 0;
+    if (c > n_expert) c = n_expert;
+    return c;
+}
+
+bool ExpertStore::init(const ExpertStoreConfig& cfg,
+                       const std::vector<const ggml_tensor*>& gate,
+                       const std::vector<const ggml_tensor*>& up,
+                       const std::vector<const ggml_tensor*>& down,
+                       std::string* err) {
+    cfg_ = cfg;
+    if (cfg_.capacity <= 0) return true;    // vykljucheno - i eto ne oshibka
+    if (int(gate.size()) != cfg_.n_layer || int(up.size()) != cfg_.n_layer ||
+        int(down.size()) != cfg_.n_layer) {
+        if (err) *err = "spisok tenzorov ekspertov ne po chislu sloev";
+        return false;
+    }
+    // Ёmkost ne bolshe chisla ekspertov: pri C == n_expert rezidentno VSJO, zapasnye sloty
+    // terjajut smysl, i promahu vzjatsja neotkuda.
+    if (cfg_.capacity >= cfg_.n_expert) {
+        cfg_.capacity = cfg_.n_expert;
+        cfg_.spares   = 0;
+    } else if (cfg_.spares < cfg_.n_used) {
+        // Zapasnyh dolzhno hvatat na hudshij token: do n_used promahov v odnom sloe, i ni
+        // odin iz nih ne imeet prava vytesnit slot, zapolnennyj na etom zhe tokene.
+        cfg_.spares = cfg_.n_used;
+    }
+    if (cfg_.capacity + cfg_.spares > cfg_.n_expert) {
+        cfg_.spares = cfg_.n_expert - cfg_.capacity;
+    }
+    n_slots_ = cfg_.capacity + cfg_.spares;
+
+    per_expert_ = bytes_per_expert(gate[0], up[0], down[0]);
+    if (per_expert_ == 0) {
+        if (err) *err = "razmer eksperta poluchilsja nulevym";
+        return false;
+    }
+
+    ggml_init_params ip = {};
+    ip.mem_size   = ggml_tensor_overhead() * std::size_t(3 * cfg_.n_layer + 8) + 4096;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    ctx_ = ggml_init(ip);
+    if (!ctx_) {
+        if (err) *err = "ggml_init dlja hranilishcha ne udalsja";
+        return false;
+    }
+
+    layers_.resize(std::size_t(cfg_.n_layer));
+    sites_.resize(std::size_t(cfg_.n_layer));
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    const std::size_t alg = ggml_backend_buft_get_alignment(buft);
+
+    for (int il = 0; il < cfg_.n_layer; ++il) {
+        Layer& L = layers_[std::size_t(il)];
+        sites_[std::size_t(il)].self = this;
+        sites_[std::size_t(il)].il   = il;
+        const ggml_tensor* sg = gate[std::size_t(il)];
+        const ggml_tensor* su = up[std::size_t(il)];
+        const ggml_tensor* sd = down[std::size_t(il)];
+        if (!sg || !su || !sd) {
+            if (err) *err = "u sloja " + std::to_string(il) + " net tenzora ekspertov";
+            return false;
+        }
+        // Nepreryvnost - uslovie kopirovanija po nb[2] i uslovie repaka. Pri mmap ona est;
+        // proverjaetsja imenno potomu, chto obratnoe dalo by pravdopodobnyj musor.
+        if (!ggml_is_contiguous(sg) || !ggml_is_contiguous(su) || !ggml_is_contiguous(sd)) {
+            if (err) *err = "tenzory ekspertov sloja " + std::to_string(il) + " ne nepreryvny";
+            return false;
+        }
+        if (sg->ne[2] != cfg_.n_expert || su->ne[2] != cfg_.n_expert ||
+            sd->ne[2] != cfg_.n_expert) {
+            if (err) *err = "tenzory ekspertov sloja " + std::to_string(il) +
+                            " ne po chislu ekspertov";
+            return false;
+        }
+        L.src_gate = sg; L.src_up = su; L.src_down = sd;
+        L.gate = ggml_new_tensor_3d(ctx_, sg->type, sg->ne[0], sg->ne[1], n_slots_);
+        L.up   = ggml_new_tensor_3d(ctx_, su->type, su->ne[0], su->ne[1], n_slots_);
+        L.down = ggml_new_tensor_3d(ctx_, sd->type, sd->ne[0], sd->ne[1], n_slots_);
+        if (!L.gate || !L.up || !L.down) {
+            if (err) *err = "tenzory hranilishcha sloja " + std::to_string(il) +
+                            " ne sozdalis";
+            return false;
+        }
+        ggml_set_name(L.gate, ("es.gate." + std::to_string(il)).c_str());
+        ggml_set_name(L.up,   ("es.up."   + std::to_string(il)).c_str());
+        ggml_set_name(L.down, ("es.down." + std::to_string(il)).c_str());
+        // Shag po ekspertu dolzhen sovpadat s istochnikom, inache kopija tri-kuska ljozhet
+        // ne tuda i dast pravdopodobnyj musor.
+        if (L.gate->nb[2] != sg->nb[2] || L.up->nb[2] != su->nb[2] ||
+            L.down->nb[2] != sd->nb[2]) {
+            if (err) *err = "shag po ekspertu v sloe " + std::to_string(il) +
+                            " ne sovpal s modelju";
+            return false;
+        }
+
+        const std::size_t nb_g = ggml_nbytes(L.gate);
+        const std::size_t nb_u = ggml_nbytes(L.up);
+        const std::size_t nb_d = ggml_nbytes(L.down);
+        const std::size_t need = align_up(nb_g, alg) + align_up(nb_u, alg) + nb_d;
+        L.buf = ggml_backend_buft_alloc_buffer(buft, need);
+        if (!L.buf) {
+            char b[192];
+            snprintf(b, sizeof(b),
+                     "pamjat pod sloj %d (%.2f GiB) ne vydelilas; vydeleno do etogo %.2f GiB",
+                     il, double(need) / 1073741824.0, double(bytes_) / 1073741824.0);
+            if (err) *err = b;
+            return false;
+        }
+        char* base = (char*)ggml_backend_buffer_get_base(L.buf);
+        std::size_t off = 0;
+        ggml_backend_tensor_alloc(L.buf, L.gate, base + off); off += align_up(nb_g, alg);
+        ggml_backend_tensor_alloc(L.buf, L.up,   base + off); off += align_up(nb_u, alg);
+        ggml_backend_tensor_alloc(L.buf, L.down, base + off);
+        bytes_ += need;
+
+        L.score.assign(std::size_t(cfg_.n_expert), 0.0f);
+        L.slot_of.assign(std::size_t(cfg_.n_expert), -1);
+        L.want.assign(std::size_t(cfg_.n_expert), 0);
+        L.seen.assign(std::size_t(cfg_.n_expert), 0);
+        L.id_of.assign(std::size_t(n_slots_), -1);
+        L.touched.assign(std::size_t(n_slots_), 0);
+        L.ring = 0;
+    }
+
+    // REPAK: reshaetsja odin raz i po SAMIM tipam, a ne po nazvaniju kvantizacii.
+    repacked_ = false;
+    if (cfg_.repack) {
+        const Layer& L0 = layers_[0];
+        const ggml_tensor* three[3] = {L0.gate, L0.up, L0.down};
+        std::string bad;
+        for (int k = 0; k < 3 && bad.empty(); ++k) {
+            const ggml_tensor* t = three[k];
+            ggml_tensor d = slice_descr(t->type, t, nullptr);
+            d.ne[2] = t->ne[2];
+            d.nb[3] = d.nb[2] * d.ne[2];
+            const ggml_type nt = (ggml_type)iqk_repacked_type(&d);
+            if (nt == t->type) {
+                bad = std::string("tip ") + ggml_type_name(t->type) +
+                      " repak ne podderzhivaet";
+            } else if (ggml_row_size(nt, t->ne[0]) != ggml_row_size(t->type, t->ne[0])) {
+                bad = std::string("u ") + ggml_type_name(nt) +
+                      " drugoj razmer stroki, chem u " + ggml_type_name(t->type);
+            }
+        }
+        if (bad.empty()) {
+            repacked_ = true;
+            repack_why_ = "vkljuchjon";
+        } else {
+            repack_why_ = "OTKAZAN: " + bad;
+        }
+    } else {
+        repack_why_ = "ne prosili";
+    }
+    token_ = 1;
+    return true;
+}
+
+bool ExpertStore::load_prior(const char* path, std::string* err) {
+    if (!on()) return true;
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        if (err) *err = std::string("fajl zatravki ne otkrylsja: ") + path;
+        return false;
+    }
+    int32_t hd[4] = {0, 0, 0, 0};
+    if (fread(hd, sizeof(int32_t), 4, f) != 4) {
+        fclose(f);
+        if (err) *err = "zagolovok zatravki ne prochitalsja";
+        return false;
+    }
+    if (hd[0] != 0x45585052) {
+        fclose(f);
+        if (err) *err = "eto ne fajl zatravki (net metki EXPR)";
+        return false;
+    }
+    if (hd[1] != cfg_.n_layer || hd[2] != cfg_.n_expert) {
+        fclose(f);
+        char b[160];
+        snprintf(b, sizeof(b), "zatravka na %d x %d, a model %d x %d", hd[1], hd[2],
+                 cfg_.n_layer, cfg_.n_expert);
+        if (err) *err = b;
+        return false;
+    }
+    std::vector<float> row(std::size_t(cfg_.n_expert));
+    for (int il = 0; il < cfg_.n_layer; ++il) {
+        if (fread(row.data(), sizeof(float), row.size(), f) != row.size()) {
+            fclose(f);
+            if (err) *err = "telo zatravki koroche zagolovka";
+            return false;
+        }
+        Layer& L = layers_[std::size_t(il)];
+        for (int e = 0; e < cfg_.n_expert; ++e) L.score[std::size_t(e)] += row[std::size_t(e)];
+    }
+    fclose(f);
+    return true;
+}
+
+void ExpertStore::observe_prefill(const int32_t* ids, int n_layer, int n_tokens, int n_used) {
+    if (!on() || !ids) return;
+    for (int il = 0; il < n_layer && il < cfg_.n_layer; ++il) {
+        Layer& L = layers_[std::size_t(il)];
+        const int32_t* p = ids + std::size_t(il) * std::size_t(n_tokens) * std::size_t(n_used);
+        for (int t = 0; t < n_tokens; ++t) {
+            for (int j = 0; j < n_used; ++j) {
+                const int32_t e = p[std::size_t(t) * std::size_t(n_used) + std::size_t(j)];
+                if (e < 0 || e >= cfg_.n_expert) continue;
+                L.score[std::size_t(e)] += 1.0f;
+                L.seen[std::size_t(e)] = 1;
+            }
+        }
+    }
+}
+
+void ExpertStore::fill_slot(Layer& L, int slot, int id) {
+    const int32_t old = L.id_of[std::size_t(slot)];
+    if (old >= 0) {
+        L.slot_of[std::size_t(old)] = -1;
+        st_.evictions++;
+    }
+    const auto t0 = Clock::now();
+    const ggml_tensor* src[3] = {L.src_gate, L.src_up, L.src_down};
+    ggml_tensor* dst[3] = {L.gate, L.up, L.down};
+    for (int k = 0; k < 3; ++k) {
+        const std::size_t nb2 = std::size_t(dst[k]->nb[2]);
+        std::memcpy((char*)dst[k]->data + std::size_t(slot) * nb2,
+                    (const char*)src[k]->data + std::size_t(id) * nb2, nb2);
+    }
+    st_.ms_fill += ms_since(t0);
+    st_.fills++;
+    st_.fill_bytes += per_expert_;
+    L.id_of[std::size_t(slot)] = id;
+    L.slot_of[std::size_t(id)] = slot;
+    L.touched[std::size_t(slot)] = token_;
+    // Pri pervichnoj zalivke sloty NE perepakovyvajutsja po odnomu: prime() perepakuet ves
+    // tenzor odnim vyzovom posle togo, kak vse sloty zapolneny. Bez etogo uslovija slot
+    // perepakovalsja by DVAZHDY - po odnomu i potom v sostave tenzora, - a repak ne
+    // idempotenten: vtoroj prohod prochital by uzhe pereplejotennye bajty kak ishodnye.
+    if (repacked_ && !bulk_) {
+        const auto t1 = Clock::now();
+        for (int k = 0; k < 3; ++k) {
+            ggml_tensor d = slice_descr(k == 2 ? L.src_down->type
+                                               : (k == 0 ? L.src_gate->type : L.src_up->type),
+                                        dst[k],
+                                        (char*)dst[k]->data +
+                                            std::size_t(slot) * std::size_t(dst[k]->nb[2]));
+            iqk_repack_tensor(&d);
+        }
+        st_.ms_repack += ms_since(t1);
+    }
+}
+
+// Zhertva pod sinhronnyj promah: pervyj po kolcu slot, kotoryj (a) pust, libo (b) zanjat
+// nerezidentnym ekspertom I ne byl TRONUT na etom tokene. Vtoroe uslovie i est ta samaja
+// zashchita, o kotoroj dlinnoe zamechanie v do_map: "tronut" znachit i "zapolnen", i
+// "prochitan kak popadanie".
+//
+// Pochemu zapasnyh dolzhno byt ne menshe top-k. K momentu obrabotki m-go mesta sloja tronuto
+// ne bolshe m-1 nerezidentnyh slotov, tak chto pri spares >= n_used zhertva est vsegda, i
+// pri m = n_used tozhe. Poetomu init podnimaet spares do n_used, a ne doverjaet flagu.
+int ExpertStore::pick_victim(Layer& L) {
+    for (int k = 0; k < n_slots_; ++k) {
+        const int s = (L.ring + k) % n_slots_;
+        const int32_t occ = L.id_of[std::size_t(s)];
+        if (occ < 0) { L.ring = (s + 1) % n_slots_; return s; }
+        if (L.want[std::size_t(occ)]) continue;
+        if (L.touched[std::size_t(s)] == token_) continue;
+        L.ring = (s + 1) % n_slots_;
+        return s;
+    }
+    return -1;
+}
+
+void ExpertStore::do_map(int il, ggml_tensor* dst, const ggml_tensor* sel) {
+    const auto tm = Clock::now();
+    Layer& L = layers_[std::size_t(il)];
+    const int nj = int(sel->ne[0]);
+    const int nr = int(sel->ne[1]);
+    for (int r = 0; r < nr; ++r) {
+        for (int j = 0; j < nj; ++j) {
+            const int32_t id = *(const int32_t*)((const char*)sel->data +
+                                                 std::size_t(r) * sel->nb[1] +
+                                                 std::size_t(j) * sel->nb[0]);
+            int32_t s = -1;
+            if (id >= 0 && id < cfg_.n_expert) {
+                st_.picks++;
+                L.score[std::size_t(id)] += 1.0f;
+                L.seen[std::size_t(id)] = 1;
+                s = L.slot_of[std::size_t(id)];
+                if (s >= 0) {
+                    st_.hits++;
+                    // POPADANIE TOZHE ZAKREPLJAET SLOT NA ETOT TOKEN, i eto ne
+                    // optimizacija, a uslovie pravilnosti. Bez etoj stroki byl real'nyj
+                    // defekt, i on vyglyadel imenno tak, kak zdes vsegda: pervyj token
+                    // sovpadal s etalonom do znaka, a so vtorogo tekst rashodilsja.
+                    //
+                    // Mehanizm. Pust ekspert X lezhit v zapasnom slote 32 (ne rezidentnyj,
+                    // znachit want[X] == 0). Na etom tokene mesto j=0 popalo v X: dst[0] = 32,
+                    // i BOLSHE NICHEGO ne pomenjalos. Mesto j=3 - promah, pick_victim ishchet
+                    // zhertvu, vidit slot 32 (zanjat, ne want, na etom tokene ne zapolnjalsja)
+                    // i kladjot tuda eksperta Y. Teper dst[0] i dst[3] oba ukazyvajut na 32:
+                    // mul_mat_id dvazhdy schitaet Y i ni razu X. Formy vernye, NaN net, tekst
+                    // pravdopodobnyj - rovno tot rod otkaza, protiv kotorogo napisan ves etot
+                    // proekt. Na PERVOM tokene defekta ne vidno voobshche, potomu chto vse
+                    // zapasnye sloty eshchjo pusty i zhertvoj vsegda okazyvaetsja pustoj slot.
+                    L.touched[std::size_t(s)] = token_;
+                } else {
+                    const auto t0 = Clock::now();
+                    const int v = pick_victim(L);
+                    if (v < 0) {
+                        // Nekuda polozhit. Eto ne "propustim eksperta": takoj rezhim zdes
+                        // zapreshchjon, potomu chto on menjaet otvet. Poetomu gromkij otkaz
+                        // odin raz na sloj i -1 v ide - mul_mat_id obnulit mesto, i eto
+                        // budet VIDNO, a ne prinjato za uskorenie.
+                        static bool said = false;
+                        if (!said) {
+                            said = true;
+                            printf("hranilishche ekspertov: v sloe %d NET slota pod promah "
+                                   "(vsego %d, rezidentnyh %d, zapasnyh %d) - mesto obnuleno, "
+                                   "OTVET IZMENJON\n", il, n_slots_, cfg_.capacity,
+                                   cfg_.spares);
+                            fflush(stdout);
+                        }
+                    } else {
+                        fill_slot(L, v, id);
+                        s = v;
+                    }
+                    st_.sync_misses++;
+                    st_.ms_sync += ms_since(t0);
+                }
+            }
+            *(int32_t*)((char*)dst->data + std::size_t(r) * dst->nb[1] +
+                        std::size_t(j) * dst->nb[0]) = s;
+        }
+    }
+    st_.ms_map += ms_since(tm);
+}
+
+void ExpertStore::map_op(ggml_tensor* dst, const ggml_tensor* a, int ith, int /*nth*/,
+                         void* ud) {
+    if (ith != 0) return;
+    Site* s = (Site*)ud;
+    s->self->do_map(s->il, dst, a);
+}
+
+ggml_tensor* ExpertStore::slots_node(ggml_context* c, int il, ggml_tensor* sel,
+                                     ggml_cgraph* gf) {
+    ggml_tensor* t = ggml_map_custom1(c, sel, map_op, /*n_tasks=*/1,
+                                      &sites_[std::size_t(il)]);
+    // Zavisimost po dannym, a ne nadezhda na porjadok: mul_mat_id nizhe beret imenno t, tak
+    // chto ni odin uzel ekspertov ne mozhet byt poschitan do togo, kak promahi prochitany.
+    if (gf) ggml_build_forward_expand(gf, t);
+    return t;
+}
+
+bool ExpertStore::prime(std::string* err) {
+    if (!on()) return true;
+    bulk_ = true;
+    std::vector<int> ord(std::size_t(cfg_.n_expert));
+    for (int il = 0; il < cfg_.n_layer; ++il) {
+        Layer& L = layers_[std::size_t(il)];
+        std::iota(ord.begin(), ord.end(), 0);
+        // Ustojchivyj poriadok pri ravnyh schjotchikah: inache dva progona s odnoj i toj zhe
+        // zatravkoj dali by raznye nabory i raznoe chislo promahov.
+        std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) {
+            if (L.score[std::size_t(a)] != L.score[std::size_t(b)]) {
+                return L.score[std::size_t(a)] > L.score[std::size_t(b)];
+            }
+            return a < b;
+        });
+        std::fill(L.want.begin(), L.want.end(), uint8_t(0));
+        for (int k = 0; k < cfg_.capacity; ++k) {
+            const int id = ord[std::size_t(k)];
+            L.want[std::size_t(id)] = 1;
+            fill_slot(L, k, id);
+            L.touched[std::size_t(k)] = 0;   // zalivka byla do pervogo tokena
+        }
+    }
+    // Repak celym tenzorom, a ne po slotam: eto te zhe bajty (gruppa iz chetyrjoh strok
+    // nikogda ne perehodit granicu eksperta, potomu chto n_ff i n_embd delyatsja na 4), no
+    // odin vyzov na tenzor vmesto trjoh na kazhdyj slot.
+    if (repacked_) {
+        const auto t0 = Clock::now();
+        for (int il = 0; il < cfg_.n_layer; ++il) {
+            Layer& L = layers_[std::size_t(il)];
+            ggml_tensor* three[3] = {L.gate, L.up, L.down};
+            for (int k = 0; k < 3; ++k) {
+                const ggml_type before = three[k]->type;
+                iqk_repack_tensor(three[k]);
+                if (three[k]->type == before) {
+                    if (err) {
+                        *err = std::string("repak tenzora ") + ggml_get_name(three[k]) +
+                               " ne srabotal, hotja byl razreshjon";
+                    }
+                    bulk_ = false;
+                    return false;
+                }
+            }
+        }
+        st_.ms_repack += ms_since(t0);
+    }
+    bulk_ = false;
+    primed_ = true;
+    return true;
+}
+
+void ExpertStore::refresh() {
+    std::vector<int> ord(std::size_t(cfg_.n_expert));
+    std::vector<int> need;
+    std::vector<int> free_slots;
+    for (int il = 0; il < cfg_.n_layer; ++il) {
+        Layer& L = layers_[std::size_t(il)];
+        std::iota(ord.begin(), ord.end(), 0);
+        std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) {
+            if (L.score[std::size_t(a)] != L.score[std::size_t(b)]) {
+                return L.score[std::size_t(a)] > L.score[std::size_t(b)];
+            }
+            return a < b;
+        });
+        std::fill(L.want.begin(), L.want.end(), uint8_t(0));
+        need.clear();
+        for (int k = 0; k < cfg_.capacity; ++k) {
+            const int id = ord[std::size_t(k)];
+            L.want[std::size_t(id)] = 1;
+            // Slot u nego uzhe est - hot rezidentnyj, hot zapasnoj. Perekladyvat ne nado:
+            // pul slotov odin, a want tolko zashchishchaet ot vytesnenija. Perekladyvanie
+            // stoilo by povtornogo chtenija tam, gde chitat nechego.
+            if (L.slot_of[std::size_t(id)] < 0) need.push_back(id);
+        }
+        if (need.empty()) continue;
+        free_slots.clear();
+        for (int s = 0; s < n_slots_; ++s) {
+            const int32_t occ = L.id_of[std::size_t(s)];
+            if (occ < 0 || !L.want[std::size_t(occ)]) free_slots.push_back(s);
+        }
+        const std::size_t m = std::min(need.size(), free_slots.size());
+        for (std::size_t k = 0; k < m; ++k) {
+            fill_slot(L, free_slots[k], need[k]);
+        }
+    }
+    st_.refreshes++;
+}
+
+void ExpertStore::end_token() {
+    if (!on()) return;
+    st_.tokens++;
+    token_++;
+    if (cfg_.period > 0 && cfg_.capacity < cfg_.n_expert &&
+        (st_.tokens % uint64_t(cfg_.period)) == 0) {
+        refresh();
+    }
+}
+
+int ExpertStore::n_resident(int il) const {
+    if (!on()) return 0;
+    const Layer& L = layers_[std::size_t(il)];
+    int n = 0;
+    for (int e = 0; e < cfg_.n_expert; ++e) {
+        if (L.want[std::size_t(e)] && L.slot_of[std::size_t(e)] >= 0) ++n;
+    }
+    return n;
+}
+
+int ExpertStore::n_seen(int il) const {
+    if (!on()) return 0;
+    const Layer& L = layers_[std::size_t(il)];
+    int n = 0;
+    for (int e = 0; e < cfg_.n_expert; ++e) n += L.seen[std::size_t(e)] ? 1 : 0;
+    return n;
+}
+
+bool ExpertStore::verify_slot(int il, int slot, std::string* why) const {
+    if (!on()) { if (why) *why = "hranilishche vykljucheno"; return false; }
+    if (il < 0 || il >= cfg_.n_layer || slot < 0 || slot >= n_slots_) {
+        if (why) *why = "sloj ili slot vne predelov";
+        return false;
+    }
+    const Layer& L = layers_[std::size_t(il)];
+    const int32_t id = L.id_of[std::size_t(slot)];
+    if (id < 0) { if (why) *why = "slot pust"; return false; }
+    if (repacked_) {
+        if (why) {
+            *why = "repak vkljuchjon: bajty slota po postroeniju drugie, sravnenie s "
+                   "modelju NEVOZMOZHNO";
+        }
+        return false;
+    }
+    const ggml_tensor* src[3] = {L.src_gate, L.src_up, L.src_down};
+    const ggml_tensor* dst[3] = {L.gate, L.up, L.down};
+    const char* nm[3] = {"gate", "up", "down"};
+    for (int k = 0; k < 3; ++k) {
+        const std::size_t nb2 = std::size_t(dst[k]->nb[2]);
+        const char* a = (const char*)dst[k]->data + std::size_t(slot) * nb2;
+        const char* b = (const char*)src[k]->data + std::size_t(id) * nb2;
+        if (std::memcmp(a, b, nb2) != 0) {
+            if (why) {
+                *why = std::string("sloj ") + std::to_string(il) + " slot " +
+                       std::to_string(slot) + " (ekspert " + std::to_string(id) + "): " +
+                       nm[k] + " rashoditsja s modelju";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace memex

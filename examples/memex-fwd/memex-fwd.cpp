@@ -102,6 +102,15 @@
 // broken kernel.
 #include "resident_set.hpp"
 
+// SHAG 4 PLANA: rezidentnoe hranilishche ekspertov v OZU. Ne to zhe, chto ResidentSet: tot
+// reshaet, kakuju polovinu ekspertov schitaet KARTA, i schitaet bajty tolko marshrutiziruemyh
+// (imenno poetomu on otkazan dlja qwen3next - u nejo est obshchij ekspert). Hranilishche zhe
+// nichego ne rasshchepljaet: ono derzhit C ekspertov na sloj v PRIVATNOJ pamjati vmesto
+// strannichnogo kesha mmap i chitaet ostalnye sinhronno. Pochemu eto nuzhno - v shapke
+// expert_store.hpp; korotko: eksperty IQ3_XXS eto 24,6 GiB, v 32 GB mashiny oni ne
+// vlezajut, i --gen 64 upirajotsja ne v schjot, a v 2,74 ms za kazhdoe chtenie s SSD.
+#include "expert_store.hpp"
+
 // FIFTH STAGE, and the one the four before it were for. The resident half executes on the
 // Vulkan device WHILE the CPU computes the non-resident half, and the two are joined at the
 // end of the layer. Concurrency is the whole point and it is not something the fork can
@@ -3301,10 +3310,15 @@ bool build_gemma4_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
 //
 // Vozvrashchaet routed + attn_out. Obshchij ekspert pribavljaetsja SNARUZHI i POSLE, potomu chto
 // poriadok etih dvuh slozhenij - eto poriadok etalona, i associativnost zdes uzhe stoila oshibok.
+// HRANILISHCHE, esli ono est, podstavljaetsja ROVNO v tri uzla mul_mat_id i ni vo chto bolshe.
+// Vesa berutsja iz slotov, a `sel` prohodit cherez odin uzel perevoda id -> slot (on zhe
+// dochityvaet promahi). Vsjo ostalnoe - softmax, top-k, vesa marshrutizacii, dva slozhenija -
+// ostajotsja tem zhe i v tom zhe poriadke, potomu chto poriadok zdes eto poriadok etalona.
 static ggml_tensor* qwen35_moe_routed(ggml_context* c, const HParams& h,
                                       const Qwen35Weights::Layer& L, ggml_tensor* attn_out,
                                       ggml_tensor* x, ggml_tensor* rlogits, int n_tokens,
-                                      ggml_tensor** sel_out, ggml_cgraph* gf) {
+                                      ggml_tensor** sel_out, ggml_cgraph* gf,
+                                      memex::ExpertStore* es = nullptr, int il = -1) {
     ggml_tensor* probs = ggml_soft_max(c, rlogits);
     ggml_tensor* sel = ggml_top_k(c, probs, h.n_expert_used);
     if (sel_out) {
@@ -3327,11 +3341,24 @@ static ggml_tensor* qwen35_moe_routed(ggml_context* c, const HParams& h,
     weights = ggml_reshape_3d(c, weights, 1, h.n_expert_used, n_tokens);
 
     ggml_tensor* xe = ggml_reshape_3d(c, x, h.n_embd, 1, n_tokens);
-    ggml_tensor* up = ggml_mul_mat_id(c, L.up_exps, xe, sel);
-    ggml_tensor* gt = ggml_mul_mat_id(c, L.gate_exps, xe, sel);
+    // TRI TENZORA I ODIN SPISOK IDOV - ili modelnye i sel, ili slotovye i perevod. Odna para
+    // peremennyh, a ne dve vetki s dvumja kopijami sledujushchih pjati uzlov: kopija razoshlas
+    // by s originalom pervoj zhe pravkoj, i raskhozhdenie bylo by drugim otvetom.
+    ggml_tensor* t_up   = L.up_exps;
+    ggml_tensor* t_gate = L.gate_exps;
+    ggml_tensor* t_down = L.down_exps;
+    ggml_tensor* ids    = sel;
+    if (es && es->on() && il >= 0) {
+        ids    = es->slots_node(c, il, sel, gf);
+        t_up   = es->up(il);
+        t_gate = es->gate(il);
+        t_down = es->down(il);
+    }
+    ggml_tensor* up = ggml_mul_mat_id(c, t_up, xe, ids);
+    ggml_tensor* gt = ggml_mul_mat_id(c, t_gate, xe, ids);
     // silu(gate) * up in one node, which is the op the reference resolves LLM_FFN_SILU to.
     ggml_tensor* par = ggml_fused_mul_unary(c, gt, up, GGML_UNARY_OP_SILU);
-    ggml_tensor* eo = ggml_mul_mat_id(c, L.down_exps, par, sel);
+    ggml_tensor* eo = ggml_mul_mat_id(c, t_down, par, ids);
     // Weight and fold in one node - see the note in build_gemma4_step. Eight slots means
     // eight nodes saved a layer, and this model has forty layers.
     ggml_tensor* routed = ggml_mul_multi_add(c, eo, weights);
@@ -3341,14 +3368,15 @@ static ggml_tensor* qwen35_moe_routed(ggml_context* c, const HParams& h,
 static ggml_tensor* qwen35_ffn(ggml_context* c, const HParams& h,
                                const Qwen35Weights::Layer& L, ggml_tensor* attn_out,
                                int n_tokens, ggml_tensor** normed_out,
-                               ggml_tensor** sel_out = nullptr, ggml_cgraph* gf = nullptr) {
+                               ggml_tensor** sel_out = nullptr, ggml_cgraph* gf = nullptr,
+                               memex::ExpertStore* es = nullptr, int il = -1) {
     const float eps = h.rms_eps;
     ggml_tensor* x = fnorm(c, attn_out, L.ffn_norm, eps);
     if (normed_out) *normed_out = x;
 
     ggml_tensor* rlogits = ggml_mul_mat(c, L.router, x);
     ggml_tensor* routed = qwen35_moe_routed(c, h, L, attn_out, x, rlogits, n_tokens,
-                                            sel_out, gf);
+                                            sel_out, gf, es, il);
 
     // The shared expert. Always active on every layer and every token - static traffic, not
     // expert traffic - and gated by a single sigmoid scalar per token.
@@ -3565,7 +3593,13 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
                        // DAMP VHODA MARSHRUTIZATORA - po toj zhe sheme i po tomu zhe
                        // pravilu, chto want_sel: kopija naruzhu tolko togda, kogda ejo
                        // kto-to chitaet (MEMEX_HIDDEN_TRACE).
-                       bool want_hid = false) {
+                       bool want_hid = false,
+                       // REZIDENTNOE HRANILISHCHE EKSPERTOV. Tolko dekod (n_tokens == 1):
+                       // pri prefille odin uzel perevoda na sloj chital by po desjat idov na
+                       // KAZHDYJ token kuska, i vse promahi kuska stali by sinhronnymi -
+                       // ta zhe rabota, no bez okna, v kotoroe ejo mozhno spryatat. Prefill
+                       // ostajotsja na modelnyh tenzorah, i eto skazano vsluh nizhe.
+                       memex::ExpertStore* es = nullptr) {
     if (n_tokens <= 0 || n_kv <= 0 || n_past < 0) {
         printf("qwen35moe: бессмысленные размеры n_tokens %d, n_past %d, n_kv %d\n",
                n_tokens, n_past, n_kv);
@@ -3574,6 +3608,14 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
     if (h.n_delta_layers() > 0 && ds.state_dim == 0) {
         printf("qwen35moe: слои дельта-сети есть, а состояние не выделено\n");
         return false;
+    }
+    // HRANILISHCHE TOLKO NA DEKODE, i eto skazano vsluh, a ne otbrosheno molcha (lovushka
+    // 7.7): tochka, kotoraja peredala hranilishche na graf shiriny > 1, dolzhna uvidet, chto
+    // ono tuda ne poshlo, inache stroka "hranilishche vkljucheno" opisyvala by ne tot put.
+    if (es && es->on() && n_tokens > 1) {
+        printf("qwen35moe: hranilishche ekspertov NE uchastvuet v grafe shiriny %d "
+               "(prefill idjot po modelnym tenzoram pod mmap) - eto po zamyslu\n", n_tokens);
+        es = nullptr;
     }
     const size_t n_nodes = size_t(h.n_layer) * 96 + 256;
     ggml_init_params ip = {ggml_tensor_overhead() * (n_nodes + 512) +
@@ -3795,13 +3837,13 @@ bool build_qwen35_step(Graph* g, ggml_backend_buffer_type_t buft, const HParams&
             // tozhe tot zhe: ostatok k marshrutiziruemoj polovine, potom obshchij ekspert.
             ggml_tensor* routed = qwen35_moe_routed(c, h, L, attn_out, card_x, card_rl,
                                                     n_tokens, want_sel ? &sel_cp : nullptr,
-                                                    g->gf);
+                                                    g->gf, es, il);
             cur = ggml_add(c, routed, card_sh);
             normed = card_x;
         } else {
             cur = qwen35_ffn(c, h, L, attn_out, n_tokens,
                              (keep_probes || want_hid) ? &normed : nullptr,
-                             want_sel ? &sel_cp : nullptr, g->gf);
+                             want_sel ? &sel_cp : nullptr, g->gf, es, il);
         }
         if (sel_cp) g->sel_ids.push_back(sel_cp);
         if (want_hid) {
@@ -3912,6 +3954,10 @@ struct BuildOpts {
     // kogda ego kto-to chitaet. Umeet EJO odin stroitel, i build_any otkazyvaet vsluh
     // ostalnym, a ne pishet nuli pod imenem dampa.
     bool want_hid = false;
+    // REZIDENTNOE HRANILISHCHE EKSPERTOV V OZU. Odno na progon, kak i gstat: ono derzhit
+    // desjatki gigabajt i zhivjot dolshe ljubogo grafa. Tochka, kotoraja ego peredala,
+    // poluchaet graf po tenzoram SLOTOV; tochka, kotoraja ne peredala, - po modelnym.
+    memex::ExpertStore* es = nullptr;
 };
 
 // Opisanie arhitektury: kakoj nabor vesov zapolnen i chto ejo stroitel umeet.
@@ -3934,6 +3980,7 @@ struct ArchModel {
     bool can_probes    = false;  // keep_probes
     bool can_keep_dbg  = false;  // g->dbg pod svoim otdelnym flagom
     bool can_repeat    = false;  // graf mozhno gonjat povtorno bez porchi perenosimogo sostojanija
+    bool can_store     = false;  // rezidentnoe hranilishche ekspertov v OZU (es)
 
     int n_set() const {
         return (w ? 1 : 0) + (dw ? 1 : 0) + (g4 ? 1 : 0) + (q35 ? 1 : 0);
@@ -3975,6 +4022,11 @@ static ArchModel arch_qwen35(const Qwen35Weights* q35, const char* name) {
     a.name = name; a.q35 = q35;
     a.needs_delta = true;
     a.can_gstat = true; a.can_probes = true;
+    // HRANILISHCHE EKSPERTOV umeet imenno eta arhitektura, i tolko ona: tri otdelnyh
+    // tenzora ekspertov na sloj (u gemma4 gate i up slity v odin, i sloty prishlos by
+    // rezat inache), obshchij ekspert v hranilishche NE vhodit i v znamenatel popadanij
+    // tozhe. Dlja qwen3moe eto sdelaemo, no ne sdelano - i build_any skazhet eto vsluh.
+    a.can_store = true;
     // can_repeat false - lovushka 7.5. can_resident false - ResidentSet schitaet bajty
     // TOLKO marshrutiziruemyh ekspertov, a zdes na kazhdom sloe i kazhdom tokene chitaetsja
     // ещё i obshchij ekspert: dolja popadanij opisyvala by chast chtenij, a jomkost
@@ -4010,6 +4062,11 @@ static bool build_any(const ArchModel& am, Graph* g, ggml_backend_buffer_type_t 
     }
     if ((o.rs || o.gx) && !am.can_resident) {
         printf("tochka %s: arhitektura %s ne podderzhivaet rasshcheplenie rezidentnyh "
+               "ekspertov - OTKAZ\n", wh, am.name);
+        return false;
+    }
+    if (o.es && o.es->on() && !am.can_store) {
+        printf("tochka %s: arhitektura %s ne podderzhivaet rezidentnoe hranilishche "
                "ekspertov - OTKAZ\n", wh, am.name);
         return false;
     }
@@ -4080,7 +4137,7 @@ static bool build_any(const ArchModel& am, Graph* g, ggml_backend_buffer_type_t 
         }
         return build_qwen35_step(g, buft, h, *am.q35, kv, *o.ds, n_tokens, n_past, n_kv,
                                  o.all_logits, o.keep_probes, o.gstat, o.want_sel || force_sel,
-                                 o.want_hid);
+                                 o.want_hid, o.es);
     }
     return build_step(g, buft, h, *am.w, kv, n_tokens, n_past, n_kv, o.min_experts,
                       o.expert_thresh, o.all_logits, o.zc, o.keep_dbg, o.rs, o.gx,
@@ -4137,6 +4194,10 @@ struct Generator {
     // The output head on the card, when it is on. Borrowed, not owned: main owns it, because
     // it has to exist before the first graph is built and outlive the last one.
     memex::GpuStatic* gstat = nullptr;
+    // Hranilishche ekspertov, tozhe vzajmy i tozhe iz main. Peredajotsja TOLKO grafam shiriny
+    // odin: poshagovaja sverka objazana proverjat imenno tot put, kotoryj rabotaet na dekode,
+    // a prefill po zamyslu ostajotsja na modelnyh tenzorah.
+    memex::ExpertStore* es = nullptr;
 
     bool dense() const { return dw != nullptr; }
 
@@ -4198,6 +4259,9 @@ struct Generator {
         // peredavat ih nado bezuslovno - inache otkaz ne sostoitsja i molchanie vernjotsja.
         o.min_experts = min_experts;
         o.expert_thresh = expert_thresh;
+        // Tolko dekodnyj graf. Uslovie zdes, a ne v stroitele, potomu chto stroitel togda
+        // pechatal by stroku "hranilishche ne uchastvuet" na kazhdyj prefill sverki.
+        o.es = (n_tokens == 1) ? es : nullptr;
         return build_any(am, g, buft, *h, kv, n_tokens, n_past, n_kv_max, o);
     }
 
@@ -4868,6 +4932,87 @@ struct ResidentOpt {
 // ggml_backend_vk_init(0) calls share one vk_device - one queue, one command pool, one staging
 // buffer - and GpuExperts' worker thread uploads whenever it has a promotion pending, which
 // includes the moment the head is running. Refused rather than raced.
+// REZIDENTNOE HRANILISHCHE EKSPERTOV V OZU (shag 4). Vykljucheno po umolchaniju, i eto
+// vazhno: vkljuchennoe po umolchaniju hranilishche zabralo by dvadcat gigabajt u ljubogo
+// progona, v tom chisle u tehjo, kto ego ne prosil.
+struct ExpertStoreOpt {
+    int capacity = 0;        // --expert-store C. 0 vykljucheno, -1 "po svobodnoj OZU"
+    int spares   = 16;       // --expert-store-spares
+    int period   = 16;       // --expert-store-period, tokenov mezhdu perestanovkami nabora
+    bool repack  = false;    // --expert-store-repack: IQ3_XXS -> IQ3_XXS_R4 pryamo v slotah
+    int reserve_mib = 2048;  // --expert-store-reserve: skolko OZU ne zanimat
+    const char* prior = nullptr;  // --expert-prior: fajl zatravki schjotchikov
+};
+
+// OTCHJOT HRANILISHCHA. Odna funkcija na oba puti (--decode-check i --gen), potomu chto
+// vtoraja kopija razoshlas by s pervoj, i togda dva progona odnogo binarnika pechatali by
+// raznoe pro odnu i tu zhe veshch.
+//
+// Znamenatel popadanij - TOLKO marshrutiziruemye obrashchenija (n_layer * top-k na token).
+// Obshchij ekspert (*_shexp) v hranilishche ne vhodit voobshche: on chitaetsja na kazhdom sloe
+// i kazhdom tokene, eto staticheskij trafik, i posle shaga 3b on lezhit na karte. Esli by on
+// popal v znamenatel, dolja popadanij opisyvala by chast chtenij i vygljadela by luchshe.
+void print_store_report(const memex::ExpertStore& es, const HParams& h,
+                        const memex::ExpertStoreStats& s, const char* phase,
+                        double phase_ms, const memex::ProcMem& before,
+                        const memex::ProcMem& after) {
+    const double tok = double(s.tokens > 0 ? s.tokens : 1);
+    printf("\nhranilishche ekspertov (%s): tokenov %llu\n", phase,
+           (unsigned long long)s.tokens);
+    printf("  rezidentnyh na sloj %d iz %d (%.1f%% modeli), slotov vsego %d\n",
+           es.n_resident(0), h.n_expert,
+           100.0 * double(es.cfg().capacity) / double(h.n_expert),
+           es.cfg().capacity + es.cfg().spares);
+    printf("  obrashchenij k MARSHRUTIZIRUEMYM ekspertam %llu (%.1f na token; obshchij "
+           "ekspert v znamenatel NE vhodit - on na karte i chitaetsja vsegda)\n",
+           (unsigned long long)s.picks, double(s.picks) / tok);
+    printf("  popadanij %.4f%%, sinhronnyh promahov %llu = %.3f na token, %.3f ms na token "
+           "(vsego %.0f ms)\n", 100.0 * s.hit_rate(), (unsigned long long)s.sync_misses,
+           s.misses_per_token(), s.ms_sync / tok, s.ms_sync);
+    printf("  perestanovok nabora %llu, kopij v sloty %llu (%.2f GiB iz fajla), vytesnenij "
+           "%llu; kopirovanie %.0f ms, repak %.0f ms, sam perevod id->slot %.0f ms\n",
+           (unsigned long long)s.refreshes, (unsigned long long)s.fills,
+           double(s.fill_bytes) / 1073741824.0, (unsigned long long)s.evictions,
+           s.ms_fill, s.ms_repack, s.ms_map - s.ms_sync);
+    printf("  repak slotov: %s\n", es.repack_why().c_str());
+    if (phase_ms > 0.0 && s.tokens > 0) {
+        printf("  dolja fazy: %.1f ms/token vsego, iz nih %.1f ms sinhronnye chtenija "
+               "(%.1f%%)\n", phase_ms / tok, s.ms_sync / tok,
+               100.0 * s.ms_sync / phase_ms);
+    }
+    int seen_min = h.n_expert, seen_max = 0;
+    double seen_sum = 0.0;
+    for (int il = 0; il < h.n_layer; ++il) {
+        const int v = es.n_seen(il);
+        seen_min = std::min(seen_min, v);
+        seen_max = std::max(seen_max, v);
+        seen_sum += v;
+    }
+    printf("  razlichnyh ekspertov videli: srednee %.0f na sloj, ot %d do %d iz %d\n",
+           seen_sum / double(h.n_layer), seen_min, seen_max, h.n_expert);
+    if (before.ok && after.ok) {
+        printf("  pamjat processa: rabochij nabor %.2f -> %.2f GiB (pik %.2f), promahov "
+               "stranic za fazu %llu\n", double(before.rss) / 1073741824.0,
+               double(after.rss) / 1073741824.0, double(after.peak) / 1073741824.0,
+               (unsigned long long)(after.faults - before.faults));
+        printf("    PageFaultCount schitaet mjagkie i zhjostkie VMESTE - Windows ne otdajot "
+               "zhjostkie otdelno; eto verhnjaja granica chtenij s diska, a ne ih chislo\n");
+    } else {
+        printf("  pamjat processa: NE IZMERENA (GetProcessMemoryInfo ne otvetil)\n");
+    }
+    printf("  CHEGO ETOT OTCHJOT NE MERIT: skolko iz kopij v sloty prishlo s diska, a skolko "
+           "iz strannichnogo kesha (razdeljaet tolko schjotchik promahov stranic vyshe); "
+           "vremja prefilla - on idjot po modelnym tenzoram pod mmap\n");
+    // Odna stroka dlja skriptov. Rjadom s prozoj, a ne vmesto nejo: skripty parsjat imenno
+    // ejo, i menjat ejo formu bez nuzhdy nelzja.
+    printf("ESTORE_AB C %d spares %d period %d repack %d tokens %llu hits %.6f "
+           "miss_per_tok %.4f ms_sync_per_tok %.4f fills %llu\n",
+           es.cfg().capacity, es.cfg().spares, es.cfg().period, es.repacked() ? 1 : 0,
+           (unsigned long long)s.tokens, s.hit_rate(), s.misses_per_token(), s.ms_sync / tok,
+           (unsigned long long)s.fills);
+    fflush(stdout);
+}
+
 struct GpuStaticOpt {
     bool on       = false;   // --gpu-static
     bool verify   = false;   // --gpu-static-verify, byte compare after the upload
@@ -6152,6 +6297,7 @@ int main(int argc, char** argv) {
     ResidentOpt ropt;
     GpuExpertOpt gopt;
     GpuStaticOpt sopt;
+    ExpertStoreOpt eopt;
     bool bad_arg = false;
 
     auto want_val = [&](int i, const char* what) {
@@ -6262,6 +6408,18 @@ int main(int argc, char** argv) {
 "  --gpu-experts-selftest   проверить весь механизм на синтетических весах, без модели\n"
 "  --gpu-experts-reserve N  запас видеопамяти в МиБ, который не занимать (%d)\n"
 "\n"
+"rezidentnoe hranilishche ekspertov v OZU, VYKLJUCHENO po umolchaniju (shag 4)\n"
+"  --expert-store C     derzhat C ekspertov na sloj v PRIVATNOJ pamjati (ne mmap) i\n"
+"                       chitat ostalnye SINHRONNO v zapasnoj slot. Otvet ne menjaetsja:\n"
+"                       rezhima \"propustit eksperta\" zdes net vovse\n"
+"  --expert-store-auto  C po svobodnoj fizicheskoj pamjati; raschjot pechataetsja\n"
+"  --expert-store-spares N  zapasnyh slotov na sloj pod promahi (%d; ne menshe top-k)\n"
+"  --expert-store-period N  tokenov mezhdu perestanovkami nabora (%d)\n"
+"  --expert-store-reserve N  skolko MiB OZU ne zanimat pri --expert-store-auto (%d)\n"
+"  --expert-store-repack    perepakovat sloty v _R4 (bystree schjot, DRUGIE BAJTY otveta)\n"
+"  --expert-prior FAJL  zatravka schjotchikov s kalibrovochnogo korpusa\n"
+"                       (gotovitsja bench/expert_prior.py po sledam MEMEX_EXPERT_TRACE)\n"
+"\n"
 "staticheskie vesa v videopamjati, VYKLJUCHENY po umolchaniju\n"
 "  --gpu-static         schitat vyhodnuju golovu (output.weight) na Vulkan. Eto 243.4 MB\n"
 "                       iz 1714 MB, kotorye tokjen chitaet, i edinstvennaja chast statiki\n"
@@ -6287,6 +6445,7 @@ int main(int argc, char** argv) {
                 zopt.tail_q8 ? "q8_0" : "f16", zopt.rotate_keys ? "on" : "off",
                 ropt.capacity, ropt.window, ropt.period, ropt.budget, ropt.policy_name(),
                 gopt.reserve_mib,
+                eopt.spares, eopt.period, eopt.reserve_mib,
                 sopt.rows, sopt.reserve_mib,
                 bandwidth_gbs);
             return 0;
@@ -6395,6 +6554,15 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // REZIDENTNOE HRANILISHCHE EKSPERTOV. -1 znachit "po svobodnoj OZU" i pechataet
+        // raschjot; 0 - vykljucheno (po umolchaniju).
+        else if (!strcmp(a, "--expert-store")) { if (want_val(i, a)) eopt.capacity = atoi(argv[++i]); }
+        else if (!strcmp(a, "--expert-store-auto")) { eopt.capacity = -1; }
+        else if (!strcmp(a, "--expert-store-spares")) { if (want_val(i, a)) eopt.spares = atoi(argv[++i]); }
+        else if (!strcmp(a, "--expert-store-period")) { if (want_val(i, a)) eopt.period = atoi(argv[++i]); }
+        else if (!strcmp(a, "--expert-store-repack")) { eopt.repack = true; }
+        else if (!strcmp(a, "--expert-store-reserve")) { if (want_val(i, a)) eopt.reserve_mib = atoi(argv[++i]); }
+        else if (!strcmp(a, "--expert-prior")) { if (want_val(i, a)) eopt.prior = argv[++i]; }
         else if (!strcmp(a, "--gpu-static")) { sopt.on = true; }
         else if (!strcmp(a, "--gpu-static-verify")) { sopt.on = true; sopt.verify = true; }
         else if (!strcmp(a, "--gpu-static-layers")) { sopt.on = true; sopt.layers = true; }
@@ -7476,6 +7644,140 @@ int main(int argc, char** argv) {
     auto place_layers = [&](int) { return true; };
 #endif
 
+    // ---------------------------------------------------------------------------------
+    // REZIDENTNOE HRANILISHCHE EKSPERTOV V OZU (shag 4)
+    // ---------------------------------------------------------------------------------
+    //
+    // Sozdajotsja POSLE place_layers i pered pervym grafom. Poriadok ne kosmeticheskij:
+    // statika uezzhaet na kartu, ejo stranicy mmap perestajot trogat, i imenno posle etogo
+    // "svobodno fizicheskoj pamjati" nazyvaet tu velichinu, ot kotoroj i nado schitat C.
+    //
+    // Chto NE izmerjaetsja etim raschjotom i skazano vsluh nizhe: stranicy mmap, kotorye
+    // zagruzchik uzhe nabil (Windows zovjot PrefetchVirtualMemory na ves fajl,
+    // llama-mmap.cpp:477) - oni schitajutsja svobodnymi ne srazu, i pervyj zhe progon posle
+    // starta mozhet uvidet menshe pamjati, chem vtoroj.
+    std::unique_ptr<memex::ExpertStore> estore;
+    memex::ExpertStore* esp = nullptr;
+    auto make_store = [&]() -> bool {
+        if (eopt.capacity == 0) return true;
+        if (!arch_q35) {
+            printf("--expert-store poka tolko dlja qwen35moe/qwen3next: u %s tenzory "
+                   "ekspertov razlozheny inache (u gemma4 gate i up v odnom) - OTKAZ\n",
+                   h.arch.c_str());
+            return false;
+        }
+        const Qwen35Weights::Layer& L0 = w35.layers[0];
+        const std::size_t bpe = memex::ExpertStore::bytes_per_expert(
+            L0.gate_exps, L0.up_exps, L0.down_exps);
+        const PhysMem pm = phys_mem();
+        const uint64_t reserve = uint64_t(eopt.reserve_mib) * 1048576ull;
+        memex::ExpertStoreConfig ec;
+        ec.n_layer  = h.n_layer;
+        ec.n_expert = h.n_expert;
+        ec.n_used   = h.n_expert_used;
+        ec.spares   = eopt.spares;
+        ec.period   = eopt.period;
+        ec.repack   = eopt.repack;
+        printf("\nrezidentnoe hranilishche ekspertov: ekspert %.3f MiB "
+               "(gate %s + up %s + down %s), na sloj %d ekspertov, sloev %d\n",
+               double(bpe) / 1048576.0, ggml_type_name(L0.gate_exps->type),
+               ggml_type_name(L0.up_exps->type), ggml_type_name(L0.down_exps->type),
+               h.n_expert, h.n_layer);
+        if (eopt.capacity < 0) {
+            if (!pm.ok) {
+                printf("  OTKAZ: --expert-store-auto ne mozhet uznat svobodnuju pamjat "
+                       "(GlobalMemoryStatusEx); zadajte --expert-store C chislom\n");
+                return false;
+            }
+            ec.capacity = memex::ExpertStore::auto_capacity(pm.avail, reserve, bpe,
+                                                            h.n_layer, eopt.spares,
+                                                            h.n_expert);
+            printf("  raschjot: svobodno %.2f GiB, zapas %.2f GiB, ostajotsja %.2f GiB; "
+                   "na sloj eto %.2f MiB, minus %d zapasnyh slotov => C = %d iz %d\n",
+                   double(pm.avail) / 1073741824.0, double(reserve) / 1073741824.0,
+                   double(pm.avail > reserve ? pm.avail - reserve : 0) / 1073741824.0,
+                   double(pm.avail > reserve ? (pm.avail - reserve) / uint64_t(h.n_layer)
+                                             : 0) / 1048576.0,
+                   eopt.spares, ec.capacity, h.n_expert);
+            if (ec.capacity <= 0) {
+                printf("  OTKAZ: v svobodnuju pamjat ne vlezaet ni odin rezidentnyj slot\n");
+                return false;
+            }
+        } else {
+            ec.capacity = eopt.capacity;
+            if (pm.ok) {
+                // Zapasnyh budet ne menshe top-k, kak by ni prosili, i pri C >= n_expert
+                // zapasnyh ne budet vovse - schitaem imenno to, chto vydelitsja.
+                const int sp = ec.capacity >= h.n_expert
+                                   ? 0
+                                   : std::max(eopt.spares, h.n_expert_used);
+                const int slots = std::min(ec.capacity + sp, h.n_expert);
+                const double need = double(bpe) * double(slots) * double(h.n_layer);
+                printf("  prosheno C = %d (+%d zapasnyh = %d slotov): nuzhno %.2f GiB "
+                       "privatnoj pamjati, svobodno %.2f GiB iz %.2f\n", ec.capacity, sp,
+                       slots, need / 1073741824.0, double(pm.avail) / 1073741824.0,
+                       double(pm.total) / 1073741824.0);
+                if (need > double(pm.avail)) {
+                    // OTKAZ, a ne preduprezhdenie. Prodolzhit zdes znachit uehat v podkachku:
+                    // odin takoj progon s C = 512 sjel vsju pamjat do 0,74 GiB svobodnyh i
+                    // ne dal ni odnoj cifry za desjat minut. Podkachka ne "medlennee" - ona
+                    // delaet ljuboj zamer nedejstvitelnym, potomu chto merit uzhe ne to.
+                    printf("  OTKAZ: eto bolshe, chem svobodno. Voznikla by podkachka, i "
+                           "kazhdaja cifra progona opisyvala by ejo, a ne hranilishche. "
+                           "Voznite --expert-store-auto (schitaet C sam) ili C ne bolshe "
+                           "%d\n", memex::ExpertStore::auto_capacity(
+                                        pm.avail, uint64_t(eopt.reserve_mib) * 1048576ull,
+                                        bpe, h.n_layer,
+                                        std::max(eopt.spares, h.n_expert_used),
+                                        h.n_expert));
+                    return false;
+                }
+            }
+        }
+        std::vector<const ggml_tensor*> tg, tu, td;
+        tg.reserve(std::size_t(h.n_layer));
+        tu.reserve(std::size_t(h.n_layer));
+        td.reserve(std::size_t(h.n_layer));
+        for (int il = 0; il < h.n_layer; ++il) {
+            tg.push_back(w35.layers[std::size_t(il)].gate_exps);
+            tu.push_back(w35.layers[std::size_t(il)].up_exps);
+            td.push_back(w35.layers[std::size_t(il)].down_exps);
+        }
+        estore.reset(new memex::ExpertStore());
+        std::string serr;
+        const auto t_a = Clock::now();
+        if (!estore->init(ec, tg, tu, td, &serr)) {
+            printf("  OTKAZ: %s\n", serr.c_str());
+            estore.reset();
+            return false;
+        }
+        printf("  vydeleno %.2f GiB za %.0f ms: %d slotov na sloj (%d rezidentnyh + %d "
+               "zapasnyh), perestanovka nabora raz v %d tokenov\n",
+               double(estore->bytes()) / 1073741824.0, ms_since(t_a),
+               estore->cfg().capacity + estore->cfg().spares, estore->cfg().capacity,
+               estore->cfg().spares, estore->cfg().period);
+        printf("  repak v _R4: %s\n", estore->repack_why().c_str());
+        if (eopt.repack && !estore->repacked()) {
+            printf("  ETO OTKAZ, a ne tihij otkat: --expert-store-repack proshen i NE "
+                   "ispolnen, sloty ostajutsja v tipah modeli\n");
+        }
+        if (eopt.prior) {
+            std::string perr;
+            if (!estore->load_prior(eopt.prior, &perr)) {
+                printf("  OTKAZ zatravki: %s\n", perr.c_str());
+                estore.reset();
+                return false;
+            }
+            printf("  zatravka schjotchikov prochitana: %s\n", eopt.prior);
+        } else {
+            printf("  ZATRAVKI NET (--expert-prior ne zadan): nabor stroitsja tolko po "
+                   "vyboram samogo dokumenta, i na holodnom starte on zavedomo huzhe - "
+                   "plato pervyh pojavlenij 98,6%% (bench/first_seen.py)\n");
+        }
+        esp = estore.get();
+        return true;
+    };
+
     ggml_backend_t be = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(be, threads);
     ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
@@ -7693,7 +7995,25 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (!place_layers(n_kv_max)) return 1;
+        // HRANILISHCHE V GLAVNOJ PROVERKE. Bez zatravki i bez progreva po promtu: schjotchiki
+        // nulevye, verhnimi C okazyvajutsja eksperty 0..C-1, i pochti kazhdoe obrashchenie -
+        // sinhronnyj promah. Eto ne nedosmotr, a samyj tjazhelyj rezhim dlja puti "zhdat": esli
+        // tokeny i L2 sovpadut zdes, znachit dochityvanie v zapasnoj slot ne menjaet otveta.
+        if (!make_store()) return 1;
+        if (esp) {
+            std::string serr;
+            const auto t_p = Clock::now();
+            if (!esp->prime(&serr)) {
+                printf("pervichnaja zalivka hranilishcha ne udalas: %s\n", serr.c_str());
+                return 1;
+            }
+            printf("  pervichnaja zalivka: %llu kopij, %.2f GiB, %.0f ms (BEZ zatravki i "
+                   "bez progreva po promtu - rezhim namerenno hudshij)\n",
+                   (unsigned long long)esp->stats().fills,
+                   double(esp->stats().fill_bytes) / 1073741824.0, ms_since(t_p));
+        }
         Generator gen;
+        gen.es = esp;
         gen.want_probes = (probe_name == "all");
         // Three states for the per-step probe section, because an empty one used to be
         // indistinguishable from "every layer agreed" - which is exactly what qwen3moe printed,
@@ -7727,6 +8047,9 @@ int main(int argc, char** argv) {
         // must be fed the same token at every position or the comparison decays into two
         // different conversations after the first disagreement.
         llama_token tok = llama_token(argmax_of(pre));
+        const memex::ExpertStoreStats es_base = esp ? esp->stats() : memex::ExpertStoreStats();
+        const memex::ProcMem pm_before = memex::proc_mem();
+        const auto t_dc = Clock::now();
         std::vector<float> mine, theirs;
         int n_agree = 0, n_steps = 0;
         double worst_step_l2 = 0.0;
@@ -7786,6 +8109,7 @@ int main(int argc, char** argv) {
                 }
             }
             produced.push_back(am_mine);
+            if (esp) esp->end_token();
             // Both sides advance on OUR token, deliberately. Feeding each side its own pick
             // would let them drift apart into two different contexts and every later number
             // would describe two different computations rather than one.
@@ -7803,6 +8127,17 @@ int main(int argc, char** argv) {
         }
         printf("  итог: %d из %d шагов дали тот же токен; худший L2 %.4f%% на шаге %d\n",
                n_agree, n_steps, worst_step_l2, worst_step);
+        // TA ZHE STROKA, TOLKO LATINICEJ I S IDAMI. Nuzhna potomu, chto skript A/B chitaet
+        // log, a konsol pod Windows otdajot russkie stroki v OEM-kodirovke: Set-Content
+        // sohranjaet ih kak est, i regexp po russkomu tekstu ne nahodit NICHEGO - progon
+        // vygljadit kak "sverka ne sostojalas" pri polnom pravilnom loge. Tokeny zdes
+        // spiskom idov, a ne tekstom: dve raznye posledovatelnosti mogut detokenizirovatsja
+        // v odnu stroku.
+        printf("DECODE_CHECK agree %d steps %d worst_l2 %.6f worst_step %d ids", n_agree,
+               n_steps, worst_step_l2, worst_step);
+        for (llama_token t : produced) printf(" %d", t);
+        printf("\n");
+        fflush(stdout);
         printf("  наш текст: %s\n",
                detokenise(model, produced.data(), int(produced.size())).c_str());
         if (n_agree != n_steps) {
@@ -7811,6 +8146,34 @@ int main(int argc, char** argv) {
             // Same tokens is necessary and not sufficient, and this is the line that says so.
             printf("  ВНИМАНИЕ: токены совпали, но логиты разошлись на %.4f%% — "
                    "совпадение токенов не является доказательством\n", worst_step_l2);
+        }
+        if (esp) {
+            const double dc_ms = ms_since(t_dc);
+            print_store_report(*esp, h, esp->stats().since(es_base), "poshagovaja sverka",
+                               dc_ms, pm_before, memex::proc_mem());
+            // SLOT PROTIV MODELI, POBAJTNO. Ni odna drugaja proverka etogo ne lovit: slot,
+            // sdvinutyj na odnogo eksperta, dajot pravdopodobnye logity, a L2 i tak
+            // nenulevoj. Pri repake sravnenie nevozmozhno, i verify_slot govorit imenno eto.
+            int probed = 0, bad = 0;
+            std::string verr;
+            for (int il = 0; il < h.n_layer; il += 7) {
+                for (int s = 0; s < esp->cfg().capacity + esp->cfg().spares; s += 37) {
+                    std::string e;
+                    if (!esp->verify_slot(il, s, &e)) {
+                        if (e == "slot pust") continue;
+                        ++bad;
+                        if (verr.empty()) verr = e;
+                    }
+                    ++probed;
+                }
+            }
+            printf("ESTORE_VERIFY slots %d bad %d%s%s%s\n", probed, bad,
+                   probed == 0 ? " NE_IZMERENO" : "", bad ? " - " : "",
+                   bad ? verr.c_str() : "");
+            if (probed == 0) {
+                printf("  NI ODIN slot ne sverjalsja: eto NE sovpadenie bajtov, a "
+                       "otsutstvie proverki\n");
+            }
         }
         gen.free_all();
     }
@@ -7826,6 +8189,7 @@ int main(int argc, char** argv) {
         // a tail has to be able to ask for one.
         const int n_kv_max = std::max(pad32(n + n_gen), pad32(n_ctx_req));
         if (!place_layers(n_kv_max)) return 1;
+        if (!make_store()) return 1;
         Cache kv;
         if (!kv.init(buft, h, n_kv_max)) {
             printf("кэш не выделился\n");
@@ -8023,7 +8387,13 @@ int main(int argc, char** argv) {
         // togda, kogda ejo nikto ne chital.
         const bool want_cover = getenv("MEMEX_EXPERT_COVERAGE") != nullptr;
         const char* trace_path = getenv("MEMEX_EXPERT_TRACE");
-        const bool want_sel = (rset != nullptr) || want_cover || (trace_path != nullptr);
+        // Hranilishche - CHETVJORTYJ chitatel marshrutizacii, i emu ona nuzhna po toj zhe
+        // prichine, chto rezidentnomu naboru: schjotchiki chastot dolzhny znat, chto vybiral
+        // sam promt, inache pervichnaja zalivka idjot po odnoj zatravke (ili po nulju).
+        // Raskladka grafa ot etogo menjaetsja - i eto PROVERENO: MEMEX_LAYOUT_SEL dal te zhe
+        // chisla do poslednego znaka (razdel "Raskladka grafa nevinovna" v STATE.md).
+        const bool want_sel = (rset != nullptr) || want_cover || (trace_path != nullptr) ||
+                              (esp != nullptr);
         // DAMP SKRYTOGO SOSTOJANIJA - vhod marshrutizatora kazhdogo sloja na kazhdom tokene.
         // Sprosheno ZDES, ryadom s want_sel i po toj zhe prichine: ot etogo zavisit sam graf
         // prefilla, a ne tolko chtenie iz nego. Poriadok tokenov u dampa i u sleda
@@ -8387,6 +8757,29 @@ int main(int argc, char** argv) {
                         ggml_nbytes(t));
                 }
             }
+            // ZATRAVKA SCHJOTCHIKOV HRANILISHCHA VYBORAMI PROMTA i pervichnaja zalivka.
+            // Do etogo mesta hranilishche pusto i ni odin graf ego ne trogal: prefill idjot
+            // po modelnym tenzoram. Zalivka - PERED chasami generacii, potomu chto ona chitaet
+            // dvadcat gigabajt i otnesti ejo k pervomu tokenu znachilo by polozhit sekundy v
+            // odin shag i sdelat kazhduju cifru "na token" vydumkoj.
+            if (esp) {
+                esp->observe_prefill(rsel.data(), h.n_layer, n, h.n_expert_used);
+                const auto t_p = Clock::now();
+                std::string serr;
+                if (!esp->prime(&serr)) {
+                    printf("pervichnaja zalivka hranilishcha ne udalas: %s\n", serr.c_str());
+                    return 1;
+                }
+                const memex::ExpertStoreStats& ps = esp->stats();
+                printf("  pervichnaja zalivka hranilishcha: %llu kopij, %.2f GiB, %.0f ms "
+                       "(iz nih repak %.0f ms) - NE vhodit v cifry na token nizhe\n",
+                       (unsigned long long)ps.fills,
+                       double(ps.fill_bytes) / 1073741824.0, ms_since(t_p), ps.ms_repack);
+                printf("    schjotchiki: zatravka%s + %d tokenov promta; rezidentnyh na "
+                       "sloe 0 %d iz %d, razlichnyh videli %d\n",
+                       eopt.prior ? " s kalibrovochnogo korpusa" : " OTSUTSTVUET",
+                       n, esp->n_resident(0), h.n_expert, esp->n_seen(0));
+            }
             // MTP: perekrytie naborov ekspertov u sosednih tokenov. Plotnaja model chitaet
             // vesa odin raz na prohod, i mnozhitel raven K. Razrezhennaja MoE - net: kazhdyj iz
             // K tokenov idjot v SVOI eksperty, i prohod chitaet OBEDINENIE. rsel uzhe derzhit
@@ -8660,6 +9053,19 @@ int main(int argc, char** argv) {
         memex::ResidentStats gen_seg_base;
         if (rset) gen_seg_base = rset->stats();
 
+        // ZALIVKA MOGLA NE SOSTOJATSJA, i togda ob etom nado skazat, a ne uehat s pustymi
+        // slotami: pri pustyh slotah kazhdoe obrashchenie promah, cifry vygljadjat kak
+        // "hranilishche ne pomogaet", i prichina - propushchennaja zalivka - nigde ne vidna.
+        if (esp && !esp->primed()) {
+            printf("hranilishche: graf prefilla ne otdal marshrutizaciju, schjotchiki "
+                   "zapolneny TOLKO zatravkoj (ili nichem) - zalivka idjot po nej\n");
+            std::string serr;
+            if (!esp->prime(&serr)) {
+                printf("pervichnaja zalivka hranilishcha ne udalas: %s\n", serr.c_str());
+                return 1;
+            }
+        }
+
         llama_token next = argmax_of(lg);
         gaps.push_back(top2_gap(lg));
 
@@ -8695,6 +9101,7 @@ int main(int argc, char** argv) {
             dbo.keep_dbg = zopt.check || rset != nullptr;
             dbo.gstat = gsp;
             dbo.ds = &hds;
+            dbo.es = esp;
             const bool built_dec = build_any(am, &dec, buft, h, kv, 1, n, n_kv_max, dbo);
             if (!built_dec) {
                 printf("граф декода не собрался\n");
@@ -8990,6 +9397,9 @@ int main(int argc, char** argv) {
                    "deshevle\n");
         }
 
+        const memex::ExpertStoreStats es_gen_base =
+            esp ? esp->stats() : memex::ExpertStoreStats();
+        const memex::ProcMem pm_gen_before = memex::proc_mem();
         const auto t_gen = Clock::now();
         if (zopt.on) {
 #ifdef MEMEX_FWD_ZONED
@@ -9568,12 +9978,41 @@ int main(int argc, char** argv) {
                 ggml_backend_synchronize(be);
                 ggml_backend_tensor_get(dec.logits, lg.data(), 0,
                                         sizeof(float) * size_t(h.n_vocab));
+                // POSLE grafa i do sledujushchego: perestanovka nabora dolzhna sluchitsja
+                // mezhdu tokenami, inache ona vytesnila by slot, kotoryj token uzhe chitaet.
+                if (esp) esp->end_token();
                 next = argmax_of(lg);
                 gaps.push_back(top2_gap(lg));
             }
         }
         const double gen_ms = ms_since(t_gen);
+        const memex::ProcMem pm_gen_after = memex::proc_mem();
         if (dec_built) printf("граф декода собран один раз за %.1f мс\n", build_ms);
+        if (esp) {
+            print_store_report(*esp, h, esp->stats().since(es_gen_base), "generacija",
+                               gen_ms, pm_gen_before, pm_gen_after);
+            int probed = 0, bad = 0;
+            std::string verr;
+            for (int il = 0; il < h.n_layer; il += 7) {
+                for (int s = 0; s < esp->cfg().capacity + esp->cfg().spares; s += 37) {
+                    std::string e;
+                    if (!esp->verify_slot(il, s, &e)) {
+                        if (e == "slot pust") continue;
+                        ++bad;
+                        if (verr.empty()) verr = e;
+                    }
+                    ++probed;
+                }
+            }
+            printf("ESTORE_VERIFY slots %d bad %d%s%s%s\n", probed, bad,
+                   probed == 0 ? " NE_IZMERENO" : "", bad ? " - " : "",
+                   bad ? verr.c_str() : "");
+            if (probed == 0) {
+                printf("  NI ODIN slot ne sverjalsja: eto NE sovpadenie bajtov, a "
+                       "otsutstvie proverki (pri repake tak i dolzhno byt - bajty slota po "
+                       "postroeniju drugie)\n");
+            }
+        }
 
         // The reference, greedily, from the same prompt. Under --no-ref there is no reference
         // context, so ref_seq stays empty and every line below reports zero for it - our own
