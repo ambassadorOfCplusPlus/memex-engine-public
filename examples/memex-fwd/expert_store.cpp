@@ -15,6 +15,7 @@
 #endif
 #include <windows.h>
 #include <psapi.h>
+#include <malloc.h>   // _aligned_malloc / _aligned_free
 #pragma comment(lib, "psapi.lib")
 #endif
 
@@ -101,6 +102,119 @@ ExpertStore::~ExpertStore() {
     }
     if (ctx_) ggml_free(ctx_);
     ctx_ = nullptr;
+#if defined(_WIN32)
+    if (fh_ && fh_ != INVALID_HANDLE_VALUE) CloseHandle((HANDLE)fh_);
+    if (io_buf_) _aligned_free(io_buf_);
+#endif
+    fh_ = nullptr;
+    io_buf_ = nullptr;
+}
+
+namespace {
+constexpr std::size_t kSector = 4096;   // NO_BUFFERING trebuet vyravnivanija po sektoru diska
+}
+
+// Otkryt gguf, uznat fajlovye smeshchenija tenzorov ekspertov po IMENAM src-tenzorov, otkryt
+// fajl s FILE_FLAG_NO_BUFFERING, vydelit vyrovnennyj io_buf_. Vsjo eto - odin raz.
+bool ExpertStore::open_direct(std::string* err) {
+#if !defined(_WIN32)
+    if (err) *err = "prjamoe chtenie realizovano tolko dlja Windows";
+    return false;
+#else
+    // Smeshchenija iz gguf: data_offset (nachalo sekcii dannyh v fajle) + tensor_offset.
+    gguf_init_params gp;
+    gp.no_alloc = true;
+    gp.ctx      = nullptr;
+    gguf_context* g = gguf_init_from_file(cfg_.gguf_path.c_str(), gp);
+    if (!g) {
+        if (err) *err = "gguf_init_from_file ne otkryl " + cfg_.gguf_path;
+        return false;
+    }
+    const uint64_t data_off = (uint64_t)gguf_get_data_offset(g);
+    std::size_t max_chunk = 0;
+    bool okall = true;
+    std::string why;
+    for (int il = 0; il < cfg_.n_layer && okall; ++il) {
+        Layer& L = layers_[std::size_t(il)];
+        const ggml_tensor* three[3] = {L.src_gate, L.src_up, L.src_down};
+        uint64_t* dstoff[3] = {&L.off_gate, &L.off_up, &L.off_down};
+        for (int k = 0; k < 3; ++k) {
+            const char* nm = ggml_get_name(three[k]);
+            const int ti = gguf_find_tensor(g, nm);
+            if (ti < 0) {
+                okall = false;
+                why = std::string("tenzor '") + (nm ? nm : "?") + "' ne najden v gguf";
+                break;
+            }
+            *dstoff[k] = data_off + (uint64_t)gguf_get_tensor_offset(g, ti);
+            const std::size_t nb2 = std::size_t(three[k]->nb[2]);
+            if (nb2 > max_chunk) max_chunk = nb2;
+        }
+    }
+    gguf_free(g);
+    if (!okall) {
+        if (err) *err = "prjamoe chtenie: " + why;
+        return false;
+    }
+
+    HANDLE h = CreateFileA(cfg_.gguf_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING,
+                           FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (err) *err = "CreateFile(NO_BUFFERING) ne otkryl fajl, kod " +
+                        std::to_string((unsigned long)GetLastError());
+        return false;
+    }
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz)) {
+        CloseHandle(h);
+        if (err) *err = "GetFileSizeEx ne dal razmer fajla";
+        return false;
+    }
+    file_size_ = (uint64_t)sz.QuadPart;
+
+    // Bufer pod odin kusok: dlina eksperta plus do dvuh sektorov na vyravnivanie kraev.
+    io_cap_ = align_up(max_chunk, kSector) + 2 * kSector;
+    io_buf_ = _aligned_malloc(io_cap_, kSector);
+    if (!io_buf_) {
+        CloseHandle(h);
+        io_cap_ = 0;
+        if (err) *err = "io-bufer pod prjamoe chtenie ne vydelilsja";
+        return false;
+    }
+    fh_ = (void*)h;
+    direct_ = true;
+    return true;
+#endif
+}
+
+// Prjamoe chtenie [foff, foff+len) v dst mimo strannichnogo kesha. Krajа vyravnivajutsja po
+// sektoru; chitaem vyrovnennyj diapazon v io_buf_, kopiruem nuzhnyj poddiapazon.
+bool ExpertStore::read_chunk(uint64_t foff, std::size_t len, void* dst) {
+#if !defined(_WIN32)
+    (void)foff; (void)len; (void)dst;
+    return false;
+#else
+    const uint64_t astart = foff & ~(uint64_t)(kSector - 1);
+    const uint64_t head   = foff - astart;
+    uint64_t aend = align_up(std::size_t(foff + len), kSector);
+    // Ne chitat za sektornyj hvost fajla: poslednij sektor mozhet byt nepolnym, i ReadFile
+    // vernjot menshe bajt - eto normal'no, poka pokryt head+len.
+    const uint64_t fend = align_up(std::size_t(file_size_), kSector);
+    if (aend > fend) aend = fend;
+    const std::size_t alen = std::size_t(aend - astart);
+    if (alen > io_cap_ || head + len > alen) return false;
+
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)astart;
+    if (!SetFilePointerEx((HANDLE)fh_, li, nullptr, FILE_BEGIN)) return false;
+    DWORD got = 0;
+    if (!ReadFile((HANDLE)fh_, io_buf_, (DWORD)alen, &got, nullptr)) return false;
+    if ((std::size_t)got < head + len) return false;
+    std::memcpy(dst, (const char*)io_buf_ + head, len);
+    direct_reads_++;
+    return true;
+#endif
 }
 
 std::size_t ExpertStore::bytes_per_expert(const ggml_tensor* gate, const ggml_tensor* up,
@@ -271,6 +385,19 @@ bool ExpertStore::init(const ExpertStoreConfig& cfg,
     } else {
         repack_why_ = "ne prosili";
     }
+
+    // PRJAMOE CHTENIE MIMO MMAP. Esli zadan put k fajlu, sloty zapolnjajutsja ReadFile'om s
+    // NO_BUFFERING, a ne memcpy iz mmap. Bez etogo hranilishche - VTORAJA kopija ekspertov
+    // (privatnaja + strannichnyj kesh mmap), i dve ne vlezajut v 26 GB (STATE, shag 4 A/B).
+    // Otkaz vsluh: esli put zadan, no chtenie ne nastroilos - eto oshibka, a ne tihij otkat
+    // na memcpy, potomu chto memcpy vernul by trjoshing, kotoryj my i ubiraem.
+    if (!cfg_.gguf_path.empty()) {
+        std::string derr;
+        if (!open_direct(&derr)) {
+            if (err) *err = derr;
+            return false;
+        }
+    }
     token_ = 1;
     return true;
 }
@@ -340,10 +467,27 @@ void ExpertStore::fill_slot(Layer& L, int slot, int id) {
     const auto t0 = Clock::now();
     const ggml_tensor* src[3] = {L.src_gate, L.src_up, L.src_down};
     ggml_tensor* dst[3] = {L.gate, L.up, L.down};
+    const uint64_t off[3] = {L.off_gate, L.off_up, L.off_down};
     for (int k = 0; k < 3; ++k) {
         const std::size_t nb2 = std::size_t(dst[k]->nb[2]);
-        std::memcpy((char*)dst[k]->data + std::size_t(slot) * nb2,
-                    (const char*)src[k]->data + std::size_t(id) * nb2, nb2);
+        char* d = (char*)dst[k]->data + std::size_t(slot) * nb2;
+        if (direct_) {
+            // Prjamoe chtenie s diska: NE trogaet stranicy mmap etogo eksperta, tak chto oni
+            // ostajutsja holodnymi i ne konkurirujut za pamjat s privatnym slotom.
+            const uint64_t foff = off[k] + std::size_t(id) * nb2;
+            if (!read_chunk(foff, nb2, d)) {
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    printf("hranilishche ekspertov: PRJAMOE CHTENIE ne udalos (sloj-tenzor %d, "
+                           "ekspert %d, smeshchenie %llu, %zu bajt) - slot NE zapolnen\n",
+                           k, id, (unsigned long long)foff, nb2);
+                    fflush(stdout);
+                }
+            }
+        } else {
+            std::memcpy(d, (const char*)src[k]->data + std::size_t(id) * nb2, nb2);
+        }
     }
     st_.ms_fill += ms_since(t0);
     st_.fills++;

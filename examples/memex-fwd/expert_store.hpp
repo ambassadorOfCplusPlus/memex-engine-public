@@ -87,6 +87,12 @@ struct ExpertStoreConfig {
     int spares    = 16;   // Z: zapasnyh slotov na sloj pod sinhronnye promahi
     int period    = 16;   // tokenov mezhdu perestanovkami nabora
     bool repack   = false;
+    // Put k gguf-fajlu modeli. Esli zadan, sloty zapolnjajutsja PRJAMYM CHTENIEM fajla mimo
+    // strannichnogo kesha (CreateFile FILE_FLAG_NO_BUFFERING), a ne kopirovaniem iz mmap. Eto
+    // i est smysl shaga: hranilishche - EDINSTVENNAJA kopija rezidentnyh ekspertov, stranicy
+    // mmap teh zhe ekspertov ne fol'tjatsja i ne konkurirujut za pamjat. Pustaja stroka -
+    // staroe povedenie (memcpy iz mmap), ostavleno dlja sverki.
+    std::string gguf_path;
 };
 
 struct ExpertStoreStats {
@@ -139,6 +145,9 @@ class ExpertStore {
     std::size_t bytes_per_expert() const { return per_expert_; }
     bool repacked() const { return repacked_; }
     const std::string& repack_why() const { return repack_why_; }
+    // Prjamoe chtenie fajla vkljucheno (mimo mmap) i skolko kuskov s diska prochitano.
+    bool     direct() const { return direct_; }
+    uint64_t direct_reads() const { return direct_reads_; }
 
     // Zatravka schjotchikov iz fajla kalibrovki. Format - sm. bench/expert_prior.py:
     // zagolovok int32[4] = {0x45585052, n_layer, n_expert, 1}, telo f32 [n_layer][n_expert].
@@ -180,6 +189,11 @@ class ExpertStore {
         const ggml_tensor* src_gate = nullptr;
         const ggml_tensor* src_up   = nullptr;
         const ggml_tensor* src_down = nullptr;
+        // Fajlovoe smeshchenie eksperta 0 po kazhdomu tenzoru (dlja prjamogo chtenija). Ekspert
+        // id lezhit na off + id*nb[2], toch'-v-toch' kak src->data + id*nb2 pri mmap.
+        uint64_t off_gate = 0;
+        uint64_t off_up   = 0;
+        uint64_t off_down = 0;
         ggml_backend_buffer_t buf = nullptr;
         std::vector<float>   score;     // [n_expert] zatravka + vybory
         std::vector<int32_t> slot_of;   // [n_expert] -> slot ili -1
@@ -198,6 +212,13 @@ class ExpertStore {
     void fill_slot(Layer& L, int slot, int id);
     void refresh();
     int  pick_victim(Layer& L);
+    // Prjamoe chtenie fajla mimo strannichnogo kesha: kusok [foff, foff+len) v dst. Diapazon
+    // vyravnivaetsja po sektoru (4096) pod FILE_FLAG_NO_BUFFERING, chitaetsja v io_buf_, nuzhnyj
+    // poddiapazon kopiruetsja v dst. Vozvrashchaet false pri oshibke I/O.
+    bool read_chunk(uint64_t foff, std::size_t len, void* dst);
+    // Odin raz v init: otkryt gguf, najti fajlovye smeshchenija tenzorov ekspertov po imenam,
+    // otkryt fajl s NO_BUFFERING, vydelit vyrovnennyj io_buf_. err - prichina otkaza.
+    bool open_direct(std::string* err);
 
     ExpertStoreConfig  cfg_;
     ExpertStoreStats   st_;
@@ -214,6 +235,13 @@ class ExpertStore {
     // Idjot pervichnaja zalivka: sloty zapolnjajutsja bez poslotovogo repaka, potomu chto
     // prime() perepakuet celye tenzory odnim vyzovom v konce. Repak NE idempotenten.
     bool               bulk_ = false;
+    // Prjamoe chtenie fajla vmesto memcpy iz mmap (shag 4, protiv dvojnoj pamjati).
+    bool               direct_    = false;
+    void*              fh_        = nullptr;   // HANDLE fajla, otkryt s NO_BUFFERING
+    void*              io_buf_    = nullptr;   // vyrovnennyj po 4096 bufer pod odin kusok
+    std::size_t        io_cap_    = 0;
+    uint64_t           file_size_ = 0;
+    uint64_t           direct_reads_ = 0;      // skolko kuskov prochitano s diska
 };
 
 }  // namespace memex

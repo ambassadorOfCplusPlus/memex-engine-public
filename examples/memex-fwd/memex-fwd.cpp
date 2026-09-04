@@ -4975,6 +4975,10 @@ void print_store_report(const memex::ExpertStore& es, const HParams& h,
            double(s.fill_bytes) / 1073741824.0, (unsigned long long)s.evictions,
            s.ms_fill, s.ms_repack, s.ms_map - s.ms_sync);
     printf("  repak slotov: %s\n", es.repack_why().c_str());
+    printf("  zapolnenie slotov: %s (kuskov s diska prjamym chteniem %llu)\n",
+           es.direct() ? "PRJAMOE CHTENIE fajla mimo mmap (NO_BUFFERING)"
+                       : "memcpy iz mmap (staryj put)",
+           (unsigned long long)es.direct_reads());
     if (phase_ms > 0.0 && s.tokens > 0) {
         printf("  dolja fazy: %.1f ms/token vsego, iz nih %.1f ms sinhronnye chtenija "
                "(%.1f%%)\n", phase_ms / tok, s.ms_sync / tok,
@@ -7186,6 +7190,28 @@ int main(int argc, char** argv) {
         }
     }
     printf("  mmap: %s — %s\n", want_mmap ? "ВКЛЮЧЁН" : "выключен", mmap_why.c_str());
+    // PREFETCH i HRANILISHCHE nesovmestimy. Pri --expert-store sloty zapolnjajutsja prjamym
+    // chteniem s diska, i stranicy mmap ekspertov trogat NELZJA - inache oni snova v kesh, i
+    // vozvrashchaetsja dvojnaja pamjat (STATE, shag 4 A/B). No zagruzchik pri mmap zovjot
+    // PrefetchVirtualMemory na ves fajl (llama-mmap.cpp), esli LLAMA_MMAP_PREFETCH != 0.
+    // Poetomu pri vkljuchennom hranilishche stavim ego v 0 sami (esli pol'zovatel ne zadal
+    // javno) i govorim ob etom vsluh - eto uslovie pravilnosti zamera, a ne udobstvo.
+    if (eopt.capacity != 0 && want_mmap) {
+        const char* pf = std::getenv("LLAMA_MMAP_PREFETCH");
+        if (!pf) {
+#if defined(_WIN32)
+            _putenv_s("LLAMA_MMAP_PREFETCH", "0");
+#else
+            setenv("LLAMA_MMAP_PREFETCH", "0", 1);
+#endif
+            printf("  --expert-store: LLAMA_MMAP_PREFETCH ne zadan => stavlju 0 (inache "
+                   "zagruzchik nabil by ves fajl v kesh i vernul dvojnuju pamjat)\n");
+        } else if (strcmp(pf, "0") != 0) {
+            printf("  PREDUPREZHDENIE: --expert-store vkljuchen, no LLAMA_MMAP_PREFETCH='%s' "
+                   "(ne 0): zagruzchik prefetchit fajl, stranicy ekspertov ujdut v kesh i "
+                   "vernjotsja dvojnaja pamjat. Postavte LLAMA_MMAP_PREFETCH=0\n", pf);
+        }
+    }
     llama_model* model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) {
         printf("модель не загрузилась: %s\n", model_path.c_str());
@@ -7678,6 +7704,10 @@ int main(int argc, char** argv) {
         ec.spares   = eopt.spares;
         ec.period   = eopt.period;
         ec.repack   = eopt.repack;
+        // Put k fajlu => sloty zapolnjajutsja PRJAMYM CHTENIEM mimo mmap (shag 4, protiv
+        // dvojnoj pamjati). Bez etogo hranilishche kopiruet iz mmap i fol'tit ves ekspertnyj
+        // region v strannichnyj kesh - rovno tot trjoshing, kotoryj my ubiraem.
+        ec.gguf_path = model_path;
         printf("\nrezidentnoe hranilishche ekspertov: ekspert %.3f MiB "
                "(gate %s + up %s + down %s), na sloj %d ekspertov, sloev %d\n",
                double(bpe) / 1048576.0, ggml_type_name(L0.gate_exps->type),
