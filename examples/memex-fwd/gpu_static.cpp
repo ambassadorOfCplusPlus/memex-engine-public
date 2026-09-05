@@ -309,26 +309,30 @@ bool GpuStatic::init(const GpuStaticConfig& cfg, ggml_tensor* out, std::string* 
     }
     // Golova neobjazatelna: gemma4 beret sloi, no ne golovu (sm. cfg_.head).
     if (cfg_.head && !out) { *err = "output.weight otsutstvuet"; return false; }
-    if (out->ne[0] != cfg_.n_embd || out->ne[1] != cfg_.n_vocab) {
-        char b[200];
-        snprintf(b, sizeof(b),
-                 "output.weight [%lld,%lld] ne sovpal s n_embd %d / n_vocab %d",
-                 (long long)out->ne[0], (long long)out->ne[1], cfg_.n_embd, cfg_.n_vocab);
-        *err = b;
-        return false;
-    }
-    if (!out->data || !out->buffer || !ggml_backend_buffer_is_host(out->buffer)) {
-        *err = "output.weight nedostupen hostu - zalivat neotkuda";
-        return false;
-    }
-    if (type_is_interleaved(out->type)) {
-        char b[280];
-        snprintf(b, sizeof(b),
-                 "golova perepakovana v %s, a formy _R* Vulkan ne chitaet ni odnoj operaciej; "
-                 "iskljuchite golovu iz perepakovki (po umolchaniju perepakovyvajutsja tolko "
-                 "eksperty)", ggml_type_name(out->type));
-        *err = b;
-        return false;
+    // Golova neobjazatelna (head==false, out==nullptr dlja gemma4): validaciju golovy
+    // vypolnjaem tolko kogda tenzor golovy realno peredan, inache nizhe byl by null-deref.
+    if (out) {
+        if (out->ne[0] != cfg_.n_embd || out->ne[1] != cfg_.n_vocab) {
+            char b[200];
+            snprintf(b, sizeof(b),
+                     "output.weight [%lld,%lld] ne sovpal s n_embd %d / n_vocab %d",
+                     (long long)out->ne[0], (long long)out->ne[1], cfg_.n_embd, cfg_.n_vocab);
+            *err = b;
+            return false;
+        }
+        if (!out->data || !out->buffer || !ggml_backend_buffer_is_host(out->buffer)) {
+            *err = "output.weight nedostupen hostu - zalivat neotkuda";
+            return false;
+        }
+        if (type_is_interleaved(out->type)) {
+            char b[280];
+            snprintf(b, sizeof(b),
+                     "golova perepakovana v %s, a formy _R* Vulkan ne chitaet ni odnoj operaciej; "
+                     "iskljuchite golovu iz perepakovki (po umolchaniju perepakovyvajutsja tolko "
+                     "eksperty)", ggml_type_name(out->type));
+            *err = b;
+            return false;
+        }
     }
     src_out_ = out;
 
@@ -522,7 +526,16 @@ bool GpuStatic::block(const float* x, int n_rows, float* dst) {
     auto t0 = std::chrono::steady_clock::now();
     ggml_backend_tensor_set(t_x_, x, 0, xbytes);
     auto t1 = std::chrono::steady_clock::now();
-    ggml_backend_graph_compute(be_, gf_[w]);
+    const ggml_status gcs = ggml_backend_graph_compute(be_, gf_[w]);
+    if (gcs != GGML_STATUS_SUCCESS) {
+        char b[160];
+        snprintf(b, sizeof(b),
+                 "golova: ggml_backend_graph_compute vernul %s (shirina %zu)",
+                 ggml_status_to_string(gcs), w);
+        fail_msg_ = b;
+        std::fprintf(stderr, "[memex][gpu_static] %s\n", b);
+        return false;
+    }
     auto t2 = std::chrono::steady_clock::now();
     // Not the mapped pointer. ggml_vk_buffer_read (ggml-vulkan.cpp:4805-4831) deliberately
     // takes the hardware copy path on a non-UMA device even when the buffer is host-visible,
@@ -885,7 +898,13 @@ bool GpuStatic::init_layers(const GpuStaticLayer* layers, int n_kv_max, std::str
         for (int il = 0; il < cfg_.n_layer; ++il) {
             try {
                 ggml_backend_tensor_set(t_lx_, zx.data(), 0, zx.size() * sizeof(float));
-                ggml_backend_graph_compute(be_, lg_[std::size_t(il)].gf);
+                const ggml_status gcs = ggml_backend_graph_compute(be_, lg_[std::size_t(il)].gf);
+                if (gcs != GGML_STATUS_SUCCESS) {
+                    *err = std::string("probnyj prohod sloja ") + std::to_string(il) +
+                           ": ggml_backend_graph_compute vernul " + ggml_status_to_string(gcs);
+                    shutdown();
+                    return false;
+                }
             } catch (const std::exception& e) {
                 *err = std::string("probnyj prohod sloja ") + std::to_string(il) + ": " +
                        e.what();
@@ -2474,8 +2493,15 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
             }
         }
         auto tb = std::chrono::steady_clock::now();
-        ggml_backend_graph_compute(be_, G.gf);
+        const ggml_status gcs = ggml_backend_graph_compute(be_, G.gf);
         auto tc = std::chrono::steady_clock::now();
+        if (gcs != GGML_STATUS_SUCCESS) {
+            char b[160];
+            snprintf(b, sizeof(b), "sloj %d: ggml_backend_graph_compute vernul %s",
+                     il, ggml_status_to_string(gcs));
+            fail_msg_ = b;
+            std::fprintf(stderr, "[memex][gpu_static] %s\n", b);
+        }
         // THE READBACK, AND THIS IS A CORRECTED MISTAKE RATHER THAN A CHOICE.
         //
         // The first version took the mapped pointer: the layer's output is 16.9 KB, so the
@@ -2502,7 +2528,7 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
         // rb_ is shared with the head. Safe by construction rather than by luck: both run from
         // ggml_map_custom with n_tasks == 1 on the one thread that executes the node, and the
         // head is the last node of the graph while every layer is strictly before it.
-        if (!folded && !truncated) {
+        if (fail_msg_.empty() && !folded && !truncated) {
             if (G.out) {
                 ggml_backend_tensor_get(G.out, rb_, 0, out_floats * sizeof(float));
             } else {
@@ -2520,7 +2546,7 @@ void GpuStatic::do_layer(int il, ggml_tensor* dst, const ggml_tensor* cur,
                                             * std::size_t(W) * sizeof(float));
             }
         }
-        if (!truncated) {
+        if (fail_msg_.empty() && !truncated) {
             std::memcpy(dst->data, rb_, out_floats * sizeof(float));
         }
         // NO KEEP-WARM POKE HERE, and the reason is worth keeping.

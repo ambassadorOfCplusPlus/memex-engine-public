@@ -119,10 +119,38 @@ void probe_vulkan(HardwareCaps* c) {
     if (n == 0) { vkDestroyInstance(inst, nullptr); return; }
     std::vector<VkPhysicalDevice> devs;
     devs.resize(std::size_t(n));
-    vkEnumeratePhysicalDevices(inst, &n, devs.data());
+    if (vkEnumeratePhysicalDevices(inst, &n, devs.data()) != VK_SUCCESS || n == 0) {
+        vkDestroyInstance(inst, nullptr);
+        return;
+    }
+    devs.resize(std::size_t(n));
+
+    // Select a DISCRETE GPU rather than blindly devs[0]. On a laptop with an iGPU + discrete
+    // card, or when lavapipe/llvmpipe is present, devs[0] can be the integrated or software
+    // device, which hands back system RAM as device-local - plausible VRAM/BAR for the wrong
+    // card. Prefer the first discrete GPU; if there is none, fall back to devs[0] but record
+    // the real device type so the printer can say so honestly.
+    uint32_t chosen = 0;
+    bool found_discrete = false;
+    for (uint32_t i = 0; i < n; ++i) {
+        VkPhysicalDeviceProperties pp{};
+        vkGetPhysicalDeviceProperties(devs[i], &pp);
+        if (pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            chosen = i;
+            found_discrete = true;
+            break;
+        }
+    }
+    {
+        VkPhysicalDeviceProperties pp{};
+        vkGetPhysicalDeviceProperties(devs[chosen], &pp);
+        c->vram_discrete    = found_discrete;
+        c->vram_device_type = (int)pp.deviceType;
+        std::snprintf(c->gpu_name, sizeof(c->gpu_name), "%s", pp.deviceName);
+    }
 
     VkPhysicalDeviceMemoryProperties mp{};
-    vkGetPhysicalDeviceMemoryProperties(devs[0], &mp);
+    vkGetPhysicalDeviceMemoryProperties(devs[chosen], &mp);
 
     // Largest device-local heap = VRAM.
     uint64_t vram = 0;
@@ -226,6 +254,13 @@ void print_hardware_caps(const HardwareCaps& c) {
         printf("  VRAM:  %.0f MiB (krupnejshaja device-local kucha)     [izmereno: Vulkan, "
                "NE po \"svobodno\" drajvera]\n",
                double(c.vram_bytes) / 1048576.0);
+        const char* kind = c.vram_discrete ? "diskretnaja GPU"
+                         : c.vram_device_type == 1 ? "vstroennaja GPU (iGPU!)"
+                         : c.vram_device_type == 4 ? "programmnyj rasterizator (CPU/lavapipe!)"
+                         : "NE diskretnaja GPU!";
+        printf("  GPU:   %s  [%s]%s\n",
+               c.gpu_name[0] ? c.gpu_name : "?", kind,
+               c.vram_discrete ? "" : "  <- VRAM/BAR mogut byt sistemnoj OZU, ne kartoj");
     } else {
         printf("  VRAM:  NE UZNANO (Vulkan ne skompilirovan ili net ustrojstva) -> "
                "default %.0f MiB [ocenka]\n",

@@ -4762,6 +4762,19 @@ void print_store_report(const memex::ExpertStore& es, const HParams& h,
     printf("  obrashchenij k MARSHRUTIZIRUEMYM ekspertam %llu (%.1f na token; obshchij "
            "ekspert v znamenatel NE vhodit - on na karte i chitaetsja vsegda)\n",
            (unsigned long long)s.picks, double(s.picks) / tok);
+    // OBSHCHIJ (vsegda-aktivnyj) EKSPERT - javnyj uchjot, chtoby otchjot ne zanizhal trafik.
+    // Do etoj stroki ego chtenija ne popadali NIKUDA: ni v picks/hits, ni v sync_misses, ni v
+    // bajty urovnej. On aktiven na KAZHDOM sloe kazhdogo tokena (qwen3next: 48 chtenij/token),
+    // eto staticheskij trafik (karta/mmap), a ne marshrutiziruemye promahi - poetomu on i vne
+    // znamenatelja popadanij vyshe. Chislo vesov tochnoe iz geometrii (kvant zadajot bajty).
+    if (h.n_ff_shexp > 0) {
+        const unsigned long long reads_tok = (unsigned long long)h.n_layer;
+        const double elems_layer = 3.0 * double(h.n_embd) * double(h.n_ff_shexp)
+                                   + double(h.n_embd);  // gate+up+down + shexp_gate
+        printf("  OBSHCHIJ ekspert (vsegda aktiven): %llu chtenij/token (po odnomu na sloj), "
+               "%.3f M vesov/token - staticheskij trafik, VNE cifr vyshe\n",
+               reads_tok, elems_layer * double(h.n_layer) / 1e6);
+    }
     printf("  popadanij %.4f%%, sinhronnyh promahov %llu = %.3f na token, %.3f ms na token "
            "(vsego %.0f ms)\n", 100.0 * s.hit_rate(), (unsigned long long)s.sync_misses,
            s.misses_per_token(), s.ms_sync / tok, s.ms_sync);

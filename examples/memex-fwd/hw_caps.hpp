@@ -32,6 +32,13 @@ struct HardwareCaps {
     // ---- video memory (Vulkan heaps; the DRIVER'S free is not trusted) ----
     bool     vram_measured     = false;  // heaps enumerated
     uint64_t vram_bytes        = 0;      // size of the LARGEST device-local heap
+    // Which physical device was probed for VRAM/BAR. Blindly taking devs[0] measures an iGPU or
+    // a software rasteriser (lavapipe/llvmpipe) on a laptop with two GPUs and reports system RAM
+    // as device-local: plausible numbers for the wrong card. We select a discrete GPU when one
+    // exists and record here what we actually measured, honestly.
+    bool     vram_discrete     = false;  // selected device is VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    int      vram_device_type  = -1;     // raw VkPhysicalDeviceType of the probed device
+    char     gpu_name[256]     = {0};    // deviceName of the probed device
 
     // ---- BAR window ----
     // The heap that is BOTH device-local AND host-visible. On a small-BAR discrete card that

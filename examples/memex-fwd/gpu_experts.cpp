@@ -920,6 +920,41 @@ bool GpuExperts::init(const GpuExpertsConfig& cfg, ggml_tensor* const* up,
             n_down_[std::size_t(k)] = o;
             n_out_[std::size_t(k)]  = o;
         }
+        // Vsjo vyshe postroeno na tenzorah SLOJA 0 (up_[0]/gate_[0]/down_[0]), poetomu
+        // supports_op proveril kvant tolko sloja 0. Etot modul' - pro SMESHANNYJ kvant (hpp:
+        // sloj 0 q8_0, ostalnye q6_K), i tip, kotoryj Vulkan ne umeet, no kotoryj est tolko na
+        // nenulevom sloe, inache proshjol by init i upal by v seredine progona vnutri
+        // ggml_backend_graph_compute. Perenacelivaem uzly proby shiriny 1 na kazhdyj sloj i
+        // sprashivaem bekend zaranee.
+        if (n_up_[1] && n_gate_[1] && n_down_[1]) {
+            ggml_tensor* saved_u = n_up_[1]->src[0];
+            ggml_tensor* saved_g = n_gate_[1]->src[0];
+            ggml_tensor* saved_d = n_down_[1]->src[0];
+            for (int il = 0; il < cfg_.n_layers; ++il) {
+                ggml_tensor* probe[3] = { n_up_[1], n_gate_[1], n_down_[1] };
+                ggml_tensor* w[3]     = { up_[std::size_t(il)], gate_[std::size_t(il)],
+                                          down_[std::size_t(il)] };
+                for (int j = 0; j < 3; ++j) {
+                    probe[j]->src[0] = w[j];
+                    if (ggml_backend_supports_op(be_, probe[j])) continue;
+                    char buf[240];
+                    snprintf(buf, sizeof(buf),
+                             "бэкенд Vulkan не поддерживает %s над %s на sloe %d - "
+                             "smeshannyj kvant: proba proverjala tolko sloj 0; "
+                             "proverennye - IQ4_XS, Q6_K, Q4_K",
+                             ggml_op_name(probe[j]->op), ggml_type_name(w[j]->type), il);
+                    *err = buf;
+                    n_up_[1]->src[0]   = saved_u;
+                    n_gate_[1]->src[0] = saved_g;
+                    n_down_[1]->src[0] = saved_d;
+                    shutdown();
+                    return false;
+                }
+            }
+            n_up_[1]->src[0]   = saved_u;
+            n_gate_[1]->src[0] = saved_g;
+            n_down_[1]->src[0] = saved_d;
+        }
     }
 
     // Pinned host memory for the read back. ggml_vk_buffer_read_async looks the destination
